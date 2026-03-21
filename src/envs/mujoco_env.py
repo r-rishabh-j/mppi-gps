@@ -48,6 +48,13 @@ class MuJoCoEnv(BaseEnv):
             self.model, self.data, state, 
             mujoco.mjtState.mjSTATE_FULLPHYSICS, 
         )
+        return state
+
+    def set_state(self, state: np.ndarray) -> None:
+        mujoco.mj_setState(
+            self.model, self.data, state,
+            mujoco.mjtState.mjSTATE_FULLPHYSICS,
+        )
 
     def batch_rollout(
             self, 
