@@ -6,27 +6,27 @@ import numpy as np
 class BaseEnv(ABC):
     @abstractmethod
     def reset(self, state: np.ndarray | None = None) -> np.ndarray:
-        """reset to the initial or specified state and returns None"""
+        """reset to the initial or specified state and returns the observation"""
 
     @abstractmethod
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
-        """Advance one timestep. Returns (obs, cost, done, info)."""
+        """Advance one timestep. Returns (obs, cost, done, info)"""
 
     @abstractmethod
     def get_state(self) -> np.ndarray:
-        """Capture full simulator state (sufficient to restore exactly)."""
+        """Capture full simulator state (sufficient to restore exactly)"""
 
     @abstractmethod
     def set_state(self, state: np.ndarray) -> None:
-        """Restore simulator to a previously captured state."""
-
+        """Restore simulator to a previously captured state"""
+    
     @abstractmethod
-    def cost(self, state: np.ndarray, action: np.ndarray) -> float:
-        """Running cost at (state, action)."""
-
+    def running_cost(self, states: np.ndarray, actions: np.ndarray) -> np.ndarray:
+      """Vectorized running cost. states: (K,H,nstate), actions: (K,H,nu) → (K,H)"""
+    
     @abstractmethod
-    def terminal_cost(self, state: np.ndarray) -> float:
-        """Terminal cost at final state."""
+    def terminal_cost(self, states: np.ndarray) -> np.ndarray:
+      """Vectorized terminal cost. states: (K,nstate) → (K,)"""
 
     @property
     @abstractmethod
@@ -39,12 +39,23 @@ class BaseEnv(ABC):
     @property
     @abstractmethod
     def action_bounds(self) -> tuple[np.ndarray, np.ndarray]:
-        """Returns (low, high) arrays of shape (action_dim,)."""
+        """Returns (low, high) arrays of shape (action_dim,)"""
 
+    @abstractmethod
     def batch_rollout(
             self, 
             initial_state: np.ndarray, 
             action_sequences: np.ndarray, 
     ) -> tuple[np.ndarray, np.ndarray]:
-        """rollout K action sequences of length H from the initial state"""
-        pass 
+        """
+        Roll out K action sequences of length H from initial_state.
+
+        Args:
+        initial_state: state vector from get_state()
+        action_sequences: (K, H, action_dim)
+
+        Returns:
+        states: (K, H, nstate) state at each step
+        costs:  (K,) total cost per trajectory
+        """
+        
