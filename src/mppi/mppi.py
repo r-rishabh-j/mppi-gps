@@ -48,7 +48,7 @@ class MPPI:
         
         # rollout 
         states, costs = self.env.batch_rollout(state, U_perturbed)
-
+       
         # compute the prior/ proposal 
         log_prior = None 
         log_proposal = None 

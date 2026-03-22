@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "gymnasium>=1.2.3",
+    "imageio>=2.37.3",
     "ipython>=9.10.0",
     "matplotlib>=3.8.0",
     "mediapy>=1.2.6",

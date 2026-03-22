@@ -8,9 +8,13 @@ from mujoco import rollout
 from src.envs.base import BaseEnv
 
 class MuJoCoEnv(BaseEnv):
-    def __init__(self, model_path: str, nthread: int | None = None):
+    def __init__(self, model_path: str, nthread: int | None = None, frame_skip: int = 1):
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
+
+        # adding frame skip 
+        self._frame_skip = frame_skip
+        self._dt = self.model.opt.timestep * frame_skip
 
         # state size for full physics state (qpos, qvel, actions, etc)
         self._nstate = mujoco.mj_stateSize(
@@ -34,12 +38,13 @@ class MuJoCoEnv(BaseEnv):
     
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         self.data.ctrl[:] = action 
-        mujoco.mj_step(self.model, self.data)
-        obs = self._get_obs()
-        state = self.get_state()
-        c = self.running_cost(
-            state.reshape(1, 1, -1), action.reshape(1, 1, -1) # running cost has batched inputs (K, H, nstate) but step is just one state
-        ).item()
+        for _ in range(self._frame_skip):
+            mujoco.mj_step(self.model, self.data)
+            obs = self._get_obs()
+            state = self.get_state()
+            c = self.running_cost(
+                state.reshape(1, 1, -1), action.reshape(1, 1, -1) # running cost has batched inputs (K, H, nstate) but step is just one state
+            ).item()
         return obs, c, False, {}
     
     def get_state(self) -> np.ndarray:
@@ -62,12 +67,19 @@ class MuJoCoEnv(BaseEnv):
             action_sequences: np.ndarray, 
     ) -> tuple[np.ndarray, np.ndarray]:
         K, H, _ = action_sequences.shape 
-        states, _ = self._rollout_ctx.rollout(
+        
+        # repeat each action for frame_skip physics steps 
+        actions_expanded = np.repeat(action_sequences, self._frame_skip, axis = 1) 
+        states_full, _ = self._rollout_ctx.rollout(
             self.model, 
             self._data_pool, 
             initial_state, 
-            action_sequences, 
+            actions_expanded, 
         )
+
+        # downsample states: take every frame_skip-th frame 
+        states = states_full[:, self._frame_skip - 1 :: self._frame_skip, :]
+    
         c = self.running_cost(states, action_sequences) # (K, H)
         tc = self.terminal_cost(states[:, -1, :]) # (K, )
         costs = c.sum(axis = 1) + tc 

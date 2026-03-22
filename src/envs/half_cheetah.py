@@ -11,8 +11,8 @@ _XML = str(
 
 class HalfCheetah(MuJoCoEnv):
 
-    def __init__(self, ctrl_cost_weight: float = 0.1, **kwargs):
-        super().__init__(model_path = _XML, **kwargs)
+    def __init__(self, ctrl_cost_weight: float = 0.1, frame_skip: int = 5,**kwargs):
+        super().__init__(model_path=_XML, frame_skip=frame_skip, **kwargs)
         self._ctrl_w = ctrl_cost_weight 
         self._nq = self.model.nq # 9 
         self._nv = self.model.nv # 9 
@@ -27,7 +27,7 @@ class HalfCheetah(MuJoCoEnv):
 
         xvel = states[..., self._nq] # (K, H)
         ctrl = np.sum(actions ** 2, axis = -1) # (K, H)
-        return - 5.0 * xvel + self._ctrl_w * ctrl # (K, H)
+        return -xvel + self._ctrl_w * ctrl # (K, H)
     
     def terminal_cost(self, states: np.ndarray) -> np.ndarray:
           # no terminal cost to start
