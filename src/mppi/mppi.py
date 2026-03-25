@@ -87,7 +87,7 @@ class MPPI:
 
         # shift horizon 
         self.U[:-1] = self.U[1:]
-        self.U[-1] = 0.0 
+        self.U[-1] = self.U[-2].copy()
 
         # store for GPS 
         self._last_states = states

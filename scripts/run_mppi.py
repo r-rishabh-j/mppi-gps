@@ -8,7 +8,7 @@ import mujoco
 
 def main():
     env = HalfCheetah()
-    cfg = MPPIConfig(K=128, H=10, lam=0.303287121111635, noise_sigma=0.3115203301856378)
+    cfg = MPPIConfig(K=128, H=10, lam=0.01, noise_sigma=0.7, adaptive_lam=False)
     controller = MPPI(env, cfg)
 
     env.reset()
