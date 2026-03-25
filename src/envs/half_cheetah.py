@@ -2,6 +2,7 @@
 
 import numpy as np 
 from pathlib import Path 
+from jaxtyping import Array, Float
 
 from src.envs.mujoco_env import MuJoCoEnv
 
@@ -25,9 +26,21 @@ class HalfCheetah(MuJoCoEnv):
         # states are (K, H, nstate)
         # forward velocity is qvel[0] (root x-velocity)
 
-        xvel = states[..., self._nq] # (K, H)
-        ctrl = np.sum(actions ** 2, axis = -1) # (K, H)
-        return -xvel + self._ctrl_w * ctrl # (K, H)
+        w_vel: float = 1.0 
+        w_pitch: float = 0.5 
+        w_controls: float = 0.001  
+
+        qpos: Float[Array, "K T nq"] = states[:, :, :self._nq]
+        qvel: Float[Array, "K T nv"] = states[:, :, self._nq:self._nq + self._nv]
+
+        vx: Float[Array, "K T"] = qvel[:, :, 0]
+        torso_pitch: Float[Array, "K T"] = qpos[:, :, 2]
+
+        ctrls_cost = np.sum(np.square(actions), axis=-1)
+        stage_cost = -w_vel * vx + w_pitch * (torso_pitch ** 2) + w_controls * ctrls_cost
+
+        return stage_cost
+
     
     def terminal_cost(self, states: np.ndarray) -> np.ndarray:
           # no terminal cost to start
