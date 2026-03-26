@@ -7,10 +7,10 @@ from jaxtyping import Array, Float
 
 from src.envs.mujoco_env import MuJoCoEnv
 
-_XML = str(Path(__file__).resolve().parents[2] / "assets" / "half_cheetah.xml")
+_XML = str(Path(__file__).resolve().parents[2] / "assets" / "acrobot.xml")
 
 class Acrobot(MuJoCoEnv):
-    def __init__(self, frame_skip: int = 5, **kwargs):
+    def __init__(self, frame_skip: int = 1, **kwargs):
         super().__init__(model_path=_XML, frame_skip=frame_skip, **kwargs)
         self._nq = self.model.nq # 2 
         self._nv = self.model.nv #2 
@@ -68,7 +68,7 @@ class Acrobot(MuJoCoEnv):
 def _angle_diff(a, b) -> float:
     # signed angular distance wrapped by [-pi, pi]
     diff = a - b 
-    return ((diff + np.pi) % 2*np.pi) - np.pi 
+    return ((diff + np.pi) % (2 * np.pi)) - np.pi
  
 
 
