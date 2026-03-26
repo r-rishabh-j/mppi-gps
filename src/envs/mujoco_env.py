@@ -77,8 +77,8 @@ class MuJoCoEnv(BaseEnv):
             actions_expanded, 
         )
 
-        # downsample states: take every frame_skip-th frame 
-        states = states_full[:, self._frame_skip - 1 :: self._frame_skip, :]
+        # downsample states: take every frame_skip-th frame
+        states = states_full[:, ::self._frame_skip, :]
     
         c = self.running_cost(states, action_sequences) # (K, H)
         tc = self.terminal_cost(states[:, -1, :]) # (K, )
