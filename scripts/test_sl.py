@@ -7,8 +7,12 @@ from src.policy.gaussian_policy import GaussianPolicy
 from src.utils.config import PolicyConfig
 from pathlib import Path
 from src.envs.acrobot import Acrobot
-import mujoco 
 import mediapy 
+
+import os
+os.environ["MUJOCO_GL"] = "egl"
+
+import mujoco 
 
 demo_path = Path("data/acrobot_demos.h5")
 obs_dim = 4 
