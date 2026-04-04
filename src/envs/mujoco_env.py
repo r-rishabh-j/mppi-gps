@@ -97,7 +97,7 @@ class MuJoCoEnv(BaseEnv):
     
         c = self.running_cost(states, action_sequences) # (K, H)
         tc = self.terminal_cost(states[:, -1, :]) # (K, )
-        costs = c.sum(axis = 1) + tc 
+        costs = c.sum(axis = 1) + tc
         return states, costs 
     
 

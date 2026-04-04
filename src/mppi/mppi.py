@@ -19,7 +19,7 @@ class MPPI:
         self.nu = env.action_dim
         self.act_low, self.act_high = env.action_bounds
 
-        self.U = np.zeros((self.H, self.nu))
+        self.reset()
 
         self._last_states = None
         self._last_actions = None
@@ -40,22 +40,22 @@ class MPPI:
         """
         # sample from q = N(U_nominal, sigma^2 I)
         # noise is eps 
-        eps = np.random.randn(self.K, self.H, self.nu) * self.sigma 
-        U_perturbed = self.U[None, :, :] + eps 
+        eps = np.random.randn(self.K, self.H, self.nu) * self.sigma
+        U_perturbed = self.U[None, :, :] + eps
 
-        # clamp before rollout 
-        np.clip(U_perturbed, self.act_low, self.act_high, out = U_perturbed)
-        
-        # rollout 
-        states, costs = self.env.batch_rollout(state, U_perturbed)
+        # clamp before rollout (but keep raw eps for unbiased update)
+        U_clipped = np.clip(U_perturbed, self.act_low, self.act_high)
+
+        # rollout
+        states, costs = self.env.batch_rollout(state, U_clipped)
        
         # compute the prior/ proposal 
         log_prior = None 
         log_proposal = None 
 
         if prior is not None:
-            log_prior = prior(states, U_perturbed)
-            log_proposal = gaussian_log_prob(U_perturbed, self.U, self.sigma)
+            log_prior = prior(states, U_clipped)
+            log_proposal = gaussian_log_prob(U_clipped, self.U, self.sigma)
 
         # compute weights 
         lam = self.lam 
@@ -78,8 +78,8 @@ class MPPI:
                 n_eff = effective_sample_size(weights)
             self.lam = lam 
 
-        # compute the weighted mean 
-        self.U = np.einsum('k, kha -> ha', weights, U_perturbed)
+        # compute the weighted mean (weight raw perturbations to avoid clipping bias)
+        self.U = self.U + np.einsum('k, kha -> ha', weights, eps)
         np.clip(self.U, self.act_low, self.act_high, out = self.U)
 
         # extract action 
@@ -91,7 +91,7 @@ class MPPI:
 
         # store for GPS 
         self._last_states = states
-        self._last_actions = U_perturbed
+        self._last_actions = U_clipped
         self._last_weights = weights
         self._last_costs = costs
 

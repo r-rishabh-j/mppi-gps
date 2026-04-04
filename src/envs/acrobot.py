@@ -1,10 +1,11 @@
 
 """acrobot swing up env"""
 
-import numpy as np 
-from pathlib import Path 
+import mujoco
+import numpy as np
+from pathlib import Path
 from jaxtyping import Array, Float
-from numpy import ndarray 
+from numpy import ndarray
 
 from src.envs.mujoco_env import MuJoCoEnv
 
@@ -13,29 +14,46 @@ _XML = str(Path(__file__).resolve().parents[2] / "assets" / "acrobot.xml")
 class Acrobot(MuJoCoEnv):
     def __init__(self, frame_skip: int = 1, **kwargs) -> None:
         super().__init__(model_path=_XML, frame_skip=frame_skip, **kwargs)
-        self._nq = self.model.nq #2 
-        self._nv = self.model.nv #2 
+        self._nq = self.model.nq #2
+        self._nv = self.model.nv #2
 
-        # this is upright, zero velocity and then the angles for the two joints 
-        self._x_goal: Float[ndarray, "4"] = np.array([np.pi, 0.0, 0.0, 0.0])
+        # this is upright, zero velocity and then the angles for the two joints
+        self._x_goal: Float[ndarray, "4"] = np.array([0.0, 0.0, 0.0, 0.0])
 
-        # cost weights 
-        self._Q: Float[ndarray, "4"] = np.array([1.0, 1.0, 1.0, 1.0])
-        self._R = 0
-        self._P_scale = 1.0 # terminal cost multiplier 
+        # FK constants (from acrobot.xml)
+        self._shoulder_z = 2.0  # shoulder mount height
+        self._l1 = 1.0  # upper arm length
+        self._l2 = 1.0  # lower arm length
+        self._target_z = 4.0  # tip z when upright
+
+        # cost weights — sparse running cost, strong terminal
+        self._w_ctrl = 0.01
+        self._w_height = 0.5
+        self._Q_terminal: Float[ndarray, "4"] = np.array([10.0, 10.0, 1.0, 1.0])
+        self._w_terminal = 200.0
 
     def reset(
-            self, 
-            state: Float[ndarray, "state_dim"] | None = None, 
+            self,
+            state: Float[ndarray, "state_dim"] | None = None,
     ) -> Float[ndarray, "4"]:
         # should be able to establish a fresh simulator state or restore a full state that's been saved
         if state is not None:
             return super().reset(state = state)
 
         obs = super().reset()
-        self.data.qvel[:] = np.random.normal(0.0, 1e-4, size = self._nv)
-        
+        self.data.qpos[:] += np.random.normal(0.0, 0.05, size=self._nq)
+        self.data.qvel[:] = np.random.normal(0.0, 0.05, size=self._nv)
+        mujoco.mj_forward(self.model, self.data)
         return self._get_obs()
+
+    def _tip_dist(self, qpos: Float[Array, "... nq"]) -> Float[Array, "..."]:
+        """Euclidean distance from tip to target via forward kinematics.
+        Target is at (0, 0, 4). Planar system so y=0 always."""
+        q0 = qpos[..., 0]
+        q1 = qpos[..., 1]
+        tip_x = self._l1 * np.sin(q0) + self._l2 * np.sin(q0 + q1)
+        tip_z = self._shoulder_z + self._l1 * np.cos(q0) + self._l2 * np.cos(q0 + q1)
+        return np.sqrt(tip_x**2 + (tip_z - self._target_z)**2)
 
     def running_cost(
             self,
@@ -43,22 +61,13 @@ class Acrobot(MuJoCoEnv):
           actions: Float[Array, "K H nu"],
       ) -> Float[Array, "K H"]:
         qpos: Float[Array, "K H nq"] = self.state_qpos(states)
-        qvel: Float[Array, "K H nv"] = self.state_qvel(states)
+        dist = self._tip_dist(qpos)
 
-        # angle error (wrap the shoulder between negative pi and pi)
-        angle_err_shoulder = _angle_diff(qpos[:, :, 0], self._x_goal[0])
-        angle_err_elbow = qpos[:, :, 1] - self._x_goal[1]
-        vel_err_shoulder = qvel[:, :, 0] - self._x_goal[2]
-        vel_err_elbow = qvel[:, :, 1] - self._x_goal[3]
-
-        # weighted quadratic cost
-        cost = (self._Q[0] * angle_err_shoulder**2
-            + self._Q[1] * angle_err_elbow**2
-            + self._Q[2] * vel_err_shoulder**2
-            + self._Q[3] * vel_err_elbow**2
-            + self._R * np.sum(np.square(actions), axis=-1))
+        # quadratic Cartesian distance cost (good gradient near target for stabilization)
+        cost = (self._w_height * dist**2
+                + self._w_ctrl * np.sum(np.square(actions), axis=-1))
         return cost  # (K, H)
-    
+
     def terminal_cost(
         self,
         states: Float[Array, "K nstate"],
@@ -66,27 +75,18 @@ class Acrobot(MuJoCoEnv):
         qpos: Float[Array, "K nq"] = self.state_qpos(states)
         qvel: Float[Array, "K nv"] = self.state_qvel(states)
 
-        angle_err_shoulder: Float[Array, "K"] = _angle_diff(qpos[:, 0], self._x_goal[0])
-        angle_err_elbow: Float[Array, "K"] = qpos[:, 1] - self._x_goal[1]
-        vel_err_shoulder: Float[Array, "K"] = qvel[:, 0] - self._x_goal[2]
-        vel_err_elbow: Float[Array, "K"] = qvel[:, 1] - self._x_goal[3]
+        dist = self._tip_dist(qpos)
+        vel_cost = np.sum(qvel**2, axis=-1)
 
-        return self._P_scale * (
-            self._Q[0] * angle_err_shoulder**2
-            + self._Q[1] * angle_err_elbow**2
-            + self._Q[2] * vel_err_shoulder**2
-            + self._Q[3] * vel_err_elbow**2
-        )
-    
+        # terminal: quadratic distance + velocity penalty, scaled up
+        return self._w_terminal * (dist**2 + 0.1 * vel_cost)
+
     def _get_obs(self) -> Float[ndarray, "4"]:
         return np.concatenate([self.data.qpos, self.data.qvel])
-    
+
 def _angle_diff(
-        a: Float[ndarray, "..."], 
+        a: Float[ndarray, "..."],
         b: Float[ndarray, "..."],
 ) -> Float[ndarray, "..."]:
-    diff = b - a 
+    diff = b - a
     return ((diff + np.pi) % (2.0 * np.pi)) - np.pi
-
-
-        
