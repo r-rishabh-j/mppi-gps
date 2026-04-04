@@ -21,12 +21,12 @@ class BaseEnv(ABC):
         """Restore simulator to a previously captured state"""
     
     @abstractmethod
-    def running_cost(self, states: np.ndarray, actions: np.ndarray) -> np.ndarray:
-      """Vectorized running cost. states: (K,H,nstate), actions: (K,H,nu) → (K,H)"""
-    
+    def running_cost(self, states: np.ndarray, actions: np.ndarray, sensordata: np.ndarray | None = None) -> np.ndarray:
+      """Vectorized running cost. states: (K,H,nstate), actions: (K,H,nu), sensordata: (K,H,nsensor) → (K,H)"""
+
     @abstractmethod
-    def terminal_cost(self, states: np.ndarray) -> np.ndarray:
-      """Vectorized terminal cost. states: (K,nstate) → (K,)"""
+    def terminal_cost(self, states: np.ndarray, sensordata: np.ndarray | None = None) -> np.ndarray:
+      """Vectorized terminal cost. states: (K,nstate), sensordata: (K,nsensor) → (K,)"""
 
     @property
     @abstractmethod

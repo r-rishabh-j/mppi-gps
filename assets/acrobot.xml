@@ -40,4 +40,8 @@ Based on Coulomb's [1] rather than Spong's [2] model.
    <actuator>
     <motor name="elbow" joint="elbow" gear="2" ctrllimited="true" ctrlrange="-1 1"/>
   </actuator>
+
+  <sensor>
+    <framepos name="tip_pos" objtype="site" objname="tip"/>
+  </sensor>
 </mujoco>

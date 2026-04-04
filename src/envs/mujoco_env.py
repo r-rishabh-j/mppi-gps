@@ -38,13 +38,14 @@ class MuJoCoEnv(BaseEnv):
         return self._get_obs()
     
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
-        self.data.ctrl[:] = action 
+        self.data.ctrl[:] = action
         for _ in range(self._frame_skip):
             mujoco.mj_step(self.model, self.data)
             obs = self._get_obs()
             state = self.get_state()
+            sensor = self.data.sensordata.copy().reshape(1, 1, -1)
             c = self.running_cost(
-                state.reshape(1, 1, -1), action.reshape(1, 1, -1) # running cost has batched inputs (K, H, nstate) but step is just one state
+                state.reshape(1, 1, -1), action.reshape(1, 1, -1), sensor
             ).item()
         return obs, c, False, {}
     
@@ -85,20 +86,21 @@ class MuJoCoEnv(BaseEnv):
         
         # repeat each action for frame_skip physics steps 
         actions_expanded = np.repeat(action_sequences, self._frame_skip, axis = 1) 
-        states_full, _ = self._rollout_ctx.rollout(
-            self.model, 
-            self._data_pool, 
-            initial_state, 
-            actions_expanded, 
+        states_full, sensordata_full = self._rollout_ctx.rollout(
+            self.model,
+            self._data_pool,
+            initial_state,
+            actions_expanded,
         )
 
         # downsample states: take every frame_skip-th frame
         states = states_full[:, ::self._frame_skip, :]
-    
-        c = self.running_cost(states, action_sequences) # (K, H)
-        tc = self.terminal_cost(states[:, -1, :]) # (K, )
+        sensordata = sensordata_full[:, ::self._frame_skip, :]
+
+        c = self.running_cost(states, action_sequences, sensordata) # (K, H)
+        tc = self.terminal_cost(states[:, -1, :], sensordata[:, -1, :]) # (K, )
         costs = c.sum(axis = 1) + tc
-        return states, costs 
+        return states, costs
     
 
     def _get_obs(self) -> np.ndarray:

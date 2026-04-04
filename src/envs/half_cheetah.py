@@ -19,9 +19,10 @@ class HalfCheetah(MuJoCoEnv):
         self._nv = self.model.nv # 9 
 
     def running_cost(
-            self, 
-            states: np.ndarray, 
+            self,
+            states: np.ndarray,
             actions: np.ndarray, # (K, H, action_dim)
+            sensordata: np.ndarray | None = None,
     ) -> np.ndarray:
         # states are (K, H, nstate)
         # forward velocity is qvel[0] (root x-velocity)
@@ -42,7 +43,7 @@ class HalfCheetah(MuJoCoEnv):
         return stage_cost
 
     
-    def terminal_cost(self, states: np.ndarray) -> np.ndarray:
+    def terminal_cost(self, states: np.ndarray, sensordata: np.ndarray | None = None) -> np.ndarray:
           # no terminal cost to start
           return np.zeros(states.shape[0])
 
