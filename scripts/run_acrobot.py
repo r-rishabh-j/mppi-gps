@@ -7,13 +7,7 @@ from src.utils.config import MPPIConfig
 
 def main():
     env = Acrobot()
-    cfg = MPPIConfig(
-        K=512,
-        H=161,
-        lam=0.0743556503761203,
-        noise_sigma=0.22102217055428525,
-        adaptive_lam=False,
-    )
+    cfg = MPPIConfig.load("acrobot")
     controller = MPPI(env, cfg)
 
     renderer = mujoco.Renderer(env.model, height=480, width=640)

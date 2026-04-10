@@ -45,18 +45,18 @@ class Acrobot(MuJoCoEnv):
         dist = np.linalg.norm(tip_pos - _TARGET, axis=-1)
         margin = 4.0 # where the decay hits a specific value
         # adding a gaussian tolerance 
-        _value_at_margin = 0.1 
-        scale = np.sqrt(-2.0 * np.log(_value_at_margin)) # how steep do you want the decay to be
-        d_beyond = np.maximum(dist - target_radius, 0.0)
-        reward = np.where(
-            dist <= target_radius, 
-            1.0, 
-            np.exp(-0.5 * (d_beyond * scale / margin) ** 2), 
-        )
-        gaussian_cost = 1.0 - reward
-        tip_z = sensordata[:, :, 2] 
-        height_cost = 1.0 - tip_z / 4.0
-        return dist**2 / (margin**2) 
+        # _value_at_margin = 0.1 
+        # scale = np.sqrt(-2.0 * np.log(_value_at_margin)) # how steep do you want the decay to be
+        # d_beyond = np.maximum(dist - target_radius, 0.0)
+        # reward = np.where(
+        #     dist <= target_radius, 
+        #     1.0, 
+        #     np.exp(-0.5 * (d_beyond * scale / margin) ** 2), 
+        # )
+        # gaussian_cost = 1.0 - reward
+        # tip_z = sensordata[:, :, 2] 
+
+        return (dist / margin) + 2 *(4 - np.linalg.norm(sensordata, axis=2))
 
     def terminal_cost(
             self,

@@ -25,6 +25,7 @@ class MPPI:
         self._last_actions = None
         self._last_weights = None
         self._last_costs = None
+        self._last_sensordata = None
 
     def reset(self):
         self.U = np.zeros((self.H, self.nu))
@@ -47,7 +48,7 @@ class MPPI:
         U_clipped = np.clip(U_perturbed, self.act_low, self.act_high)
 
         # rollout
-        states, costs = self.env.batch_rollout(state, U_clipped)
+        states, costs, sensordata = self.env.batch_rollout(state, U_clipped)
        
         # baseline warm start
         # q(V) = N(U, sigma^2 I), p(V) = N(0, sigma^2 I)
@@ -64,11 +65,8 @@ class MPPI:
         lam = self.lam 
         weights = compute_weights(costs, lam, log_prior, log_proposal)
         self._last_weights = weights
-        n_eff = effective_sample_size(weights) 
+        n_eff = effective_sample_size(weights)
 
-        import ipdb
-        ipdb.set_trace()
-        
         # you want to make sure that the weights don't collapse aka lambda is not too small 
         # if lambda is small then the policy isn't exploring
         if self.cfg.adaptive_lam:
@@ -100,6 +98,7 @@ class MPPI:
         self._last_actions = U_clipped
         self._last_weights = weights
         self._last_costs = costs
+        self._last_sensordata = sensordata
 
         info = {
             'cost_mean': np.mean(costs),
@@ -115,6 +114,7 @@ class MPPI:
             'actions': self._last_actions,
             'weights': self._last_weights,
             'costs': self._last_costs,
+            'sensordata': self._last_sensordata, 
             }
     
 

@@ -70,7 +70,7 @@ class GaussianPolicy(nn.Module):
 
         lp = self.log_prob(obs_t, act_t) # (N, )
         # this is just the negative weight * log likelihood 
-        loss = -(w_t * lp).sum()
+        loss = -(w_t * lp).sum() / w_t.sum().clamp(min=1e-8)
 
         self.optimizer.zero_grad()
         loss.backward()

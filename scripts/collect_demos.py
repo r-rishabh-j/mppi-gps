@@ -8,24 +8,10 @@ from src.utils.config import MPPIConfig
 from pathlib import Path
 
 # settings for data collection 
-num_conditions = 5 
-episode_len = 200
+num_conditions = 50
+episode_len = 1000
 save_path = Path("data/acrobot_demos.h5")
-
-cfg = MPPIConfig(
-    K = 2048, 
-    H = 100, 
-    lam = 716.7028104220127,
-    noise_sigma = 0.641222666442091,
-    adaptive_lam = False,
-)
-
-def random_initial_state(env: Acrobot, 
-                         rng: np.random.Generator):
-    env.reset()
-    env.data.qpos[:] += rng.normal(0, 0.1, size = env.model.nq)
-    env.data.qvel[:] += rng.normal(0, 0.1, size = env.model.nv)
-    return env.get_state()
+cfg = MPPIConfig.load("acrobot")
 
 def main():
     env = Acrobot()
@@ -37,7 +23,8 @@ def main():
 
     with h5py.File(save_path, "w") as f:
         for i in range(num_conditions):
-            state = random_initial_state(env, rng)
+            env.reset()
+            state = env.get_state()
             controller.reset()
             grp = f.create_group(f"condition_{i}")
 

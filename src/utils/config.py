@@ -1,5 +1,9 @@
 """dataclass configurations for mppi-gps"""
-from dataclasses import dataclass 
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+_CONFIGS_DIR = Path(__file__).resolve().parents[2] / "configs"
 
 @dataclass 
 class MPPIConfig:
@@ -9,9 +13,16 @@ class MPPIConfig:
     # this parameter essentially helps you know how much you want to focus on specific samples vs others 
     noise_sigma: float = 0.5 # exploration noise std 
     adaptive_lam: bool = False # adapt lam in order to maintain the n_eff
-    n_eff_threshold: float = 64.0 # number of samples that you want to contribute to the weighted mean 
+    n_eff_threshold: float = 64.0 # number of samples that you want to contribute to the weighted mean
 
-@dataclass 
+    @staticmethod
+    def load(env_name: str) -> "MPPIConfig":
+        """Load best tuned params from configs/<env_name>_best.json."""
+        path = _CONFIGS_DIR / f"{env_name}_best.json"
+        params = json.loads(path.read_text())
+        return MPPIConfig(**params)
+
+@dataclass
 class PolicyConfig:
     hidden_dims: tuple[int, ...] = (256, 256)
     lr: float = 3e-4

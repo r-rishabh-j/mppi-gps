@@ -100,7 +100,7 @@ class MuJoCoEnv(BaseEnv):
         c = self.running_cost(states, action_sequences, sensordata) # (K, H)
         tc = self.terminal_cost(states[:, -1, :], sensordata[:, -1, :]) # (K, )
         costs = c.sum(axis = 1) + tc
-        return states, costs
+        return states, costs, sensordata
     
 
     def _get_obs(self) -> np.ndarray:

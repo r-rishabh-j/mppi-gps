@@ -55,7 +55,8 @@ class BaseEnv(ABC):
         action_sequences: (K, H, action_dim)
 
         Returns:
-        states: (K, H, nstate) state at each step
-        costs:  (K,) total cost per trajectory
+        states:     (K, H, nstate) state at each step
+        costs:      (K,) total cost per trajectory
+        sensordata: (K, H, nsensor) sensor readings at each step
         """
         

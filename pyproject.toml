@@ -16,6 +16,7 @@ dependencies = [
     "mediapy>=1.2.6",
     "mujoco>=3.1.0",
     "numpy>=1.26.0",
+    "opencv-python>=4.13.0.92",
     "optuna>=4.8.0",
     "pyyaml>=6.0",
     "scipy>=1.12.0",
