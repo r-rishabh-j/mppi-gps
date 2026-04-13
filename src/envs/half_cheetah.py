@@ -53,4 +53,13 @@ class HalfCheetah(MuJoCoEnv):
             self.data.qpos[1:],
             self.data.qvel,
         ])
+
+    def state_to_obs(self, states: np.ndarray) -> np.ndarray:
+        qpos = self.state_qpos(states)[..., 1:]  # skip root x
+        qvel = self.state_qvel(states)
+        return np.concatenate([qpos, qvel], axis=-1)
+
+    @property
+    def obs_dim(self) -> int:
+        return (self._nq - 1) + self._nv
     

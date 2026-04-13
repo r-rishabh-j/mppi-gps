@@ -38,8 +38,17 @@ class BaseEnv(ABC):
 
     @property
     @abstractmethod
+    def obs_dim(self) -> int: ...
+
+    @property
+    @abstractmethod
     def action_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """Returns (low, high) arrays of shape (action_dim,)"""
+
+    @abstractmethod
+    def state_to_obs(self, states: np.ndarray) -> np.ndarray:
+        """Convert full physics states to policy observations.
+        states: (..., nstate) → (..., obs_dim)"""
 
     @abstractmethod
     def batch_rollout(

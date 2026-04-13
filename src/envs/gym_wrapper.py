@@ -86,6 +86,13 @@ class GymEnv(BaseEnv):
     def _get_obs(self):
         return self.gym_env.unwrapped._get_obs()
 
+    def state_to_obs(self, states):
+        return states
+
+    @property
+    def obs_dim(self):
+        return self.gym_env.observation_space.shape[0]
+
     @property
     def state_dim(self):
         return self._nstate

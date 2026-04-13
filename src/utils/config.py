@@ -28,13 +28,18 @@ class PolicyConfig:
     lr: float = 3e-4
     activation: str = "relu"
 
-@dataclass 
+@dataclass
 class GPSConfig:
-    num_iterations: int = 50 
+    num_iterations: int = 50
     num_conditions: int = 5         # number of initial states
-    kl_estimator: str = "moment_matched" # "moment_matched" (Eq 3): fits Gaussian to MPPI samples, closed-form KL — stable but unimodal 
+    episode_length: int = 500       # steps per episode during GPS training
+    kl_estimator: str = "moment_matched" # "moment_matched" (Eq 3): fits Gaussian to MPPI samples, closed-form KL — stable but unimodal
     # "sample_based" (Eq 4): estimates KL directly from weighted particles variance
-    badmm_init_nu: float = 1.0  # initial dual variable (penalizes KL between MPPI and policy)
-    badmm_step_size: float = 2.0 
+    kl_target: float = 1.0          # target KL for BADMM dual update
+    badmm_init_nu: float = 1.0     # initial dual variable (penalizes KL between MPPI and policy)
+    badmm_step_size: float = 2.0
     policy_augmented_alpha: float = 0.1 # weight on -log π(u|x) in MPPI cost (Eq 5)
+    distill_batch_size: int = 256   # mini-batch size for policy distillation
+    distill_epochs: int = 5         # gradient epochs per GPS iteration
+    warm_start_policy: bool = True  # warm-start MPPI nominal U from policy rollout
 

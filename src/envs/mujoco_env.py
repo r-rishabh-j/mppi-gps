@@ -106,8 +106,16 @@ class MuJoCoEnv(BaseEnv):
     def _get_obs(self) -> np.ndarray:
         """ can be overrided in the sub class if you need to change the obs space"""
         return self.get_state()
-    
-    @property 
+
+    def state_to_obs(self, states: np.ndarray) -> np.ndarray:
+        """Default: return full state. Override in subclasses that have reduced obs."""
+        return states
+
+    @property
+    def obs_dim(self) -> int:
+        return self._nstate
+
+    @property
     def state_dim(self) -> int:
         return self._nstate
     

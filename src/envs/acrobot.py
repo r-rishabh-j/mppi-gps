@@ -71,3 +71,12 @@ class Acrobot(MuJoCoEnv):
 
     def _get_obs(self) -> Float[ndarray, "4"]:
         return np.concatenate([self.data.qpos, self.data.qvel])
+
+    def state_to_obs(self, states: np.ndarray) -> np.ndarray:
+        qpos = self.state_qpos(states)
+        qvel = self.state_qvel(states)
+        return np.concatenate([qpos, qvel], axis=-1)
+
+    @property
+    def obs_dim(self) -> int:
+        return self._nq + self._nv

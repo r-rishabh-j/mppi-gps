@@ -1,0 +1,8 @@
+{
+  "K": 512,
+  "H": 64,
+  "noise_sigma": 0.3,
+  "lam": 1.0,
+  "adaptive_lam": true,
+  "n_eff_threshold": 128
+}
