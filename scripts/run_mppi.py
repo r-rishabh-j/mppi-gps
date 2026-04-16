@@ -1,5 +1,5 @@
 import numpy as np 
-from src.envs.half_cheetah import HalfCheetah
+from src.envs.acrobot import Acrobot
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
 import gymnasium as gym 
@@ -7,8 +7,8 @@ import mujoco
 
 
 def main():
-    env = HalfCheetah()
-    cfg = MPPIConfig(K=128, H=10, lam=0.020650190864803457, noise_sigma=0.4255750435453001, adaptive_lam=False)
+    env = Acrobot()
+    cfg = MPPIConfig(K=256, H=10, lam=0.020650190864803457, noise_sigma=0.4255750435453001, adaptive_lam=False)
     controller = MPPI(env, cfg)
 
     env.reset()

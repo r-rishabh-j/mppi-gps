@@ -31,29 +31,17 @@ from src.gps.mppi_gps import MPPIGPS
 from src.utils.config import MPPIConfig, PolicyConfig, GPSConfig
 from src.utils.evaluation import evaluate_policy, evaluate_mppi
 from src.mppi.mppi import MPPI
+from src.envs import make_env
 
 
-# Maps env name → (module path, class name) for dynamic import.
-# Add new environments here to make them available via --env.
-ENV_REGISTRY = {
-    "acrobot": ("src.envs.acrobot", "Acrobot"),
-    "half_cheetah": ("src.envs.half_cheetah", "HalfCheetah"),
-    "point_mass": ("src.envs.point_mass", "PointMass"),
-    "hopper": ("src.envs.hopper", "Hopper"),
-}
-
-
-def make_env(name: str):
-    """Dynamically import and instantiate an environment by name."""
-    mod_path, cls_name = ENV_REGISTRY[name]
-    import importlib
-    mod = importlib.import_module(mod_path)
-    return getattr(mod, cls_name)()
+_ENVS = ["acrobot", "half_cheetah", "point_mass", "hopper"]
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--env", default="acrobot", choices=list(ENV_REGISTRY.keys()))
+    p.add_argument("--env", default="acrobot", choices=_ENVS)
+    p.add_argument("--backend", default="cpu", choices=["cpu", "gpu"],
+                   help="'cpu' (MuJoCo threads) or 'gpu' (MJX/JAX)")
     p.add_argument("--gps-iters", type=int, default=None,
                    help="Number of GPS iterations (default: from GPSConfig)")
     p.add_argument("--num-conditions", type=int, default=None,
@@ -76,10 +64,11 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    env = make_env(args.env)
+    env = make_env(args.env, backend=args.backend)
 
     # Load tuned MPPI hyperparameters from configs/<env>_best.json
     mppi_cfg = MPPIConfig.load(args.env)
+    mppi_cfg.backend = args.backend
     policy_cfg = PolicyConfig()
     gps_cfg = GPSConfig()
 
@@ -151,9 +140,11 @@ def main():
     )
 
     print("--- Evaluating MPPI baseline ---")
-    mppi = MPPI(env, mppi_cfg)
+    # MPPI baseline always uses CPU controller for evaluation
+    eval_env = make_env(args.env, backend="cpu") if args.backend == "gpu" else env
+    mppi = MPPI(eval_env, mppi_cfg)
     mppi_stats = evaluate_mppi(
-        env, mppi,
+        eval_env, mppi,
         n_episodes=args.n_eval,
         episode_len=args.eval_len,
         seed=args.seed,

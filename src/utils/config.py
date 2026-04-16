@@ -11,7 +11,8 @@ class MPPIConfig:
     H: int = 50 # planning horizon 
     lam: float = 1.0 # temperature parameter 
     # this parameter essentially helps you know how much you want to focus on specific samples vs others 
-    noise_sigma: float = 0.5 # exploration noise std 
+    noise_sigma: float = 0.5 # exploration noise std
+    backend: str = "cpu"  # "cpu" or "gpu" (MJX/JAX)
     adaptive_lam: bool = False # adapt lam in order to maintain the n_eff
     n_eff_threshold: float = 64.0 # number of samples that you want to contribute to the weighted mean
 

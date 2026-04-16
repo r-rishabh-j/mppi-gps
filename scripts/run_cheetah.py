@@ -8,7 +8,7 @@ import mujoco
 
 def main():
     env = HalfCheetah()
-    cfg = MPPIConfig(K=128, H=10, lam=0.025187910703501223, noise_sigma=0.35180969970545684, adaptive_lam=False)
+    cfg = MPPIConfig(K=1024, H=20, lam=0.025187910703501223, noise_sigma=0.35180969970545684, adaptive_lam=False)
     controller = MPPI(env, cfg)
 
     env.reset()
@@ -27,7 +27,7 @@ def main():
         state = env.get_state()
         costs.append(info["cost_mean"])
 
-        renderer.update_scene(env.data)
+        renderer.update_scene(env.data, camera="track")
         frames.append(renderer.render().copy())
 
         weights = np.sum(-controller._last_weights * np.log2(controller._last_weights))

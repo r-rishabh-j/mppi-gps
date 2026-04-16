@@ -28,6 +28,10 @@ python -m scripts.test_sl
 python -m scripts.run_gps --env acrobot
 python -m scripts.run_gps --env hopper --gps-iters 30
 
+# GPU-accelerated GPS training (MJX/JAX backend)
+python -m scripts.run_gps --env hopper --backend gpu
+python -m scripts.run_ablations --env acrobot --backend gpu
+
 # Hyperparameter tuning (Optuna)
 python -m scripts.tuning.tune_acrobot
 python -m scripts.tuning.tune_cheetah
@@ -45,13 +49,17 @@ No unit test framework is configured. Validation is done via `scripts/test_sl.py
 
 ## Architecture
 
-- **`src/mppi/mppi.py`** — Core MPPI controller. Samples K trajectory perturbations, computes importance-weighted updates to a nominal action sequence, and supports adaptive temperature (λ) to maintain effective sample size.
-- **`src/envs/`** — Environment implementations behind an abstract `BaseEnv` interface (`base.py`). `mujoco_env.py` wraps MuJoCo with multi-threaded batch rollout. `gym_wrapper.py` adapts Gymnasium envs. Concrete tasks: `point_mass.py`, `half_cheetah.py`, `acrobot.py`, `hopper.py`. Each env provides `state_to_obs()` for converting full physics state to policy observations.
+- **`src/mppi/mppi.py`** — Core MPPI controller (CPU/numpy). Samples K trajectory perturbations, computes importance-weighted updates to a nominal action sequence, and supports adaptive temperature (λ) to maintain effective sample size.
+- **`src/mppi/mppi_jax.py`** — GPU-accelerated MPPI controller (JAX). Same public API as `mppi.py` but runs noise sampling, batch rollout, cost computation, and weight update as a single JIT-compiled function on GPU.
+- **`src/envs/`** — Environment implementations behind an abstract `BaseEnv` interface (`base.py`). `mujoco_env.py` wraps MuJoCo with multi-threaded batch rollout (CPU). `mjx_env.py` wraps MJX for GPU batch rollout via `jax.vmap` + `jax.lax.scan`. `gym_wrapper.py` adapts Gymnasium envs. Concrete tasks: `point_mass.py`, `half_cheetah.py`, `acrobot.py`, `hopper.py` (CPU) and `mjx_*.py` variants (GPU). Each env provides `state_to_obs()` for converting full physics state to policy observations. Factory: `src.envs.make_env(name, backend="cpu"|"gpu")`.
 - **`src/policy/gaussian_policy.py`** — Diagonal Gaussian MLP policy for behavior cloning and GPS distillation.
 - **`src/gps/mppi_gps.py`** — Core GPS training loop (`MPPIGPS` class). Distills MPPI into the policy via BADMM-constrained optimization with policy-augmented MPPI cost and moment-matched or sample-based KL estimators.
 - **`src/gps/ilqr.py`** — GPS via iLQR (skeleton/in-progress).
 - **`src/utils/config.py`** — Dataclass configs (`MPPIConfig`, `PolicyConfig`, `GPSConfig`).
-- **`src/utils/math.py`** — Numerically stable log-sum-exp, weight computation, KL helpers.
+- **`src/utils/math.py`** — Numerically stable log-sum-exp, weight computation, KL helpers (numpy).
+- **`src/utils/math_jax.py`** — JAX equivalents for GPU path.
+- **`src/envs/costs_jax.py`** — Pure JAX cost functions for all environments (used by MJX path).
+- **`src/backend.py`** — Backend enum and JAX device utilities.
 - **`src/utils/evaluation.py`** — Shared `evaluate_policy` and `evaluate_mppi` used by GPS and BC scripts.
 - **`configs/`** — JSON hyperparameter configs (e.g., `acrobot_best.json`).
 - **`assets/`** — MuJoCo XML model files.
@@ -59,6 +67,7 @@ No unit test framework is configured. Validation is done via `scripts/test_sl.py
 ## Key Patterns
 
 - States are `(K, H, state_dim)` arrays, actions `(K, H, action_dim)`, costs `(K,)` — heavy NumPy broadcasting throughout.
-- Batch rollouts use MuJoCo's native `rollout` API with thread pool for parallel trajectory simulation.
-- `jaxtyping` annotations document array shapes (JAX is used only for type hints, not computation).
+- CPU batch rollouts use MuJoCo's native `rollout` API with thread pool. GPU batch rollouts use MJX (`jax.vmap` + `jax.lax.scan`) — selected via `--backend gpu`.
+- `jaxtyping` annotations document array shapes. JAX/MJX is used for GPU-accelerated rollouts and cost computation.
+- GPU acceleration works on Apple Silicon (Metal via `jax-metal`) and NVIDIA (CUDA via `jax[cuda12]`) — install the appropriate extra: `uv sync --extra metal` or `uv sync --extra cuda`.
 - Python >=3.11 required. Dependency management via `uv` with `uv.lock` for reproducibility.

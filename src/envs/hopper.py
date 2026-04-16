@@ -34,7 +34,7 @@ _ANGLE_MAX = 0.2
 class Hopper(MuJoCoEnv):
     def __init__(
         self,
-        frame_skip: int = 5,
+        frame_skip: int = 4,
         ctrl_cost_weight: float = 0.001,
         forward_reward_weight: float = 1.0,
         healthy_reward: float = 1.0,
@@ -64,16 +64,22 @@ class Hopper(MuJoCoEnv):
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs()
 
-    def _is_healthy(self, qpos_z: np.ndarray, qpos_angle: np.ndarray) -> np.ndarray:
+    def _is_healthy(self, qpos_z: np.ndarray, qpos_angle: np.ndarray,
+                    obs: np.ndarray | None = None) -> np.ndarray:
         """Vectorised health check.  Works for both scalar and batched inputs.
 
         The hopper is "healthy" when:
           - z position (rootz) is above _Z_MIN  (hasn't fallen)
           - torso angle (rooty) is within [-_ANGLE_MAX, _ANGLE_MAX]  (upright)
+          - all observation values are finite and within (-100, 100)
         """
         z_ok = qpos_z > _Z_MIN
         angle_ok = np.abs(qpos_angle) < _ANGLE_MAX
-        return z_ok & angle_ok
+        healthy = z_ok & angle_ok
+        if obs is not None:
+            state_ok = np.all(np.isfinite(obs)) & np.all(np.abs(obs) < 100.0)
+            healthy = healthy & state_ok
+        return healthy
 
     def running_cost(
         self,
@@ -126,11 +132,10 @@ class Hopper(MuJoCoEnv):
         this method returns done=True when the hopper falls.
         """
         obs, cost, _, info = super().step(action)
-        # Check health *after* the physics step
         z = self.data.qpos[1]
         angle = self.data.qpos[2]
         done = not self._is_healthy(
-            np.array(z), np.array(angle)
+            np.array(z), np.array(angle), obs
         ).item()
         return obs, cost, done, info
 

@@ -17,6 +17,7 @@ class HalfCheetah(MuJoCoEnv):
         self._ctrl_w = ctrl_cost_weight 
         self._nq = self.model.nq # 9 
         self._nv = self.model.nv # 9 
+        print('dims', self._nq, self._nv)
 
     def running_cost(
             self,
@@ -28,13 +29,13 @@ class HalfCheetah(MuJoCoEnv):
         # forward velocity is qvel[0] (root x-velocity)
 
         w_vel: float = 1.0 
-        w_pitch: float = 0.5 
+        w_pitch: float = 0.5
         w_controls: float = 0.001  
 
         qpos: Float[Array, "K T nq"] = states[:, :, :self._nq]
         qvel: Float[Array, "K T nv"] = states[:, :, self._nq:self._nq + self._nv]
 
-        vx: Float[Array, "K T"] = qvel[:, :, 0]
+        vx: Float[Array, "K T"] = qvel[:, :, 1]
         torso_pitch: Float[Array, "K T"] = qpos[:, :, 2]
 
         ctrls_cost = np.sum(np.square(actions), axis=-1)

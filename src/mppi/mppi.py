@@ -61,8 +61,8 @@ class MPPI:
         if prior is not None:
             log_prior = log_prior + prior(states, U_clipped)
 
-        # compute weights 
-        lam = self.lam 
+        # compute weights
+        lam = self.lam
         weights = compute_weights(costs, lam, log_prior, log_proposal)
         self._last_weights = weights
         n_eff = effective_sample_size(weights)

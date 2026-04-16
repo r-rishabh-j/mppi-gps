@@ -79,11 +79,11 @@ class GaussianPolicy(nn.Module):
     
     # this is the numpy variant for the log prob function since mppi uses numpy 
     @torch.no_grad()
-    def log_prob_np(self, 
-                    obs: np.ndarray, 
+    def log_prob_np(self,
+                    obs: np.ndarray,
                     actions: np.ndarray) -> np.ndarray:
-        obs_t = torch.as_tensor(obs, dtype = torch.float32)
-        act_t = torch.as_tensor(actions, dtype = torch.float32)
+        obs_t = torch.from_numpy(np.array(obs, dtype=np.float32, copy=True))
+        act_t = torch.from_numpy(np.array(actions, dtype=np.float32, copy=True))
         return self.log_prob(obs_t, act_t).numpy()
     
 

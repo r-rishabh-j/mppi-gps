@@ -51,14 +51,17 @@ def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float, nu: fl
         nu:     BADMM dual variable — scales how strongly the constraint is
                 enforced.  Starts at badmm_init_nu and is updated each iter.
     """
-    def prior_fn(states: np.ndarray, actions: np.ndarray) -> np.ndarray:
+    def prior_fn(states, actions) -> np.ndarray:
         # states:  (K, H, nstate) — full physics states from batch_rollout
         # actions: (K, H, act_dim) — clipped perturbed action sequences
+        # Ensure numpy (MPPIJAX may pass JAX arrays from the prior bridge)
+        states = np.asarray(states)
+        actions = np.asarray(actions)
         K, H, _ = states.shape
 
         # Convert full physics states to policy-sized observations.
         # E.g. for Acrobot this extracts [qpos, qvel] from [time, qpos, qvel, …]
-        obs = env.state_to_obs(states)              # (K, H, obs_dim)
+        obs = np.asarray(env.state_to_obs(states))  # (K, H, obs_dim)
 
         # Flatten the (K, H) grid into a single batch for the policy network,
         # evaluate log π(u | obs) for every (obs, action) pair, then reshape
@@ -276,7 +279,12 @@ class MPPIGPS:
 
         # A single MPPI controller instance, reused across conditions
         # (we reset its nominal U between conditions).
-        self.mppi = MPPI(env, mppi_cfg)
+        # Use JAX-backed MPPI when backend="gpu".
+        if mppi_cfg.backend == "gpu":
+            from src.mppi.mppi_jax import MPPIJAX
+            self.mppi = MPPIJAX(env, mppi_cfg)
+        else:
+            self.mppi = MPPI(env, mppi_cfg)
 
     # ----- helpers ---------------------------------------------------------
 
@@ -458,8 +466,8 @@ class MPPIGPS:
                     # We only need the first-step actions (what MPPI considered
                     # at this timestep) and their importance weights.
                     rollout_data = self.mppi.get_rollout_data()
-                    first_step_actions = rollout_data['actions'][:, 0, :]  # (K, act_dim)
-                    weights = rollout_data['weights']                       # (K,)
+                    first_step_actions = np.asarray(rollout_data['actions'][:, 0, :])  # (K, act_dim)
+                    weights = np.asarray(rollout_data['weights'])                       # (K,)
 
                     episode_obs.append(obs.copy())
                     episode_actions.append(action.copy())  # the executed action
