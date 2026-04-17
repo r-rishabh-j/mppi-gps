@@ -60,6 +60,13 @@ python -m scripts.run_gps --env acrobot --device auto
 python -m scripts.run_gps --env hopper --gps-iters 30 --device auto
 ```
 
+Outputs (in `--ckpt-dir`, default `checkpoints/`):
+- `gps_<env>_iter<k:03d>.pt` — per-iteration policy weights.
+- `gps_<env>_best.pt` — weights from the iteration with the lowest mean rollout cost.
+- `gps_<env>.pt` — final iteration weights.
+- `gps_<env>_curves.json` / `.png` — cost / KL / nu / distill-loss curves.
+- `gps_<env>.mp4` — first eval-episode video of the trained policy.
+
 ### Policy-prior-only GPS (no KL / no BADMM)
 
 Bias MPPI with `-α·log π(u|s)`, then plain behavior-clone the resulting
@@ -67,8 +74,13 @@ Bias MPPI with `-α·log π(u|s)`, then plain behavior-clone the resulting
 stays constant at `--nu` (default 1.0).
 
 ```bash
-python -m scripts.run_gps --env acrobot --disable-kl --distill-loss mse \
-    --alpha 0.1 --nu 1.0 --device auto
+python -m scripts.run_gps --env acrobot --disable-kl --distill-loss nll \
+    --alpha 0.1 --device auto --gps-iters 20
+
+# quick smoke test
+python -m scripts.run_gps --env acrobot --disable-kl --distill-loss nll \
+    --alpha 0.1 --nu 1.0 --gps-iters 3 --num-conditions 2 --episode-length 80 \
+    --n-eval 2 --eval-len 80 --device cpu
 ```
 
 Flags:
@@ -76,7 +88,27 @@ Flags:
 - `--distill-loss {nll,mse}` — `mse` matches plain BC, `nll` uses weighted NLL (default).
 - `--alpha` — weight on `-log π` inside the MPPI cost (policy-prior strength).
 - `--nu` — constant multiplier on the prior; effective weight is `alpha * nu`.
+- `--gps-iters`, `--num-conditions`, `--episode-length` — override `GPSConfig` defaults.
+- `--n-eval`, `--eval-len` — evaluation episode count / length.
+- `--ckpt-dir` — where per-iter / best / final checkpoints are saved (default `checkpoints/`).
 - `--device auto|cpu|mps|cuda` — policy training device (MPPI always runs on CPU).
+
+## Evaluate a saved checkpoint
+
+Load any `.pt` policy state_dict and evaluate it (observation-normalizer
+stats and tanh-squash buffers are restored automatically via `state_dict`).
+
+```bash
+python -m scripts.eval_checkpoint --env acrobot \
+    --ckpt checkpoints/gps_acrobot_best.pt \
+    --n-eval 10 --render
+```
+
+Flags:
+- `--ckpt` — path to a policy `state_dict` (GPS / DAgger / BC all compatible).
+- `--n-eval`, `--eval-len` — evaluation episode count / length.
+- `--render` — save an mp4 of episode 0 next to the checkpoint (or at `--video-out`).
+- `--device auto|cpu|mps|cuda` — inference device.
 
 ## Baselines, tuning, ablations
 

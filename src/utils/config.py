@@ -25,13 +25,17 @@ class MPPIConfig:
 @dataclass
 class PolicyConfig:
     hidden_dims: tuple[int, ...] = (256, 256)
-    lr: float = 3e-4
+    lr: float = 5e-3
     activation: str = "relu"
+    obs_norm: bool = True
+    log_sigma_min: float = -5.0
+    log_sigma_max: float = 2.0
+    squash_tanh: bool = True
 
 @dataclass
 class GPSConfig:
     num_iterations: int = 50
-    num_conditions: int = 5         # number of initial states
+    num_conditions: int = 20         # number of initial states
     episode_length: int = 500       # steps per episode during GPS training
     kl_estimator: str = "moment_matched" # "moment_matched" (Eq 3): fits Gaussian to MPPI samples, closed-form KL — stable but unimodal
     # "sample_based" (Eq 4): estimates KL directly from weighted particles variance

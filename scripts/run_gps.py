@@ -101,15 +101,23 @@ def main():
               f"distill_loss={gps_cfg.distill_loss})")
 
     # ---- Training ----
-    gps = MPPIGPS(env, mppi_cfg, policy_cfg, gps_cfg, device=device)
-    history = gps.train()
-
-    # ---- Save checkpoint ----
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / f"gps_{args.env}.pt"
+    env_tag = f"gps_{args.env}"
+
+    gps = MPPIGPS(env, mppi_cfg, policy_cfg, gps_cfg, device=device)
+    history = gps.train(checkpoint_dir=ckpt_dir, env_tag=env_tag)
+
+    # ---- Save final checkpoint (alongside per-iter + best from train()) ----
+    ckpt_path = ckpt_dir / f"{env_tag}.pt"
     torch.save(gps.policy.state_dict(), ckpt_path)
-    print(f"\nsaved policy checkpoint to {ckpt_path}")
+    print(f"\nsaved final policy checkpoint to {ckpt_path}")
+    if history.best_iter >= 0:
+        best_path = ckpt_dir / f"{env_tag}_best.pt"
+        print(
+            f"best iter: {history.best_iter} "
+            f"(cost={history.best_cost:.2f}) → {best_path}"
+        )
 
     # ---- Save learning curves as JSON ----
     curves_path = ckpt_dir / f"gps_{args.env}_curves.json"

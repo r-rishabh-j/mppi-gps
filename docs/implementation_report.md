@@ -2,336 +2,241 @@
 
 ## Overview
 
-This document describes the implementation of the MPPI-based Guided Policy Search (GPS) system that distills an online MPPI trajectory optimiser into a cheap, reactive neural network policy. The core idea is: MPPI produces excellent trajectories at high computational cost (K rollouts per step); GPS trains a feedforward policy to mimic MPPI's behaviour, enabling real-time deployment without the simulator-in-the-loop.
+This document describes the implementation of an MPPI-based **Guided Policy Search (GPS)** system that distills an online MPPI trajectory optimiser into a cheap, reactive neural-network policy. The core idea: MPPI produces excellent trajectories at high computational cost (K rollouts per step); GPS trains a feedforward policy to mimic MPPI's behaviour, enabling real-time deployment without the simulator-in-the-loop.
+
+Two distillation methods are implemented and share the same student (`GaussianPolicy`) and evaluation harness:
+
+- **MPPI-GPS** (`src/gps/mppi_gps.py`) — policy-augmented MPPI cost + weighted MLE, optionally with BADMM-style KL constraint. Supports a "policy-prior-only" variant (`--disable-kl`) which is used by default for current experiments.
+- **DAgger** (`src/gps/dagger.py`) — MPPI-in-the-loop BC with a linearly-decayed mixing coefficient β and an aggregating buffer.
+
+A standalone BC pipeline (`scripts/collect_bc_demos.py` → `scripts/test_sl.py`) is kept as a one-shot baseline.
+
+All MPPI batch rollouts run on CPU via MuJoCo's native `rollout` API with a thread pool. The student policy can train on CPU / MPS / CUDA — selected with `--device auto|cpu|mps|cuda` — resolved by `src/utils/device.py::pick_device`. The MJX / JAX GPU path that earlier drafts carried has been **removed**; `--backend` no longer exists.
 
 ---
 
-## What Was Implemented
+## Current Architecture
 
-### Phase 1: Core GPS Loop
+### Student Policy — `src/policy/gaussian_policy.py`
 
-#### 1. `state_to_obs` and `obs_dim` on all environments
+Diagonal-Gaussian MLP with three training-stability features, all gated by `PolicyConfig` and saved into `state_dict` via registered buffers (so checkpoints restore cleanly without any custom load code):
 
-**Files modified:** `src/envs/base.py`, `src/envs/mujoco_env.py`, `src/envs/acrobot.py`, `src/envs/half_cheetah.py`, `src/envs/point_mass.py`, `src/envs/gym_wrapper.py`
+1. **Running observation normalizer** (`RunningNormalizer`). Non-trainable buffers `mean`, `var`, `count` updated via a Welford parallel merge. Critically, `update()` is **explicit** — only the supervised training path (`train_weighted`) calls it, so MPPI's policy-prior queries (which pass trajectory-sample actions through `log_prob_np`) cannot corrupt the running stats.
+2. **`log_sigma` clamp** in `_head()` to `[log_sigma_min, log_sigma_max]` (defaults `[-5.0, 2.0]`). Prevents the classic NLL pathologies of `σ → 0` (infinite log-likelihood gradients on slight action mismatches) and `σ → ∞` (vanishing signal).
+3. **Optional tanh-squashed head** (`squash_tanh=True`). Rescales via buffers `_act_scale` / `_act_bias` to the env action box, with a change-of-variables correction `Σ_i log(1 - tanh² u_i + ε) + Σ_i log(scale_i)` applied in `log_prob`. Off by default for acrobot/point-mass; intended for hopper/cheetah where MPPI teacher samples live on the action-box boundary.
 
-MPPI works with **full physics states** (from `mj_getState`: `[time, qpos, qvel, act, ...]`) but the policy network works with **observations** (e.g. `[qpos, qvel]` for Acrobot, or `[qpos[1:], qvel]` for HalfCheetah where root x is excluded).
+`train_weighted` runs one Adam step of weighted NLL. `act_np` / `log_prob_np` are the numpy bridges used by MPPI and the eval harness.
 
-The new `state_to_obs(states)` method converts batched full-state arrays `(..., nstate)` to policy-sized observations `(..., obs_dim)`, using the existing `state_qpos` / `state_qvel` helpers that correctly handle the time offset at index 0.
+### MPPI-GPS core — `src/gps/mppi_gps.py`
 
-| Environment | obs_dim | Observation contents |
-|---|---|---|
-| Acrobot | 4 | qpos (2) + qvel (2) |
-| HalfCheetah | 17 | qpos[1:] (8) + qvel (9) — skip root x |
-| PointMass | 4 | qpos (2) + qvel (2) |
-| Hopper | 11 | qpos[1:] (5) + clip(qvel, -10, 10) (6) |
+**`make_policy_prior(policy, env, alpha, nu)`** — builds the callable plugged into MPPI's `prior` arg. Returns `+α·ν · Σ_t log π(u_t | obs_t)` per trajectory. Because MPPI computes `log_w = -S/λ + log_prior`, a positive prior reduces the effective cost of policy-likely trajectories.
 
-#### 2. `src/gps/mppi_gps.py` — Core GPS training class
+**KL estimators**:
+- **`compute_kl_moment_matched`** (Eq. 3) — fits `N(μ_t, Σ_t)` to the K weighted MPPI first-step actions, then computes closed-form `KL(p || q)` against the diagonal-Gaussian policy at `obs_t`.
+- **`compute_kl_sample_based`** (Eq. 4) — `KL ≈ Σ_k w_k (log w_k - log π(u_k | x_k))` directly on weighted particles; higher variance but multi-modal-aware.
 
-This is the central new file. It contains:
+**`MPPIGPS.train(num_iterations=None, checkpoint_dir=None, env_tag="gps")`** — main loop:
 
-**`make_policy_prior(policy, env, alpha, nu)`** — Builds the callable that plugs into MPPI's `prior` argument. Returns `+alpha * nu * sum_t log π(u_t | obs_t)` for each of the K trajectory samples. This biases MPPI toward actions the policy can represent (Eq. 5 from the proposal). The sign is positive because MPPI's weight formula is `log_w = -cost/λ + log_prior`, so a positive prior *reduces* the effective cost.
+- **C-step**: for each of the `num_conditions` fixed initial states, run MPPI for `episode_length` steps with the policy-augmented prior. Collect `(obs_t, action_t)` pairs and — unless `disable_kl_constraint` — per-timestep `(K actions, K weights)` for KL.
+- **S-step**: concatenate all conditions' data, run `distill_epochs` passes of mini-batched distillation (`distill_batch_size`). `distill_loss` selects `"nll"` (weighted NLL via `train_weighted`) or `"mse"` (MSE on policy mean — reduces to plain BC).
+- **KL + BADMM**: if enabled, compute mean KL across conditions and update ν multiplicatively (`ν *= step` if KL > target, else `ν /= step`, clamped to `[1e-4, 1e4]`).
+- **Checkpointing** (new): per iteration, write `{env_tag}_iter{k:03d}.pt`. Track the best-so-far `mean_cost`; on improvement, overwrite `{env_tag}_best.pt` and record `(best_iter, best_cost)` on the returned `GPSHistory`.
+- **Warm-start**: iter ≥ 1 seeds MPPI's nominal `U` by rolling the current policy from the init state (`_warm_start_mppi`). Terminal-done states are padded with zero actions so post-terminal garbage obs never reach the policy.
 
-**`_kl_diagonal_gaussian(mu_p, cov_p, mu_q, log_sigma_q)`** — Closed-form KL divergence from a full-covariance Gaussian (moment-matched MPPI distribution) to a diagonal Gaussian (policy output). Uses the standard formula:
+**Policy-prior-only variant** (`disable_kl_constraint=True` / `--disable-kl`) — skips KL / BADMM entirely and holds `ν` constant at `badmm_init_nu`. The C-step's prior weight is the constant `α·ν`; the S-step is plain supervised distillation.
 
-```
-KL(p||q) = 0.5 * [tr(Σ_q⁻¹ Σ_p) + (μ_q - μ_p)ᵀ Σ_q⁻¹ (μ_q - μ_p) - D + ln(det Σ_q / det Σ_p)]
-```
+**Key correctness fixes carried in the current implementation**:
+- Iteration-0 always calls `self.mppi.reset()` (zeros the nominal `U`); earlier drafts skipped the reset when `warm_start_policy=True`, leaking MPPI state across conditions.
+- KL first-step action / weight buffers are `np.array(...)` copies of `rollout_data` — MPPI overwrites `_last_*` slots on the next `plan_step`, so views would silently alias.
+- Warm-start respects env `done`, padding with zero actions.
 
-Since Σ_q is diagonal, the inverse and log-determinant reduce to element-wise operations.
+### DAgger — `src/gps/dagger.py`
 
-**`compute_kl_moment_matched()`** — Eq. 3 estimator. At each timestep t:
-1. Fits `N(μ_t, Σ_t)` to the K weighted MPPI first-step actions via `weighted_mean_cov`.
-2. Queries the policy for `π_θ(·|obs_t) = N(μ_π, σ_π²I)`.
-3. Computes closed-form KL and averages over timesteps.
+`DAggerTrainer` runs the policy in the env and relabels every visited full state with `mppi.plan_step` as the expert. β-schedule (`linear` 1→0 over K/2 iters, or `constant_zero`) mixes policy vs MPPI **execution** during rollout; relabelling always uses MPPI. An aggregating buffer (`buffer_cap`, FIFO eviction) persists across iterations. Per iter: finetune via MSE-on-mean for `distill_epochs` on the full buffer, optionally seeded from a BC h5 via `--seed-from`.
 
-**`compute_kl_sample_based()`** — Eq. 4 estimator. Uses the identity `KL ≈ Σ_k w_k (log w_k - log π(u_k|x_k))` directly on the weighted particles, without fitting a Gaussian. Higher variance but captures multi-modal distributions.
+### Shared components
 
-**`MPPIGPS` class** — The main training loop, alternating between:
-- **C-step** (controller step): For each initial condition, run MPPI with the policy-augmented prior for a full episode. Collect executed (obs, action) pairs and per-timestep MPPI sample distributions.
-- **S-step** (supervised step): Aggregate all (obs, action) pairs across conditions, then run multiple epochs of mini-batched weighted MLE to distill into the policy.
-- **BADMM update**: If KL > target, multiply nu by step_size (tighten); if KL < target, divide (relax). Clamped to [1e-4, 1e4].
-- **Warm-start**: After the first iteration, roll out the policy from each initial condition to seed MPPI's nominal U, so MPPI refines rather than searches from scratch.
+- **`src/utils/config.py`** — four dataclasses: `MPPIConfig` (K / H / lam / noise_sigma / adaptive_lam / n_eff_threshold, `load(env_name)` reads `configs/<env>_best.json`), `PolicyConfig` (hidden_dims, lr, activation, plus the four new stability fields `obs_norm`, `log_sigma_min`, `log_sigma_max`, `squash_tanh`), `GPSConfig`, `DAggerConfig`.
+- **`src/utils/evaluation.py`** — `evaluate_policy` and `evaluate_mppi` using a shared seed schedule `(seed + ep)` so GPS-vs-MPPI per-episode comparisons start from identical initial conditions.
+- **`src/utils/device.py`** — `pick_device("auto"|"cpu"|"mps"|"cuda")` resolving `auto` → cuda → mps → cpu.
+- **`src/utils/math.py`** — log-sum-exp, weight computation, weighted-mean-cov, KL helpers (numpy).
+- **`src/envs/`** — `BaseEnv` + `MuJoCoEnv` base, concrete envs: `acrobot`, `half_cheetah`, `point_mass`, `hopper`. Factory: `src.envs.make_env(name)`. Every env exposes `state_to_obs(states)` for the policy-sized projection and `obs_dim` as a property. Hopper terminates via `done=True` on `z < 0.7` or `|angle| > 0.2` in single-step mode; batch rollouts don't terminate — high unhealthy cost discourages falling.
 
-#### 3. `GPSConfig` extensions
+---
 
-**File modified:** `src/utils/config.py`
+## Entry Points
 
-New fields added to `GPSConfig`:
-- `episode_length: int = 500` — steps per episode during GPS training
-- `kl_target: float = 1.0` — target KL for BADMM dual update
-- `distill_batch_size: int = 256` — mini-batch size for policy gradient steps
-- `distill_epochs: int = 5` — number of gradient passes per GPS iteration
-- `warm_start_policy: bool = True` — whether to seed MPPI from the policy
+### MPPI (open-loop, baseline)
 
-#### 4. `src/utils/evaluation.py` — Shared evaluation helpers
-
-**New file.** Extracted `evaluate_policy()` and `evaluate_mppi()` from `scripts/test_sl.py` into a shared module. Both functions use the same seed schedule `(seed + ep)` so that episode i starts from identical initial conditions, making per-episode cost comparisons apples-to-apples.
-
-`scripts/test_sl.py` was updated to import from this shared module instead of defining its own copies.
-
-#### 5. `scripts/run_gps.py` — Main GPS training script
-
-**New file.** Entry point that:
-1. Creates the environment and loads tuned MPPI hyperparameters from `configs/<env>_best.json`.
-2. Instantiates `MPPIGPS` and runs `train()`.
-3. Saves the policy checkpoint (`.pt`) and learning curves (JSON + PNG).
-4. Evaluates GPS policy vs MPPI baseline on 10 episodes with matched seeds.
-5. Renders an MP4 video of the trained policy's first evaluation episode.
-
-### Phase 2: Hopper Environment
-
-#### 6. `src/envs/hopper.py` — Contact-rich locomotion task
-
-**New file.** `assets/hopper.xml` copied from Gymnasium's bundled MuJoCo assets.
-
-Model: 6 qpos (rootx, rootz, rooty, thigh, leg, foot), 6 qvel, 3 actuators (range [-1, 1]).
-
-Cost function mirrors the negated Gymnasium Hopper-v5 reward:
-```
-cost = -forward_velocity_weight * vx  -  healthy_reward * is_healthy  +  ctrl_weight * ||u||²
+```bash
+python -m scripts.run_acrobot       # per-env tuning-style harness
+python -m scripts.run_cheetah
+python -m scripts.run_hopper
+python -m scripts.run_point_mass
+python -m scripts.run_mppi          # generic entry
 ```
 
-Termination: `step()` returns `done=True` when z < 0.7 or |angle| > 0.2 (hopper has fallen). During MPPI batch rollouts, there is no termination — the high cost of unhealthy states naturally discourages falling.
+### Behaviour cloning (one-shot)
 
-Observation: `qpos[1:]` (skip root x for translation invariance) + `clip(qvel, -10, 10)` = 11 dims.
+```bash
+python -m scripts.collect_bc_demos   # MPPI → data/acrobot_bc.h5
+python -m scripts.test_sl            # MSE on policy mean vs MPPI baseline
+```
 
-#### 7. `configs/hopper_best.json` + `scripts/tuning/tune_hopper.py`
+### DAgger
 
-Starting MPPI hyperparameters: K=512, H=64, noise_sigma=0.3, lam=1.0, adaptive_lam=true. The tuning script uses Optuna with a GP sampler and median pruning, searching over noise_sigma and lam. Early termination during evaluation is penalised by charging the current cost for all remaining steps.
+```bash
+python -m scripts.run_dagger --env acrobot \
+    --dagger-iters 10 --rollouts-per-iter 20 --episode-len 200 \
+    --seed-from data/acrobot_bc.h5 --device auto
+```
 
-### Phase 3: Evaluation & Baselines
+Outputs: per-iter `checkpoints/dagger/dagger_<env>_iter<k>.pt`, metrics csv at `results/dagger_<env>/dagger_log.csv`.
 
-#### 8. `scripts/run_sb3_baseline.py` — SAC/PPO baselines
+### GPS
 
-**New file.** Trains a standard model-free RL agent via stable-baselines3 on the Gymnasium version of the environment. Reports both reward (Gymnasium convention) and cost (-reward, for MPPI/GPS comparison). `stable-baselines3>=2.3.0` added to `pyproject.toml`.
+```bash
+# KL-constrained GPS
+python -m scripts.run_gps --env acrobot --device auto
+python -m scripts.run_gps --env hopper --gps-iters 30 --device auto
 
-#### 9. `scripts/run_ablations.py` — Ablation studies
+# Policy-prior-only (no KL / no BADMM)
+python -m scripts.run_gps --env acrobot --disable-kl --distill-loss nll \
+    --alpha 0.1 --nu 1.0 --device auto --gps-iters 20
+```
 
-**New file.** Runs controlled experiments varying one parameter at a time:
-- **Alpha** (policy-augmented cost weight): 0.0, 0.01, 0.1, 0.5
-- **K** (MPPI sample count): 128, 256, 512
-- **Num conditions**: 3, 5, 10
-- **Wall-clock**: policy forward pass vs MPPI planning time
+Relevant CLI flags: `--disable-kl`, `--distill-loss {nll,mse}`, `--alpha`, `--nu`, `--gps-iters`, `--num-conditions`, `--episode-length`, `--n-eval`, `--eval-len`, `--ckpt-dir`, `--device`, `--seed`.
 
-Each ablation runs a full GPS training + evaluation cycle. Results are saved to `results/ablations/<env>_ablations.json`.
+**Outputs** (under `--ckpt-dir`, default `checkpoints/`):
+- `gps_<env>_iter<k:03d>.pt` — per-iteration policy state_dict (normalizer + squash buffers included).
+- `gps_<env>_best.pt` — state_dict from the iteration with the lowest mean rollout cost.
+- `gps_<env>.pt` — final-iter state_dict.
+- `gps_<env>_curves.json` / `.png` — cost / KL / ν / distill-loss curves.
+- `gps_<env>.mp4` — first eval-episode video of the trained policy.
 
-#### 10. `scripts/visualisation/plot_results.py` — Plotting
+### Evaluate an existing checkpoint
 
-**New file.** Reads JSON output from run_gps.py, run_ablations.py, and run_sb3_baseline.py and generates:
-- GPS training curves (cost, KL, dual variable)
-- Alpha ablation bar chart with MPPI baseline reference line
-- K ablation overlaid cost curves
-- Num conditions bar chart
-- Wall-clock comparison (policy vs MPPI ms/step)
-- Cross-method comparison bar chart (GPS vs MPPI vs SAC vs PPO)
+```bash
+python -m scripts.eval_checkpoint --env acrobot \
+    --ckpt checkpoints/gps_acrobot_best.pt \
+    --n-eval 10 --render
+```
+
+Loads any compatible `state_dict` (GPS / DAgger / BC) into a fresh `GaussianPolicy(obs_dim, act_dim, PolicyConfig())`; normalizer stats and tanh-squash buffers restore automatically because they're registered buffers. Caveat: the script hardcodes `PolicyConfig()` defaults, so a checkpoint trained with non-default `squash_tanh` will fail `strict` load until a matching flag is plumbed.
+
+### Tuning / baselines / ablations
+
+```bash
+python -m scripts.tuning.tune_acrobot
+python -m scripts.tuning.tune_cheetah
+python -m scripts.tuning.tune_hopper
+python -m scripts.run_sb3_baseline --env Hopper-v5 --algo SAC
+python -m scripts.run_ablations --env acrobot
+python -m scripts.visualisation.plot_results --env acrobot
+```
+
+Tuning uses Optuna (GP sampler, median pruning) and writes `configs/<env>_best.json` with `K`, `H`, `noise_sigma`, `lam`. `MPPIConfig.load(env_name)` consumes this; fields not in the JSON fall back to the dataclass defaults (`adaptive_lam=False`, `n_eff_threshold=64.0`).
+
+---
+
+## Verified Training-Stability Fixes
+
+Smoke test on acrobot (`--disable-kl --distill-loss nll --alpha 0.1 --nu 1.0 --gps-iters 3 --num-conditions 2 --episode-length 80 --device cpu`):
+
+- Per-iter and best-of-run checkpoints are both written; `best_iter` / `best_cost` reported at the end of `run_gps.py`.
+- Loading `gps_acrobot_iter002.pt` into a fresh policy shows `normalizer.count = 2400` and `|mean|_max ≈ 2.1`, `var ∈ [1.10, 34.04]` — stats have clearly shifted from the `mean=0, var=1` init, confirming the explicit-update wiring works end-to-end and survives `state_dict` round-trip.
+- `log_sigma` on 100 random-reset acrobot obs ranges in `[−2.41, −0.69]`, well inside the `[−5.0, 2.0]` clamp.
+- Distillation loss decreased monotonically across iters (acrobot smoke: 0.81 → 0.53 → 0.39).
 
 ---
 
 ## File Inventory
 
 ```
-NEW FILES:
-  src/gps/mppi_gps.py                    Core GPS training class + KL estimators
-  src/envs/hopper.py                     Hopper environment
-  src/utils/evaluation.py                Shared evaluate_policy / evaluate_mppi
-  assets/hopper.xml                      Hopper MuJoCo model
-  configs/hopper_best.json               Hopper MPPI hyperparameters
-  scripts/run_gps.py                     Main GPS training + eval script
-  scripts/run_sb3_baseline.py            SAC/PPO baseline training
-  scripts/run_ablations.py               Ablation study runner
-  scripts/tuning/tune_hopper.py          Optuna tuning for Hopper
-  scripts/visualisation/plot_results.py  Result plotting
+src/gps/
+  mppi_gps.py                            MPPI-GPS trainer, KL estimators, BADMM, checkpointing
+  dagger.py                              DAgger trainer (MPPI-in-the-loop BC)
+  ilqr.py                                iLQR skeleton (in progress)
 
-MODIFIED FILES:
-  src/envs/base.py                       Added abstract state_to_obs, obs_dim
-  src/envs/mujoco_env.py                 Added default state_to_obs, obs_dim
-  src/envs/acrobot.py                    Added state_to_obs, obs_dim
-  src/envs/half_cheetah.py               Added state_to_obs, obs_dim
-  src/envs/point_mass.py                 Added state_to_obs, obs_dim
-  src/envs/gym_wrapper.py                Added state_to_obs, obs_dim
-  src/utils/config.py                    Extended GPSConfig with new fields
-  scripts/test_sl.py                     Updated to import from evaluation.py
-  pyproject.toml                         Added stable-baselines3 dependency
-  CLAUDE.md                              Updated with GPS commands + architecture
+src/policy/
+  gaussian_policy.py                     Diagonal-Gaussian MLP +
+                                         RunningNormalizer, log_sigma clamp, optional tanh squash
+
+src/envs/
+  base.py  mujoco_env.py  gym_wrapper.py
+  acrobot.py  half_cheetah.py  point_mass.py  hopper.py
+  __init__.py                            make_env(name) factory
+
+src/utils/
+  config.py                              MPPIConfig, PolicyConfig, GPSConfig, DAggerConfig
+  device.py                              pick_device helper
+  evaluation.py                          evaluate_policy, evaluate_mppi
+  math.py                                weights / KL / weighted moments
+
+scripts/
+  run_gps.py                             GPS entry (KL + policy-prior-only)
+  run_dagger.py                          DAgger entry
+  eval_checkpoint.py                     Standalone checkpoint evaluator
+  run_mppi.py  run_acrobot.py  run_cheetah.py  run_hopper.py  run_point_mass.py
+  collect_bc_demos.py  test_sl.py        One-shot BC pipeline
+  run_sb3_baseline.py                    SAC / PPO baselines
+  run_ablations.py                       Ablation runner
+  tuning/tune_{acrobot,cheetah,hopper}.py
+  visualisation/{plot_results,plot_cost,visualise_rollouts}.py
+
+configs/
+  acrobot_best.json                      K=256, H=256, noise_sigma=0.057, lam=0.005
+  hopper_best.json                       K=512, H=64, noise_sigma=0.3, lam=1.0, adaptive_lam=true
+
+assets/
+  acrobot.xml  half_cheetah.xml  hopper.xml  point_mass.xml
 ```
 
 ---
 
-## Commands Reference
-
-All commands assume you are in the project root with the `.venv` activated or using `uv run`:
-
-### Install Dependencies
-
-```bash
-uv sync
-```
-
-### GPS Training
-
-```bash
-# Train GPS on acrobot (default: 50 iterations, 5 conditions, 500 steps/episode)
-python -m scripts.run_gps --env acrobot
-
-# Train GPS on hopper
-python -m scripts.run_gps --env hopper
-
-# Custom settings
-python -m scripts.run_gps --env acrobot \
-    --gps-iters 30 \
-    --num-conditions 10 \
-    --episode-length 300 \
-    --alpha 0.05 \
-    --seed 42
-
-# Quick smoke test (verify everything runs end-to-end)
-python -m scripts.run_gps --env acrobot \
-    --gps-iters 2 \
-    --num-conditions 2 \
-    --episode-length 50 \
-    --n-eval 3 \
-    --eval-len 100
-```
-
-**Outputs:**
-- `checkpoints/gps_<env>.pt` — trained policy weights
-- `checkpoints/gps_<env>_curves.json` — per-iteration cost, KL, nu, loss
-- `checkpoints/gps_<env>_curves.png` — learning curve plots
-- `checkpoints/gps_<env>.mp4` — video of the trained policy
-
-### MPPI Hyperparameter Tuning
-
-```bash
-# Tune MPPI for hopper (50 Optuna trials)
-python -m scripts.tuning.tune_hopper
-
-# Tune MPPI for acrobot (existing)
-python -m scripts.tuning.tune_acrobot
-```
-
-**Outputs:** `configs/<env>_best.json` with tuned K, H, noise_sigma, lam.
-
-### Standalone MPPI Control (pre-existing)
-
-```bash
-python -m scripts.run_acrobot
-python -m scripts.run_cheetah
-python -m scripts.run_point_mass
-```
-
-### Behaviour Cloning Pipeline (pre-existing)
-
-```bash
-# Step 1: Collect MPPI demonstrations
-python -m scripts.collect_bc_demos
-
-# Step 2: Train BC policy and compare against MPPI
-python -m scripts.test_sl
-```
-
-### SB3 Baselines (SAC / PPO)
-
-```bash
-# Train SAC on Hopper-v5
-python -m scripts.run_sb3_baseline --env Hopper-v5 --algo SAC --total-timesteps 500000
-
-# Train PPO on HalfCheetah-v5
-python -m scripts.run_sb3_baseline --env HalfCheetah-v5 --algo PPO --total-timesteps 1000000
-```
-
-**Outputs:** `checkpoints/sb3/<algo>_<env>` (model) + `checkpoints/sb3/<algo>_<env>_results.json`.
-
-### Ablation Studies
-
-```bash
-# Run all ablations on acrobot (alpha, K, conditions, wall-clock)
-python -m scripts.run_ablations --env acrobot --gps-iters 20
-
-# Run on hopper
-python -m scripts.run_ablations --env hopper --gps-iters 15
-```
-
-**Outputs:** `results/ablations/<env>_ablations.json`
-
-### Plotting
-
-```bash
-# Generate all plots for acrobot
-python -m scripts.visualisation.plot_results --env acrobot
-
-# Custom directories
-python -m scripts.visualisation.plot_results \
-    --env hopper \
-    --curves-dir checkpoints \
-    --results-dir results/ablations \
-    --save-dir results/plots
-```
-
-**Outputs:** `results/plots/` with PNG files for training curves, ablations, wall-clock, and method comparison.
-
----
-
-## Recommended Execution Order
-
-For a complete experiment cycle:
-
-```bash
-# 1. Tune MPPI hyperparameters for the target environment
-python -m scripts.tuning.tune_hopper
-
-# 2. Train GPS
-python -m scripts.run_gps --env hopper
-
-# 3. Train SB3 baselines for comparison
-python -m scripts.run_sb3_baseline --env Hopper-v5 --algo SAC
-python -m scripts.run_sb3_baseline --env Hopper-v5 --algo PPO
-
-# 4. Run ablations
-python -m scripts.run_ablations --env hopper
-
-# 5. Generate plots
-python -m scripts.visualisation.plot_results --env hopper
-```
-
----
-
-## Architecture Diagram
+## Data Flow (GPS, per iteration)
 
 ```
-                         ┌─────────────────────┐
+                         ┌──────────────────────┐
                          │   MPPIGPS.train()    │
                          └──────────┬───────────┘
                                     │
               ┌─────────────────────┼─────────────────────┐
               │                     │                     │
      ┌────────▼────────┐  ┌────────▼────────┐  ┌────────▼────────┐
-     │  C-step:        │  │  S-step:        │  │  BADMM update:  │
-     │  MPPI planning  │  │  Policy distill │  │  Adjust nu      │
-     │  with policy    │  │  via weighted   │  │  based on KL    │
-     │  augmented cost │  │  MLE            │  │  vs target      │
+     │  C-step:        │  │  S-step:        │  │  BADMM update   │
+     │  MPPI with      │  │  Distill via    │  │  (skipped when  │
+     │  policy prior   │  │  NLL or MSE     │  │  --disable-kl)  │
      └────────┬────────┘  └────────┬────────┘  └─────────────────┘
               │                     │
     ┌─────────▼─────────┐ ┌────────▼────────┐
     │ make_policy_prior │ │ _distill_epoch  │
-    │ α·ν·Σ log π(u|x)  │ │ mini-batch SGD  │
-    │ → (K,) added to   │ │ on (obs, act,   │
-    │   MPPI log-weights│ │   weights)      │
+    │ +α·ν·Σ log π(u|x) │ │ mini-batch SGD  │
+    │ added to MPPI     │ │ (weighted NLL   │
+    │ log-weights       │ │  or MSE)        │
     └─────────┬─────────┘ └─────────────────┘
               │
-    ┌─────────▼─────────┐
-    │ MPPI.plan_step()  │
-    │ K samples × H     │
-    │ horizon rollouts   │
-    │ via MuJoCo         │
-    └───────────────────┘
+    ┌─────────▼─────────┐        ┌──────────────────────┐
+    │ MPPI.plan_step()  │───────▶│ _warm_start_mppi()   │
+    │ K×H MuJoCo rollout│        │ seeds next-iter U    │
+    └───────────────────┘        │ from policy rollout  │
+                                 └──────────────────────┘
 ```
 
-**Data flow per GPS iteration:**
+Per iteration:
+1. For each of the `num_conditions` fixed init states: reset env → run MPPI + prior for `episode_length` steps → collect `(obs_t, action_t)` and optionally the K-sample first-step distribution.
+2. Concatenate `(N×T, obs_dim)` / `(N×T, act_dim)` → `distill_epochs` mini-batched passes.
+3. Save `{env_tag}_iter{k:03d}.pt`; if `mean_cost` improved, overwrite `{env_tag}_best.pt`.
+4. If KL enabled: compute moment-matched or sample-based KL, update ν.
+5. If `warm_start_policy`: roll policy from each init state to seed next iter's MPPI `U`.
 
-1. For each of the N initial conditions:
-   - Reset env to saved state → run MPPI for T steps → collect `(obs_t, action_t)` pairs and per-timestep MPPI sample distributions `(K actions, K weights)`.
-2. Concatenate all pairs across conditions → `(N×T, obs_dim)`, `(N×T, act_dim)`.
-3. Train policy for `distill_epochs` passes with mini-batches of size `distill_batch_size`.
-4. Compute KL between MPPI's weighted sample distribution and the updated policy (moment-matched or sample-based).
-5. Adjust dual variable: `nu *= step` if KL > target, `nu /= step` if KL < target.
-6. If `warm_start_policy`: roll out the policy to seed MPPI's nominal U for next iteration.
+---
+
+## Deliberate Non-Goals
+
+Tracked explicitly to keep scope tight:
+- GMM / diffusion / multimodal policy heads — deferred. A unimodal diagonal Gaussian is the current student.
+- Action chunking / temporal context on the policy — deferred.
+- Removing the dead `weights` parameter on `train_weighted` — deferred cleanup. All current callers pass uniform weights.
+- Revisiting the BADMM / KL path beyond whatever's needed for `PolicyConfig` compatibility.
+- Re-introducing the MJX / JAX GPU pipeline.

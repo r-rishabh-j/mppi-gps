@@ -14,6 +14,8 @@ The high-level loop (Algorithm 1 from the proposal) is:
   5. Optionally warm-start MPPI's nominal trajectory from the updated policy.
 """
 
+from pathlib import Path
+
 import numpy as np
 import torch
 from dataclasses import dataclass, field
@@ -240,6 +242,8 @@ class GPSHistory:
     iteration_kl: list[float] = field(default_factory=list)      # mean KL across conditions
     iteration_nu: list[float] = field(default_factory=list)      # BADMM dual variable
     distill_losses: list[float] = field(default_factory=list)    # last distillation loss
+    best_iter: int = -1
+    best_cost: float = float("inf")
 
 
 class MPPIGPS:
@@ -271,7 +275,13 @@ class MPPIGPS:
 
         # The global policy network that we are training.
         # obs_dim and act_dim come from the environment.
-        self.policy = GaussianPolicy(env.obs_dim, env.action_dim, policy_cfg, device=device)
+        self.policy = GaussianPolicy(
+            env.obs_dim,
+            env.action_dim,
+            policy_cfg,
+            device=device,
+            action_bounds=env.action_bounds if policy_cfg.squash_tanh else None,
+        )
 
         # BADMM dual variable — controls how strongly the KL constraint
         # is enforced in the policy-augmented cost.  Starts at badmm_init_nu
@@ -401,7 +411,12 @@ class MPPIGPS:
 
     # ----- main loop -------------------------------------------------------
 
-    def train(self, num_iterations: int | None = None) -> GPSHistory:
+    def train(
+        self,
+        num_iterations: int | None = None,
+        checkpoint_dir: Path | None = None,
+        env_tag: str = "gps",
+    ) -> GPSHistory:
         """Run the full MPPI-GPS training loop.
 
         Each iteration:
@@ -414,12 +429,18 @@ class MPPIGPS:
 
         Args:
             num_iterations: Override for gps_cfg.num_iterations.
+            checkpoint_dir: If set, save per-iter + best-so-far policy state.
+            env_tag: Prefix for checkpoint filenames.
         Returns:
             GPSHistory with per-iteration metrics.
         """
         num_iterations = num_iterations or self.gps_cfg.num_iterations
         cfg = self.gps_cfg
         history = GPSHistory()
+
+        if checkpoint_dir is not None:
+            checkpoint_dir = Path(checkpoint_dir)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Sample a fixed set of initial conditions that persist across all
         # iterations.  This ensures the policy is trained to handle a diverse
@@ -555,6 +576,16 @@ class MPPIGPS:
             history.iteration_kl.append(kl_mean)
             history.iteration_nu.append(self.nu)
             history.distill_losses.append(loss)
+
+            # ========== Checkpointing ==========
+            if checkpoint_dir is not None:
+                iter_path = checkpoint_dir / f"{env_tag}_iter{iteration:03d}.pt"
+                torch.save(self.policy.state_dict(), iter_path)
+                if mean_cost < history.best_cost:
+                    history.best_cost = mean_cost
+                    history.best_iter = iteration
+                    best_path = checkpoint_dir / f"{env_tag}_best.pt"
+                    torch.save(self.policy.state_dict(), best_path)
 
             print(
                 f"[GPS iter {iteration:3d}]  "

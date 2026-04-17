@@ -208,3 +208,5 @@ __marimo__/
 
 # extras 
 *.h5
+
+checkpoints*/*
