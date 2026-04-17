@@ -12,8 +12,7 @@ from src.utils.config import MPPIConfig
 np.random.seed(42)
 torch.manual_seed(42)
 
-T = 1000
-
+T = 2000
 
 def main():
     parser = argparse.ArgumentParser()

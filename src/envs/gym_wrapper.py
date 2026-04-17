@@ -75,7 +75,7 @@ class GymEnv(BaseEnv):
         K, H, _ = action_sequences.shape
         actions_expanded = np.repeat(action_sequences, self._frame_skip, axis=1)
         states_full, _ = self._rollout_ctx.rollout(
-            self.model, self._data_pool, initial_state, actions_expanded,
+            self.model, self._data_pool, initial_state, actions_expanded
         )
         states = states_full[:, self._frame_skip - 1::self._frame_skip, :]
         c = self.running_cost(states, action_sequences)

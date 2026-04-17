@@ -90,7 +90,7 @@ class MuJoCoEnv(BaseEnv):
             self.model,
             self._data_pool,
             initial_state,
-            actions_expanded,
+            actions_expanded
         )
 
         # downsample states: take every frame_skip-th frame
