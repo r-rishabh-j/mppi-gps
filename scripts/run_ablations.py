@@ -34,12 +34,9 @@ from src.utils.evaluation import evaluate_policy, evaluate_mppi
 from src.mppi.mppi import MPPI
 from src.envs import make_env as _make_env
 
-# Module-level backend default (set from --backend CLI arg)
-_BACKEND = "cpu"
-
 
 def make_env(name: str):
-    return _make_env(name, backend=_BACKEND)
+    return _make_env(name)
 
 
 def run_gps_trial(env_name, gps_overrides: dict, seed: int, eval_len: int = 500, n_eval: int = 5):
@@ -152,15 +149,11 @@ def parse_args():
     p.add_argument("--out-dir", type=str, default="results/ablations")
     p.add_argument("--gps-iters", type=int, default=20,
                    help="GPS iterations per ablation trial (keep low for speed)")
-    p.add_argument("--backend", default="cpu", choices=["cpu", "gpu"],
-                   help="'cpu' (MuJoCo threads) or 'gpu' (MJX/JAX)")
     return p.parse_args()
 
 
 def main():
-    global _BACKEND
     args = parse_args()
-    _BACKEND = args.backend
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     all_results = {}

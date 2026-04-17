@@ -9,14 +9,15 @@ from src.utils.config import PolicyConfig
 
 class GaussianPolicy(nn.Module):
     """the network produces mu and log std for each action dim"""
-    def __init__(self, 
-                 obs_dim: int, 
-                 act_dim: int, 
-                 cfg: PolicyConfig = PolicyConfig()):
+    def __init__(self,
+                 obs_dim: int,
+                 act_dim: int,
+                 cfg: PolicyConfig = PolicyConfig(),
+                 device: torch.device | str | None = None):
         super().__init__()
-        
-        self.obs_dim = obs_dim 
-        self.act_dim = act_dim 
+
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
 
         activations = {"relu": nn.ReLU, "tanh": nn.Tanh}
         act_fn = activations[cfg.activation]
@@ -32,9 +33,23 @@ class GaussianPolicy(nn.Module):
 
         self.net = nn.Sequential(*layers)
 
-        # initialise log sigma around 0 so that std starts around 1 
+        # initialise log sigma around 0 so that std starts around 1
         nn.init.zeros_(self.net[-1].bias[act_dim:])
+
+        self._device = torch.device(device) if device is not None else torch.device("cpu")
+        self.to(self._device)
+
         self.optimizer = torch.optim.Adam(self.parameters(), lr = cfg.lr)
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    def to(self, *args, **kwargs):
+        out = super().to(*args, **kwargs)
+        # keep cached device handle in sync with the underlying parameters
+        self._device = next(self.parameters()).device
+        return out
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """obs: (B, obs_dim) → mu: (B, act_dim), log_sigma: (B, act_dim)"""
@@ -59,14 +74,14 @@ class GaussianPolicy(nn.Module):
     
     # supervised destillation of mppi into the neural network
     def train_weighted(
-            self, 
-            obs: np.ndarray, 
-            actions: np.ndarray, 
-            weights: np.ndarray, 
+            self,
+            obs: np.ndarray,
+            actions: np.ndarray,
+            weights: np.ndarray,
     ) -> float:
-        obs_t = torch.as_tensor(obs, dtype = torch.float32)
-        act_t = torch.as_tensor(actions, dtype = torch.float32)
-        w_t = torch.as_tensor(weights, dtype = torch.float32)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+        act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
+        w_t = torch.as_tensor(weights, dtype=torch.float32, device=self._device)
 
         lp = self.log_prob(obs_t, act_t) # (N, )
         # this is just the negative weight * log likelihood 
@@ -77,14 +92,25 @@ class GaussianPolicy(nn.Module):
         self.optimizer.step()
         return loss.item()
     
-    # this is the numpy variant for the log prob function since mppi uses numpy 
+    # this is the numpy variant for the log prob function since mppi uses numpy
     @torch.no_grad()
     def log_prob_np(self,
                     obs: np.ndarray,
                     actions: np.ndarray) -> np.ndarray:
-        obs_t = torch.from_numpy(np.array(obs, dtype=np.float32, copy=True))
-        act_t = torch.from_numpy(np.array(actions, dtype=np.float32, copy=True))
-        return self.log_prob(obs_t, act_t).numpy()
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+        act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
+        return self.log_prob(obs_t, act_t).cpu().numpy()
+
+    @torch.no_grad()
+    def act_np(self, obs: np.ndarray) -> np.ndarray:
+        """Mean action from numpy obs. Used by DAgger rollouts / eval."""
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+        if obs_t.ndim == 1:
+            obs_t = obs_t.unsqueeze(0)
+            mu, _ = self.forward(obs_t)
+            return mu.squeeze(0).cpu().numpy()
+        mu, _ = self.forward(obs_t)
+        return mu.cpu().numpy()
     
 
 

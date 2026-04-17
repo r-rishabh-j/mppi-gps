@@ -40,8 +40,6 @@ _ENVS = ["acrobot", "half_cheetah", "point_mass", "hopper"]
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--env", default="acrobot", choices=_ENVS)
-    p.add_argument("--backend", default="cpu", choices=["cpu", "gpu"],
-                   help="'cpu' (MuJoCo threads) or 'gpu' (MJX/JAX)")
     p.add_argument("--gps-iters", type=int, default=None,
                    help="Number of GPS iterations (default: from GPSConfig)")
     p.add_argument("--num-conditions", type=int, default=None,
@@ -50,6 +48,13 @@ def parse_args():
                    help="Steps per episode during GPS training")
     p.add_argument("--alpha", type=float, default=None,
                    help="Policy-augmented cost weight (0 = no augmentation)")
+    p.add_argument("--disable-kl", action="store_true",
+                   help="Drop KL/BADMM: run policy-prior-only GPS (BC on MPPI data)")
+    p.add_argument("--distill-loss", default=None, choices=["nll", "mse"],
+                   help="Distillation loss (default from GPSConfig: nll)")
+    p.add_argument("--nu", type=float, default=None,
+                   help="Constant nu for the policy prior when --disable-kl is set")
+    p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda (policy only)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-dir", type=str, default="checkpoints")
     p.add_argument("--n-eval", type=int, default=10,
@@ -64,11 +69,10 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    env = make_env(args.env, backend=args.backend)
+    env = make_env(args.env)
 
     # Load tuned MPPI hyperparameters from configs/<env>_best.json
     mppi_cfg = MPPIConfig.load(args.env)
-    mppi_cfg.backend = args.backend
     policy_cfg = PolicyConfig()
     gps_cfg = GPSConfig()
 
@@ -81,9 +85,23 @@ def main():
         gps_cfg.episode_length = args.episode_length
     if args.alpha is not None:
         gps_cfg.policy_augmented_alpha = args.alpha
+    if args.disable_kl:
+        gps_cfg.disable_kl_constraint = True
+    if args.distill_loss is not None:
+        gps_cfg.distill_loss = args.distill_loss
+    if args.nu is not None:
+        gps_cfg.badmm_init_nu = args.nu
+
+    from src.utils.device import pick_device
+    device = pick_device(args.device)
+    print(f"policy device: {device}")
+    if gps_cfg.disable_kl_constraint:
+        print(f"KL constraint DISABLED — policy-prior-only GPS "
+              f"(alpha={gps_cfg.policy_augmented_alpha}, nu={gps_cfg.badmm_init_nu}, "
+              f"distill_loss={gps_cfg.distill_loss})")
 
     # ---- Training ----
-    gps = MPPIGPS(env, mppi_cfg, policy_cfg, gps_cfg)
+    gps = MPPIGPS(env, mppi_cfg, policy_cfg, gps_cfg, device=device)
     history = gps.train()
 
     # ---- Save checkpoint ----
@@ -141,7 +159,7 @@ def main():
 
     print("--- Evaluating MPPI baseline ---")
     # MPPI baseline always uses CPU controller for evaluation
-    eval_env = make_env(args.env, backend="cpu") if args.backend == "gpu" else env
+    eval_env = env
     mppi = MPPI(eval_env, mppi_cfg)
     mppi_stats = evaluate_mppi(
         eval_env, mppi,

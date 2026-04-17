@@ -54,7 +54,6 @@ def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float, nu: fl
     def prior_fn(states, actions) -> np.ndarray:
         # states:  (K, H, nstate) — full physics states from batch_rollout
         # actions: (K, H, act_dim) — clipped perturbed action sequences
-        # Ensure numpy (MPPIJAX may pass JAX arrays from the prior bridge)
         states = np.asarray(states)
         actions = np.asarray(actions)
         K, H, _ = states.shape
@@ -175,11 +174,12 @@ def compute_kl_moment_matched(
         mu_mppi, cov_mppi = weighted_mean_cov(actions_t, weights_t)
 
         # Step 2: Get the policy's distribution parameters at this observation.
-        obs_tensor = torch.as_tensor(obs_t, dtype=torch.float32).unsqueeze(0)
+        device = getattr(policy, "_device", torch.device("cpu"))
+        obs_tensor = torch.as_tensor(obs_t, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
             mu_pi, log_sigma_pi = policy(obs_tensor)
-        mu_pi = mu_pi.squeeze(0).numpy()
-        log_sigma_pi = log_sigma_pi.squeeze(0).numpy()
+        mu_pi = mu_pi.squeeze(0).cpu().numpy()
+        log_sigma_pi = log_sigma_pi.squeeze(0).cpu().numpy()
 
         # Step 3: Closed-form KL between the two Gaussians.
         kl_sum += _kl_diagonal_gaussian(mu_mppi, cov_mppi, mu_pi, log_sigma_pi)
@@ -262,6 +262,7 @@ class MPPIGPS:
         mppi_cfg: MPPIConfig,
         policy_cfg: PolicyConfig,
         gps_cfg: GPSConfig,
+        device: torch.device | str | None = None,
     ):
         self.env = env
         self.mppi_cfg = mppi_cfg
@@ -270,7 +271,7 @@ class MPPIGPS:
 
         # The global policy network that we are training.
         # obs_dim and act_dim come from the environment.
-        self.policy = GaussianPolicy(env.obs_dim, env.action_dim, policy_cfg)
+        self.policy = GaussianPolicy(env.obs_dim, env.action_dim, policy_cfg, device=device)
 
         # BADMM dual variable — controls how strongly the KL constraint
         # is enforced in the policy-augmented cost.  Starts at badmm_init_nu
@@ -279,12 +280,7 @@ class MPPIGPS:
 
         # A single MPPI controller instance, reused across conditions
         # (we reset its nominal U between conditions).
-        # Use JAX-backed MPPI when backend="gpu".
-        if mppi_cfg.backend == "gpu":
-            from src.mppi.mppi_jax import MPPIJAX
-            self.mppi = MPPIJAX(env, mppi_cfg)
-        else:
-            self.mppi = MPPI(env, mppi_cfg)
+        self.mppi = MPPI(env, mppi_cfg)
 
     # ----- helpers ---------------------------------------------------------
 
@@ -335,11 +331,26 @@ class MPPIGPS:
             np.random.shuffle(indices)
             for start in range(0, N, cfg.distill_batch_size):
                 batch = indices[start : start + cfg.distill_batch_size]
-                # train_weighted computes -Σ w log π / Σ w  and does one Adam step
-                last_loss = self.policy.train_weighted(
-                    obs[batch], actions[batch], weights[batch]
-                )
+                if cfg.distill_loss == "mse":
+                    last_loss = self._train_step_mse(obs[batch], actions[batch])
+                else:
+                    # train_weighted computes -Σ w log π / Σ w  and does one Adam step
+                    last_loss = self.policy.train_weighted(
+                        obs[batch], actions[batch], weights[batch]
+                    )
         return last_loss
+
+    def _train_step_mse(self, obs: np.ndarray, actions: np.ndarray) -> float:
+        """Plain MSE on the policy mean — used when distill_loss='mse' (BC-style)."""
+        device = self.policy.device
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
+        act_t = torch.as_tensor(actions, dtype=torch.float32, device=device)
+        mu, _ = self.policy.forward(obs_t)
+        loss = ((mu - act_t) ** 2).mean()
+        self.policy.optimizer.zero_grad()
+        loss.backward()
+        self.policy.optimizer.step()
+        return float(loss.item())
 
     def _update_badmm(self, kl_value: float):
         """Adjust the BADMM dual variable nu based on the current KL.
@@ -374,16 +385,18 @@ class MPPIGPS:
         """
         self.env.reset(state=initial_state)
         actions = []
+        done = False
         for _ in range(self.mppi_cfg.H):
+            if done:
+                # Env has terminated (e.g. hopper fell) — pad the remaining
+                # horizon with zeros so we don't feed post-terminal garbage
+                # states into the policy.
+                actions.append(np.zeros(self.env.action_dim))
+                continue
             obs = self.env._get_obs()
-            obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
-            with torch.no_grad():
-                mu, _ = self.policy(obs_t)
-            # Use the mean action (no sampling noise) for a clean warm-start
-            action = mu.squeeze(0).numpy()
+            action = self.policy.act_np(obs)
             actions.append(action)
-            self.env.step(action)
-        # Overwrite MPPI's nominal trajectory with the policy rollout
+            _, _, done, _ = self.env.step(action)
         self.mppi.U = np.array(actions)
 
     # ----- main loop -------------------------------------------------------
@@ -413,6 +426,8 @@ class MPPIGPS:
         # but consistent set of starting states.
         initial_conditions = self._sample_initial_conditions(cfg.num_conditions)
 
+        skip_kl = cfg.disable_kl_constraint
+
         for iteration in range(num_iterations):
             alpha = cfg.policy_augmented_alpha
 
@@ -421,7 +436,9 @@ class MPPIGPS:
             all_actions: list[np.ndarray] = []
             all_weights: list[np.ndarray] = []
 
-            # Accumulators for per-timestep KL data (kept per-condition)
+            # Accumulators for per-timestep KL data (kept per-condition).
+            # Skipped entirely when the KL constraint is disabled — this also
+            # avoids storing K * H * act_dim floats per timestep.
             all_kl_actions: list[list[np.ndarray]] = []
             all_kl_weights: list[list[np.ndarray]] = []
             all_kl_obs: list[list[np.ndarray]] = []
@@ -437,15 +454,16 @@ class MPPIGPS:
                 )
 
                 # After the first iteration, seed MPPI's nominal trajectory
-                # from the policy so it starts from a better guess.
+                # from the policy so it starts from a better guess.  On iter 0
+                # (or if warm-starting is off) reset U to zeros so nominal
+                # state doesn't leak across initial conditions.
                 if iteration > 0 and cfg.warm_start_policy:
                     self._warm_start_mppi(ic_state)
+                else:
+                    self.mppi.reset()
 
                 # Reset environment to this initial condition
                 self.env.reset(state=ic_state)
-                # Only reset MPPI's U to zeros on the very first iteration
-                # when we're not warm-starting (otherwise keep the warm-start)
-                self.mppi.reset() if iteration == 0 and not cfg.warm_start_policy else None
 
                 episode_obs = []
                 episode_actions = []
@@ -462,17 +480,19 @@ class MPPIGPS:
                     # returns the weighted-mean action.
                     action, info = self.mppi.plan_step(state, prior=prior_fn)
 
-                    # Retrieve the K rollout samples for KL computation.
-                    # We only need the first-step actions (what MPPI considered
-                    # at this timestep) and their importance weights.
-                    rollout_data = self.mppi.get_rollout_data()
-                    first_step_actions = np.asarray(rollout_data['actions'][:, 0, :])  # (K, act_dim)
-                    weights = np.asarray(rollout_data['weights'])                       # (K,)
-
                     episode_obs.append(obs.copy())
                     episode_actions.append(action.copy())  # the executed action
-                    episode_kl_actions.append(first_step_actions)
-                    episode_kl_weights.append(weights.copy())
+
+                    if not skip_kl:
+                        # Retrieve the K rollout samples for KL computation.
+                        # Copy both arrays: MPPI reuses the _last_* slots on
+                        # the next plan_step, and we must not hold views into
+                        # buffers it may later overwrite.
+                        rollout_data = self.mppi.get_rollout_data()
+                        first_step_actions = np.array(rollout_data['actions'][:, 0, :])
+                        weights = np.array(rollout_data['weights'])
+                        episode_kl_actions.append(first_step_actions)
+                        episode_kl_weights.append(weights)
 
                     # Step the environment with the MPPI-chosen action
                     _, cost, done, _ = self.env.step(action)
@@ -487,11 +507,12 @@ class MPPIGPS:
                 all_obs.append(np.array(episode_obs))
                 all_actions.append(np.array(episode_actions))
                 all_weights.append(np.ones(len(episode_obs)))
-
-                # Store per-timestep MPPI sample data for KL computation
-                all_kl_actions.append(episode_kl_actions)
-                all_kl_weights.append(episode_kl_weights)
-                all_kl_obs.append(episode_obs)
+                
+                if not skip_kl:
+                    # Store per-timestep MPPI sample data for KL computation
+                    all_kl_actions.append(episode_kl_actions)
+                    all_kl_weights.append(episode_kl_weights)
+                    all_kl_obs.append(episode_obs)
 
                 condition_costs.append(episode_cost)
 
@@ -505,23 +526,28 @@ class MPPIGPS:
             loss = self._distill_epoch(obs_flat, act_flat, w_flat)
 
             # ========== KL computation (average across conditions) ==========
-            kl_values = []
-            # Select the KL estimator based on config
-            kl_fn = (compute_kl_moment_matched
-                     if cfg.kl_estimator == "moment_matched"
-                     else compute_kl_sample_based)
-            for ic_idx in range(cfg.num_conditions):
-                kl_val, _ = kl_fn(
-                    all_kl_actions[ic_idx],
-                    all_kl_weights[ic_idx],
-                    all_kl_obs[ic_idx],
-                    self.policy,
-                )
-                kl_values.append(kl_val)
-            kl_mean = float(np.mean(kl_values))
+            if skip_kl:
+                # Policy-prior-only variant: no KL tracking, no BADMM update.
+                # nu stays at badmm_init_nu; the MPPI prior weight is alpha * nu.
+                kl_mean = float("nan")
+            else:
+                kl_values = []
+                # Select the KL estimator based on config
+                kl_fn = (compute_kl_moment_matched
+                         if cfg.kl_estimator == "moment_matched"
+                         else compute_kl_sample_based)
+                for ic_idx in range(cfg.num_conditions):
+                    kl_val, _ = kl_fn(
+                        all_kl_actions[ic_idx],
+                        all_kl_weights[ic_idx],
+                        all_kl_obs[ic_idx],
+                        self.policy,
+                    )
+                    kl_values.append(kl_val)
+                kl_mean = float(np.mean(kl_values))
 
-            # ========== BADMM dual variable update ==========
-            self._update_badmm(kl_mean)
+                # ========== BADMM dual variable update ==========
+                self._update_badmm(kl_mean)
 
             # ========== Logging ==========
             mean_cost = float(np.mean(condition_costs))
