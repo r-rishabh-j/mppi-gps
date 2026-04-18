@@ -351,16 +351,12 @@ class MPPIGPS:
         return last_loss
 
     def _train_step_mse(self, obs: np.ndarray, actions: np.ndarray) -> float:
-        """Plain MSE on the policy mean — used when distill_loss='mse' (BC-style)."""
-        device = self.policy.device
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
-        act_t = torch.as_tensor(actions, dtype=torch.float32, device=device)
-        mu, _ = self.policy.forward(obs_t)
-        loss = ((mu - act_t) ** 2).mean()
-        self.policy.optimizer.zero_grad()
-        loss.backward()
-        self.policy.optimizer.step()
-        return float(loss.item())
+        """Plain MSE on the policy mean — used when distill_loss='mse' (BC-style).
+
+        Reuse GaussianPolicy.mse_step so the running observation normalizer is
+        updated exactly the same way as the standalone BC and DAgger paths.
+        """
+        return self.policy.mse_step(obs, actions)
 
     def _update_badmm(self, kl_value: float):
         """Adjust the BADMM dual variable nu based on the current KL.

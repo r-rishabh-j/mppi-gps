@@ -4,6 +4,10 @@ Example:
     python -m scripts.run_dagger --env acrobot --dagger-iters 10 \
         --rollouts-per-iter 20 --episode-len 200 --device auto
 
+    python -m scripts.run_dagger --env acrobot --deterministic \
+        --init-ckpt checkpoints/dagger/dagger_acrobot_iter09.pt \
+        --dagger-iters 5 --rollouts-per-iter 20 --episode-len 200 --device auto
+
 MPPI runs on CPU (MuJoCo). Policy training uses the device selected by
 `--device` (auto → cuda → mps → cpu).
 """
@@ -47,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
     p.add_argument("--deterministic", action="store_true",
                    help="use DeterministicPolicy (direct action regression) instead of GaussianPolicy")
+    p.add_argument("--init-ckpt", default=None,
+                   help="path to a policy checkpoint to load before warmup / DAgger training")
     p.add_argument("--seed-from", default=None,
                    help="path to existing BC h5 (e.g. data/acrobot_bc.h5) to warm-start the buffer")
     p.add_argument("--warmup-rollouts", type=int, default=0,
@@ -96,6 +102,19 @@ def main() -> None:
         policy = GaussianPolicy(obs_dim, act_dim, policy_cfg,
                                 device=device, action_bounds=bounds)
         print("policy: GaussianPolicy (mu/sigma head, MSE on mu)")
+
+    if args.init_ckpt is not None:
+        init_ckpt = Path(args.init_ckpt)
+        if not init_ckpt.exists():
+            raise FileNotFoundError(f"--init-ckpt not found: {init_ckpt}")
+        try:
+            policy.load_state_dict(torch.load(init_ckpt, map_location=device))
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"failed to load --init-ckpt {init_ckpt}; make sure the checkpoint "
+                f"matches --deterministic={args.deterministic}"
+            ) from exc
+        print(f"loaded initial policy weights from {init_ckpt}")
 
     trainer = DAggerTrainer(env, mppi, policy, cfg, rng=rng)
     if args.seed_from is not None:

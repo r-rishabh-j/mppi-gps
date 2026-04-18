@@ -18,7 +18,7 @@ class Acrobot(MuJoCoEnv):
         self._nq = self.model.nq #2
         self._nv = self.model.nv #2
 
-        self._w_terminal = 3.0
+        self._w_terminal = 4.0
         # --- previous reward-shaping params (commented for reference) ---
         # self._energy_target = 4.0
         # self._energy_weight = 0.08
@@ -37,7 +37,8 @@ class Acrobot(MuJoCoEnv):
 
         obs = super().reset()
         self.data.qpos[:] = np.random.uniform(-np.pi, np.pi, size=self._nq)
-        self.data.qvel[:] = np.random.normal(0.0, 0.05, size=self._nv) * 0.0
+        # self.data.qvel[:] = np.random.normal(0.0, 0.05, size=self._nv) * 0.0
+        self.data.qvel[:] = np.random.normal(0.0, 3.0, size=self._nv)
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs()
 

@@ -39,6 +39,12 @@ python -m scripts.run_dagger --env acrobot \
     --dagger-iters 10 --rollouts-per-iter 20 --episode-len 200 \
     --seed-from data/acrobot_bc.h5 --device auto
 
+# resume DAgger (or start from a GPS / BC / prior DAgger checkpoint)
+python -m scripts.run_dagger --env acrobot --deterministic \
+    --init-ckpt checkpoints/dagger/dagger_acrobot_iter09.pt \
+    --dagger-iters 5 --rollouts-per-iter 20 --episode-len 200 \
+    --device auto
+
 # deterministic policy + BC warmup before the DAgger loop
 python -m scripts.run_dagger --env acrobot --deterministic \
     --warmup-rollouts 20 --warmup-epochs 30 \
@@ -56,6 +62,7 @@ Flags:
 - `--deterministic` — use `DeterministicPolicy` (single-head, direct action regression) instead of `GaussianPolicy`.
 - `--beta-schedule linear|constant_zero` — β decays 1→0 over K/2 iters, or always 0.
 - `--buffer-cap 200000` — aggregated buffer capacity (oldest evicted).
+- `--init-ckpt PATH` — load policy weights before warmup / DAgger. The checkpoint class must match `--deterministic` (deterministic vs Gaussian head shapes differ).
 - `--seed-from PATH` — warm-start buffer from an existing BC h5 (no pre-training, just seeded rows).
 - `--warmup-rollouts N` — collect N pure-MPPI rollouts **and BC-train the policy on them** before the DAgger loop. Rows land in the aggregate buffer with `round_idx=-1`.
 - `--warmup-epochs E` — epochs of BC pre-training on warmup rollouts (default 20; ignored when `--warmup-rollouts=0`).

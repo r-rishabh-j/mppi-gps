@@ -25,7 +25,7 @@ class MPPIConfig:
 @dataclass
 class PolicyConfig:
     hidden_dims: tuple[int, ...] = (256, 256)
-    lr: float = 5e-3
+    lr: float = 5e-4
     activation: str = "relu"
     obs_norm: bool = True
     log_sigma_min: float = -5.0
