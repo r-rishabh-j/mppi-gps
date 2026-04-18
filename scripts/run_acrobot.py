@@ -20,7 +20,7 @@ def main():
         print(env.data.qpos)
         state = env.get_state()
         total_cost = 0.0 
-        for t in range(1000):
+        for t in range(2000):
             action, info = controller.plan_step(state)
             obs, cost, done, _ = env.step(action)
             total_cost += cost

@@ -44,10 +44,9 @@ def main():
     device = pick_device(args.device)
     env = make_env(args.env)
 
-    obs_dim = env.model.nq + env.model.nv
     policy_cfg = PolicyConfig()
-    policy = GaussianPolicy(obs_dim, env.action_dim, policy_cfg,
-                            device=device, 
+    policy = GaussianPolicy(env.obs_dim, env.action_dim, policy_cfg,
+                            device=device,
                             action_bounds=env.action_bounds \
                             if policy_cfg.squash_tanh else None,)
     policy.load_state_dict(torch.load(args.ckpt, map_location=device))
