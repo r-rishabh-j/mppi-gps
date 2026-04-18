@@ -17,6 +17,7 @@ MPPI runs on CPU (MuJoCo). Policy training uses the device selected by
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,15 @@ from src.policy.deterministic_policy import DeterministicPolicy
 from src.utils.config import DAggerConfig, MPPIConfig, PolicyConfig
 from src.utils.device import pick_device
 from src.utils.evaluation import evaluate_mppi, evaluate_policy
+from src.utils.experiment import (
+    copy_as,
+    git_sha,
+    load_checkpoint,
+    make_run_dir,
+    save_checkpoint,
+    update_config,
+    write_config,
+)
 from src.gps.dagger import DAggerTrainer
 
 
@@ -60,9 +70,10 @@ def parse_args() -> argparse.Namespace:
                    help="On episode termination during rollout/relabel, auto-reset and keep "
                         "collecting until episode_len steps are taken for that slot. Recommended "
                         "for terminating envs like hopper where policy-driven episodes fall early.")
-    p.add_argument("--ckpt-dir", default="checkpoints/dagger")
-    p.add_argument("--results-dir", default=None,
-                   help="Default: results/dagger_<env>")
+    p.add_argument("--exp-name", default="run",
+                   help="Human-readable experiment name (used in the run dir name).")
+    p.add_argument("--exp-dir", default="experiments/dagger",
+                   help="Parent dir under which a <timestamp>_<env>_<name>/ run dir is created.")
     return p.parse_args()
 
 
@@ -110,14 +121,16 @@ def main() -> None:
         init_ckpt = Path(args.init_ckpt)
         if not init_ckpt.exists():
             raise FileNotFoundError(f"--init-ckpt not found: {init_ckpt}")
+        blob = load_checkpoint(init_ckpt, map_location=device)
         try:
-            policy.load_state_dict(torch.load(init_ckpt, map_location=device))
+            policy.load_state_dict(blob["state_dict"])
         except RuntimeError as exc:
             raise RuntimeError(
                 f"failed to load --init-ckpt {init_ckpt}; make sure the checkpoint "
                 f"matches --deterministic={args.deterministic}"
             ) from exc
-        print(f"loaded initial policy weights from {init_ckpt}")
+        print(f"loaded initial policy weights from {init_ckpt}"
+              + (f"  (policy_class={blob['policy_class']})" if 'policy_class' in blob else ""))
 
     trainer = DAggerTrainer(env, mppi, policy, cfg, rng=rng)
     if args.seed_from is not None:
@@ -129,10 +142,27 @@ def main() -> None:
         else:
             print(f"warning: --seed-from {seed_path} does not exist; skipping")
 
-    ckpt_dir = Path(args.ckpt_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    results_dir = Path(args.results_dir) if args.results_dir else Path(f"results/dagger_{args.env}")
-    results_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = make_run_dir(args.exp_dir, args.env, args.exp_name)
+    print(f"run dir: {run_dir}")
+
+    start_time = datetime.now().isoformat(timespec="seconds")
+    write_config(run_dir, {
+        "name": args.exp_name,
+        "env": args.env,
+        "device": str(device),
+        "policy_class": type(policy).__name__,
+        "start_time": start_time,
+        "end_time": None,
+        "git_sha": git_sha(),
+        "cli_args": vars(args),
+        "configs": {
+            "dagger": cfg,
+            "policy": policy_cfg,
+            "mppi": mppi_cfg,
+        },
+        "best_iter": None,
+        "best_cost": None,
+    })
 
     if args.init_ckpt is not None and args.warmup_rollouts > 0:
         print("\nskipping warmup because --init-ckpt was provided")
@@ -159,6 +189,10 @@ def main() -> None:
         "iter,beta,new_samples,buffer_size,train_mse,val_mse,policy_mean_cost,policy_std_cost",
     ]
 
+    best_iter: int | None = None
+    best_cost = float("inf")
+    last_ckpt_path: Path | None = None
+
     for k in range(cfg.dagger_iters):
         print(f"\n=== DAgger iter {k}/{cfg.dagger_iters - 1} ===")
         info = trainer.step(k)
@@ -181,12 +215,39 @@ def main() -> None:
             f"{eval_stats['mean_cost']:.4f},{eval_stats['std_cost']:.4f}"
         )
 
-        ckpt_path = ckpt_dir / f"dagger_{args.env}_iter{k:02d}.pt"
-        torch.save(policy.state_dict(), ckpt_path)
+        ckpt_path = run_dir / f"iter_{k:02d}.pt"
+        save_checkpoint(
+            ckpt_path, policy,
+            round=k,
+            train_mse=info["train_mse"],
+            val_mse=info["val_mse"],
+            eval_mean_cost=eval_stats["mean_cost"],
+            eval_std_cost=eval_stats["std_cost"],
+        )
+        last_ckpt_path = ckpt_path
 
-    (results_dir / "dagger_log.csv").write_text("\n".join(log_lines))
-    print(f"\nlog written to {results_dir / 'dagger_log.csv'}")
+        if eval_stats["mean_cost"] < best_cost:
+            best_cost = eval_stats["mean_cost"]
+            best_iter = k
+            copy_as(ckpt_path, run_dir / "best.pt")
 
+        (run_dir / "dagger_log.csv").write_text("\n".join(log_lines))
+
+    if last_ckpt_path is not None:
+        copy_as(last_ckpt_path, run_dir / "final.pt")
+
+    update_config(run_dir, {
+        "end_time": datetime.now().isoformat(timespec="seconds"),
+        "best_iter": best_iter,
+        "best_cost": best_cost if best_iter is not None else None,
+        "mppi_baseline": {
+            "mean_cost": mppi_stats["mean_cost"],
+            "std_cost": mppi_stats["std_cost"],
+        },
+    })
+
+    print(f"\nrun dir: {run_dir}")
+    print(f"best iter: {best_iter}  best cost: {best_cost:.2f}")
     env.close()
 
 

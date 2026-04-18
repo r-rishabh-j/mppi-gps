@@ -1,37 +1,43 @@
 """Train a reactive policy via MPPI-GPS and evaluate against baselines.
 
-This is the main entry point for GPS training.  It:
-  1. Creates an environment and loads tuned MPPI hyperparameters.
-  2. Instantiates the MPPIGPS trainer and runs the full training loop.
-  3. Saves the trained policy checkpoint and learning curves (JSON + PNG).
-  4. Evaluates the GPS policy vs the MPPI baseline on identical initial
-     conditions, printing per-episode cost comparisons.
-  5. Renders a video of the trained policy's first evaluation episode.
+Creates a run dir `experiments/gps/<timestamp>_<env>_<name>/` containing:
+  - config.json    CLI args + all dataclass configs + metadata
+  - iter_<k>.pt    per-iter wrapped checkpoints
+  - best.pt / final.pt
+  - curves.json / curves.png
+  - <env>.mp4      eval video
 
-Usage examples:
-    # Train on acrobot with defaults (50 iterations, 5 conditions)
-    python scripts/run_gps.py --env acrobot
-
-    # Train on hopper with custom settings
-    python scripts/run_gps.py --env hopper --gps-iters 30 --alpha 0.05
-
-    # Quick test run
-    python scripts/run_gps.py --env acrobot --gps-iters 3 --episode-length 100
+Usage:
+    python -m scripts.run_gps --env acrobot --exp-name baseline
+    python -m scripts.run_gps --env hopper --gps-iters 30 --alpha 0.05
+    python -m scripts.run_gps --env acrobot --disable-kl --distill-loss nll \
+        --alpha 0.1 --gps-iters 20 --exp-name prior_only
 """
 
 import argparse
 import json
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-import mediapy
+from datetime import datetime
 from pathlib import Path
 
-from src.gps.mppi_gps import MPPIGPS
-from src.utils.config import MPPIConfig, PolicyConfig, GPSConfig
-from src.utils.evaluation import evaluate_policy, evaluate_mppi
-from src.mppi.mppi import MPPI
+import matplotlib.pyplot as plt
+import mediapy
+import numpy as np
+import torch
+
 from src.envs import make_env
+from src.gps.mppi_gps import MPPIGPS
+from src.mppi.mppi import MPPI
+from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
+from src.utils.device import pick_device
+from src.utils.evaluation import evaluate_mppi, evaluate_policy
+from src.utils.experiment import (
+    copy_as,
+    git_sha,
+    make_run_dir,
+    save_checkpoint,
+    update_config,
+    write_config,
+)
 
 
 _ENVS = ["acrobot", "half_cheetah", "point_mass", "hopper"]
@@ -56,11 +62,14 @@ def parse_args():
                    help="Constant nu for the policy prior when --disable-kl is set")
     p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda (policy only)")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--ckpt-dir", type=str, default="checkpoints")
     p.add_argument("--n-eval", type=int, default=10,
                    help="Number of evaluation episodes")
     p.add_argument("--eval-len", type=int, default=500,
                    help="Max steps per evaluation episode")
+    p.add_argument("--exp-name", default="run",
+                   help="Human-readable experiment name (used in the run dir name).")
+    p.add_argument("--exp-dir", default="experiments/gps",
+                   help="Parent dir under which a <timestamp>_<env>_<name>/ run dir is created.")
     return p.parse_args()
 
 
@@ -71,12 +80,10 @@ def main():
 
     env = make_env(args.env)
 
-    # Load tuned MPPI hyperparameters from configs/<env>_best.json
     mppi_cfg = MPPIConfig.load(args.env)
     policy_cfg = PolicyConfig()
     gps_cfg = GPSConfig()
 
-    # Apply any command-line overrides to GPS config
     if args.gps_iters is not None:
         gps_cfg.num_iterations = args.gps_iters
     if args.num_conditions is not None:
@@ -92,7 +99,6 @@ def main():
     if args.nu is not None:
         gps_cfg.badmm_init_nu = args.nu
 
-    from src.utils.device import pick_device
     device = pick_device(args.device)
     print(f"policy device: {device}")
     if gps_cfg.disable_kl_constraint:
@@ -100,27 +106,49 @@ def main():
               f"(alpha={gps_cfg.policy_augmented_alpha}, nu={gps_cfg.badmm_init_nu}, "
               f"distill_loss={gps_cfg.distill_loss})")
 
+    # ---- Run dir + config dump ----
+    run_dir = make_run_dir(args.exp_dir, args.env, args.exp_name)
+    print(f"run dir: {run_dir}")
+
+    start_time = datetime.now().isoformat(timespec="seconds")
+    write_config(run_dir, {
+        "name": args.exp_name,
+        "env": args.env,
+        "device": str(device),
+        "policy_class": "GaussianPolicy",
+        "start_time": start_time,
+        "end_time": None,
+        "git_sha": git_sha(),
+        "cli_args": vars(args),
+        "configs": {
+            "gps": gps_cfg,
+            "policy": policy_cfg,
+            "mppi": mppi_cfg,
+        },
+        "best_iter": None,
+        "best_cost": None,
+    })
+
     # ---- Training ----
-    ckpt_dir = Path(args.ckpt_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    env_tag = f"gps_{args.env}"
-
     gps = MPPIGPS(env, mppi_cfg, policy_cfg, gps_cfg, device=device)
-    history = gps.train(checkpoint_dir=ckpt_dir, env_tag=env_tag)
+    history = gps.train(run_dir=run_dir)
 
-    # ---- Save final checkpoint (alongside per-iter + best from train()) ----
-    ckpt_path = ckpt_dir / f"{env_tag}.pt"
-    torch.save(gps.policy.state_dict(), ckpt_path)
-    print(f"\nsaved final policy checkpoint to {ckpt_path}")
+    # ---- Save final checkpoint (wrapped) + copy to final.pt ----
+    final_path = run_dir / "final.pt"
+    save_checkpoint(
+        final_path, gps.policy,
+        iteration=gps_cfg.num_iterations - 1,
+        mean_cost=history.iteration_costs[-1] if history.iteration_costs else None,
+    )
+    print(f"\nsaved final policy checkpoint to {final_path}")
     if history.best_iter >= 0:
-        best_path = ckpt_dir / f"{env_tag}_best.pt"
         print(
             f"best iter: {history.best_iter} "
-            f"(cost={history.best_cost:.2f}) → {best_path}"
+            f"(cost={history.best_cost:.2f}) → {run_dir / 'best.pt'}"
         )
 
     # ---- Save learning curves as JSON ----
-    curves_path = ckpt_dir / f"gps_{args.env}_curves.json"
+    curves_path = run_dir / "curves.json"
     curves_path.write_text(json.dumps({
         "costs": history.iteration_costs,
         "kl": history.iteration_kl,
@@ -150,7 +178,7 @@ def main():
     axes[2].set_title("Dual variable")
 
     plt.tight_layout()
-    plot_path = ckpt_dir / f"gps_{args.env}_curves.png"
+    plot_path = run_dir / "curves.png"
     plt.savefig(plot_path, dpi=120)
     print(f"saved learning curve plot to {plot_path}")
 
@@ -166,17 +194,14 @@ def main():
     )
 
     print("--- Evaluating MPPI baseline ---")
-    # MPPI baseline always uses CPU controller for evaluation
-    eval_env = env
-    mppi = MPPI(eval_env, mppi_cfg)
+    mppi = MPPI(env, mppi_cfg)
     mppi_stats = evaluate_mppi(
-        eval_env, mppi,
+        env, mppi,
         n_episodes=args.n_eval,
         episode_len=args.eval_len,
         seed=args.seed,
     )
 
-    # Print summary comparison
     print()
     print(f"GPS policy:    {gps_stats['mean_cost']:8.2f} +/- {gps_stats['std_cost']:.2f}")
     print(f"MPPI baseline: {mppi_stats['mean_cost']:8.2f} +/- {mppi_stats['std_cost']:.2f}")
@@ -187,11 +212,26 @@ def main():
         print(f"  ep {ep:2d}  GPS={g:8.2f}  MPPI={m:8.2f}  gap={g - m:+8.2f}")
 
     # ---- Save video of trained policy ----
+    video_path = None
     if gps_stats["frames"]:
-        video_path = ckpt_dir / f"gps_{args.env}.mp4"
+        video_path = run_dir / f"{args.env}.mp4"
         mediapy.write_video(str(video_path), gps_stats["frames"], fps=30)
         print(f"\nsaved rollout video to {video_path}")
 
+    # ---- Finalize config.json ----
+    update_config(run_dir, {
+        "end_time": datetime.now().isoformat(timespec="seconds"),
+        "best_iter": history.best_iter if history.best_iter >= 0 else None,
+        "best_cost": history.best_cost if history.best_iter >= 0 else None,
+        "eval": {
+            "gps_mean_cost": gps_stats["mean_cost"],
+            "gps_std_cost": gps_stats["std_cost"],
+            "mppi_mean_cost": mppi_stats["mean_cost"],
+            "mppi_std_cost": mppi_stats["std_cost"],
+        },
+    })
+
+    print(f"\nrun dir: {run_dir}")
     env.close()
 
 

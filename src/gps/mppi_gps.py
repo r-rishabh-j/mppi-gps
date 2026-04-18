@@ -24,6 +24,7 @@ from src.envs.base import BaseEnv
 from src.mppi.mppi import MPPI
 from src.policy.gaussian_policy import GaussianPolicy
 from src.utils.config import MPPIConfig, PolicyConfig, GPSConfig
+from src.utils.experiment import copy_as, save_checkpoint
 from src.utils.math import weighted_mean_cov
 
 
@@ -410,8 +411,7 @@ class MPPIGPS:
     def train(
         self,
         num_iterations: int | None = None,
-        checkpoint_dir: Path | None = None,
-        env_tag: str = "gps",
+        run_dir: Path | None = None,
     ) -> GPSHistory:
         """Run the full MPPI-GPS training loop.
 
@@ -425,8 +425,9 @@ class MPPIGPS:
 
         Args:
             num_iterations: Override for gps_cfg.num_iterations.
-            checkpoint_dir: If set, save per-iter + best-so-far policy state.
-            env_tag: Prefix for checkpoint filenames.
+            run_dir: If set, save per-iter wrapped checkpoints as
+                `{run_dir}/iter_{k:03d}.pt` and copy the best-by-eval to
+                `{run_dir}/best.pt`.
         Returns:
             GPSHistory with per-iteration metrics.
         """
@@ -434,9 +435,9 @@ class MPPIGPS:
         cfg = self.gps_cfg
         history = GPSHistory()
 
-        if checkpoint_dir is not None:
-            checkpoint_dir = Path(checkpoint_dir)
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if run_dir is not None:
+            run_dir = Path(run_dir)
+            run_dir.mkdir(parents=True, exist_ok=True)
 
         # Sample a fixed set of initial conditions that persist across all
         # iterations.  This ensures the policy is trained to handle a diverse
@@ -574,14 +575,20 @@ class MPPIGPS:
             history.distill_losses.append(loss)
 
             # ========== Checkpointing ==========
-            if checkpoint_dir is not None:
-                iter_path = checkpoint_dir / f"{env_tag}_iter{iteration:03d}.pt"
-                torch.save(self.policy.state_dict(), iter_path)
+            if run_dir is not None:
+                iter_path = run_dir / f"iter_{iteration:03d}.pt"
+                save_checkpoint(
+                    iter_path, self.policy,
+                    iteration=iteration,
+                    mean_cost=mean_cost,
+                    distill_loss=loss,
+                    kl=kl_mean,
+                    nu=self.nu,
+                )
                 if mean_cost < history.best_cost:
                     history.best_cost = mean_cost
                     history.best_iter = iteration
-                    best_path = checkpoint_dir / f"{env_tag}_best.pt"
-                    torch.save(self.policy.state_dict(), best_path)
+                    copy_as(iter_path, run_dir / "best.pt")
 
             print(
                 f"[GPS iter {iteration:3d}]  "

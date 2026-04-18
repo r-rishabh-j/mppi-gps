@@ -51,6 +51,13 @@ python -m scripts.run_dagger --env acrobot --deterministic \
     --dagger-iters 10 --rollouts-per-iter 20 --episode-len 200 \
     --beta-schedule linear --device auto
 
+# hopper (terminating env — use --auto-reset so early falls don't
+# waste the per-rollout step budget; env is resolved via the registry)
+python -m scripts.run_dagger --env hopper --deterministic --auto-reset \
+    --warmup-rollouts 30 --warmup-epochs 50 \
+    --dagger-iters 30 --rollouts-per-iter 10 --episode-len 500 \
+    --beta-schedule linear --distill-epochs 6 --buffer-cap 50000 --device cuda
+
 # quick smoke test (~1–2 min)
 python -m scripts.run_dagger --env acrobot \
     --dagger-iters 2 --rollouts-per-iter 3 --episode-len 80 \
@@ -58,18 +65,24 @@ python -m scripts.run_dagger --env acrobot \
 ```
 
 Flags:
+- `--env {acrobot,half_cheetah,hopper,point_mass}` — resolved via the `src.envs.make_env` registry.
 - `--device auto|cpu|mps|cuda` — auto resolves to cuda → mps → cpu.
 - `--deterministic` — use `DeterministicPolicy` (single-head, direct action regression) instead of `GaussianPolicy`.
 - `--beta-schedule linear|constant_zero` — β decays 1→0 over K/2 iters, or always 0.
 - `--buffer-cap 200000` — aggregated buffer capacity (oldest evicted).
+- `--auto-reset` — on episode termination during a rollout slot, reset env + MPPI and keep relabeling until the slot's step budget is spent. Recommended for terminating envs like hopper; off by default so acrobot / non-terminating behavior is unchanged.
 - `--init-ckpt PATH` — load policy weights before warmup / DAgger. The checkpoint class must match `--deterministic` (deterministic vs Gaussian head shapes differ).
 - `--seed-from PATH` — warm-start buffer from an existing BC h5 (no pre-training, just seeded rows).
 - `--warmup-rollouts N` — collect N pure-MPPI rollouts **and BC-train the policy on them** before the DAgger loop. Rows land in the aggregate buffer with `round_idx=-1`.
 - `--warmup-epochs E` — epochs of BC pre-training on warmup rollouts (default 20; ignored when `--warmup-rollouts=0`).
+- `--exp-name NAME` — human-readable experiment name (default `run`). Appended to the run dir.
+- `--exp-dir PATH` — parent dir under which a `<timestamp>_<env>_<name>/` run dir is created. Default `experiments/dagger`.
 
-Outputs:
-- `checkpoints/dagger/dagger_<env>_iter<k>.pt` — per-iteration policy weights.
-- `results/dagger_acrobot/dagger_log.csv` — per-iter metrics + MPPI baseline.
+Outputs (all inside the run dir `experiments/dagger/<timestamp>_<env>_<name>/`):
+- `config.json` — CLI args, DAgger/Policy/MPPI configs, env, device, git sha, start/end time, MPPI baseline, best iter + cost. Written at start, updated at end.
+- `iter_<k>.pt` — per-iteration wrapped checkpoint: `{state_dict, policy_class, round, train_mse, val_mse, eval_mean_cost, eval_std_cost}`.
+- `best.pt` / `final.pt` — copies of the best-by-eval and last iterations.
+- `dagger_log.csv` — per-iter metrics + MPPI baseline (updated incrementally).
 
 ## GPS (KL-constrained distillation)
 
@@ -113,18 +126,30 @@ Flags:
 
 ## Evaluate a saved checkpoint
 
-Load any `.pt` policy state_dict and evaluate it (observation-normalizer
-stats and tanh-squash buffers are restored automatically via `state_dict`).
+Load any `.pt` policy state_dict and evaluate it. `--ckpt` accepts either a
+single `.pt` file or a run dir from `scripts.run_dagger` — in the latter case
+`best.pt` is used and `--env` / `--deterministic` are auto-detected from the
+run's `config.json`.
+
+Policies no longer tanh-squash — the network output is unconstrained and
+bounds are applied as a clip at `act_np`. Checkpoints saved under the old
+tanh-squash scheme (with `_act_scale` / `_act_bias` buffers) are not
+load-compatible with the current policy and need to be retrained.
 
 ```bash
-# stochastic policy (GaussianPolicy — GPS default and DAgger default)
+# eval the best checkpoint from a DAgger run dir (env + policy auto-detected)
+python -m scripts.eval_checkpoint \
+    --ckpt experiments/dagger/20260418-162125_acrobot_smoke \
+    --n-eval 10 --render
+
+# legacy GPS checkpoint (raw state_dict)
 python -m scripts.eval_checkpoint --env acrobot \
     --ckpt checkpoints/gps_acrobot_best.pt \
     --n-eval 10 --render
 
-# deterministic policy checkpoint (DAgger with --deterministic)
-python -m scripts.eval_checkpoint --env acrobot --deterministic \
-    --ckpt checkpoints/dagger/dagger_acrobot_iter09.pt \
+# deterministic policy from a specific iter .pt inside a run dir
+python -m scripts.eval_checkpoint --deterministic \
+    --ckpt experiments/dagger/20260418-162125_acrobot_smoke/iter_09.pt \
     --n-eval 10 --render
 ```
 
