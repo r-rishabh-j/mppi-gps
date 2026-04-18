@@ -37,15 +37,13 @@ class DeterministicPolicy(nn.Module):
         layers.append(nn.Linear(in_dim, act_dim))
         self.net = nn.Sequential(*layers)
 
-        self._squash = bool(cfg.squash_tanh)
-        if self._squash:
-            if action_bounds is None:
-                raise ValueError("squash_tanh=True requires action_bounds")
+        if action_bounds is not None:
             low, high = action_bounds
-            low_t = torch.as_tensor(low, dtype=torch.float32)
-            high_t = torch.as_tensor(high, dtype=torch.float32)
-            self.register_buffer("_act_scale", (high_t - low_t) / 2.0)
-            self.register_buffer("_act_bias", (high_t + low_t) / 2.0)
+            self.register_buffer("_act_low", torch.as_tensor(low, dtype=torch.float32))
+            self.register_buffer("_act_high", torch.as_tensor(high, dtype=torch.float32))
+        else:
+            self._act_low = None
+            self._act_high = None
 
         self._device = torch.device(device) if device is not None else torch.device("cpu")
         self.to(self._device)
@@ -62,10 +60,7 @@ class DeterministicPolicy(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         x = self.normalizer(obs) if self.normalizer is not None else obs
-        a = self.net(x)
-        if self._squash:
-            a = torch.tanh(a) * self._act_scale + self._act_bias
-        return a
+        return self.net(x)
 
     def action(self, obs: torch.Tensor) -> torch.Tensor:
         return self.forward(obs)
@@ -88,5 +83,8 @@ class DeterministicPolicy(nn.Module):
         squeeze = obs_t.ndim == 1
         if squeeze:
             obs_t = obs_t.unsqueeze(0)
-        a = self.forward(obs_t).cpu().numpy()
-        return a[0] if squeeze else a
+        a = self.forward(obs_t)
+        if self._act_low is not None:
+            a = torch.clamp(a, self._act_low, self._act_high)
+        a_np = a.cpu().numpy()
+        return a_np[0] if squeeze else a_np

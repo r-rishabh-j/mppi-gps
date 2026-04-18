@@ -13,12 +13,12 @@ _XML = str(Path(__file__).resolve().parents[2] / "assets" / "acrobot.xml")
 _TARGET = np.array([0.0, 0.0, 4.0])
 
 class Acrobot(MuJoCoEnv):
-    def __init__(self, frame_skip: int = 1, **kwargs) -> None:
+    def __init__(self, frame_skip: int = 2, **kwargs) -> None:
         super().__init__(model_path=_XML, frame_skip=frame_skip, **kwargs)
         self._nq = self.model.nq #2
         self._nv = self.model.nv #2
 
-        self._w_terminal = 4.0
+        self._w_terminal = 5.0
         # --- previous reward-shaping params (commented for reference) ---
         # self._energy_target = 4.0
         # self._energy_weight = 0.08

@@ -103,6 +103,7 @@ class DAggerTrainer:
         obs_rows: list[np.ndarray] = []
         act_rows: list[np.ndarray] = []
 
+        auto_reset = getattr(self.cfg, "auto_reset", False)
         total_steps = n_rollouts * ep_len
         with tqdm(
             total=total_steps,
@@ -132,7 +133,11 @@ class DAggerTrainer:
                     _, _, done, _ = self.env.step(exec_action)
                     pbar.update(1)
                     if done:
-                        break
+                        if auto_reset:
+                            self.env.reset()
+                            self.mppi.reset()
+                        else:
+                            break
 
         obs_arr = np.stack(obs_rows, axis=0)
         act_arr = np.stack(act_rows, axis=0)

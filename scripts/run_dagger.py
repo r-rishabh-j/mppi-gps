@@ -4,9 +4,12 @@ Example:
     python -m scripts.run_dagger --env acrobot --dagger-iters 10 \
         --rollouts-per-iter 20 --episode-len 200 --device auto
 
-    python -m scripts.run_dagger --env acrobot --deterministic \
-        --init-ckpt checkpoints/dagger/dagger_acrobot_iter09.pt \
-        --dagger-iters 5 --rollouts-per-iter 20 --episode-len 200 --device auto
+    # Hopper (terminating env — use --auto-reset so early falls don't
+    # waste the per-rollout step budget):
+    python -m scripts.run_dagger --env hopper --deterministic --auto-reset \
+        --warmup-rollouts 30 --warmup-epochs 50 \
+        --dagger-iters 30 --rollouts-per-iter 10 --episode-len 500 \
+        --beta-schedule linear --distill-epochs 6 --buffer-cap 50000 --device cuda
 
 MPPI runs on CPU (MuJoCo). Policy training uses the device selected by
 `--device` (auto → cuda → mps → cpu).
@@ -19,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.envs.acrobot import Acrobot
+from src.envs import make_env
 from src.mppi.mppi import MPPI
 from src.policy.gaussian_policy import GaussianPolicy
 from src.policy.deterministic_policy import DeterministicPolicy
@@ -27,12 +30,6 @@ from src.utils.config import DAggerConfig, MPPIConfig, PolicyConfig
 from src.utils.device import pick_device
 from src.utils.evaluation import evaluate_mppi, evaluate_policy
 from src.gps.dagger import DAggerTrainer
-
-
-def make_env(name: str):
-    if name == "acrobot":
-        return Acrobot()
-    raise ValueError(f"unsupported env for DAgger: {name}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,8 +56,13 @@ def parse_args() -> argparse.Namespace:
                    help="Pre-DAgger: collect this many pure-MPPI rollouts and BC-train the policy on them")
     p.add_argument("--warmup-epochs", type=int, default=20,
                    help="Epochs of BC pre-training on the warmup rollouts (ignored if --warmup-rollouts=0)")
+    p.add_argument("--auto-reset", action="store_true",
+                   help="On episode termination during rollout/relabel, auto-reset and keep "
+                        "collecting until episode_len steps are taken for that slot. Recommended "
+                        "for terminating envs like hopper where policy-driven episodes fall early.")
     p.add_argument("--ckpt-dir", default="checkpoints/dagger")
-    p.add_argument("--results-dir", default="results/dagger_acrobot")
+    p.add_argument("--results-dir", default=None,
+                   help="Default: results/dagger_<env>")
     return p.parse_args()
 
 
@@ -78,6 +80,7 @@ def main() -> None:
         n_eval_eps=args.n_eval_eps,
         eval_ep_len=args.eval_ep_len,
         seed=args.seed,
+        auto_reset=args.auto_reset,
     )
 
     device = pick_device(args.device)
@@ -93,7 +96,7 @@ def main() -> None:
     obs_dim = env.obs_dim
     act_dim = env.action_dim
     policy_cfg = PolicyConfig()
-    bounds = env.action_bounds if policy_cfg.squash_tanh else None
+    bounds = env.action_bounds
     if args.deterministic:
         policy = DeterministicPolicy(obs_dim, act_dim, policy_cfg,
                                      device=device, action_bounds=bounds)
@@ -128,7 +131,7 @@ def main() -> None:
 
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    results_dir = Path(args.results_dir)
+    results_dir = Path(args.results_dir) if args.results_dir else Path(f"results/dagger_{args.env}")
     results_dir.mkdir(parents=True, exist_ok=True)
 
     if args.init_ckpt is not None and args.warmup_rollouts > 0:

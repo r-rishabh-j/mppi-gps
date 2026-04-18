@@ -280,7 +280,7 @@ class MPPIGPS:
             env.action_dim,
             policy_cfg,
             device=device,
-            action_bounds=env.action_bounds if policy_cfg.squash_tanh else None,
+            action_bounds=env.action_bounds,
         )
 
         # BADMM dual variable — controls how strongly the KL constraint

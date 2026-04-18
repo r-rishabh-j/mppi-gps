@@ -48,7 +48,7 @@ def main():
     env = make_env(args.env)
 
     policy_cfg = PolicyConfig()
-    bounds = env.action_bounds if policy_cfg.squash_tanh else None
+    bounds = env.action_bounds
     PolicyCls = DeterministicPolicy if args.deterministic else GaussianPolicy
     policy = PolicyCls(env.obs_dim, env.action_dim, policy_cfg,
                        device=device, action_bounds=bounds)

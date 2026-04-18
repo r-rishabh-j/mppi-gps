@@ -30,7 +30,6 @@ class PolicyConfig:
     obs_norm: bool = True
     log_sigma_min: float = -5.0
     log_sigma_max: float = 2.0
-    squash_tanh: bool = True
 
 @dataclass
 class GPSConfig:
@@ -65,4 +64,7 @@ class DAggerConfig:
     n_eval_eps: int = 10
     eval_ep_len: int = 500
     seed: int = 0
+    auto_reset: bool = False             # on termination, reset and keep collecting
+                                         # until episode_len steps are taken for the slot
+                                         # (useful for terminating envs like hopper)
 

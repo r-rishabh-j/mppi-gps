@@ -80,16 +80,15 @@ class GaussianPolicy(nn.Module):
         # Init log_sigma head bias to 0 → sigma ≈ 1 at start.
         nn.init.zeros_(self.net[-1].bias[act_dim:])
 
-        # Tanh-squash: store action scale/bias so mu lands in [low, high].
-        self._squash = bool(cfg.squash_tanh)
-        if self._squash:
-            if action_bounds is None:
-                raise ValueError("squash_tanh=True requires action_bounds")
+        # Bounds are used only to clip at execution time (act_np). Network
+        # output is unconstrained; the env (MuJoCo ctrl) also clamps ctrl.
+        if action_bounds is not None:
             low, high = action_bounds
-            low_t = torch.as_tensor(low, dtype=torch.float32)
-            high_t = torch.as_tensor(high, dtype=torch.float32)
-            self.register_buffer("_act_scale", (high_t - low_t) / 2.0)
-            self.register_buffer("_act_bias", (high_t + low_t) / 2.0)
+            self.register_buffer("_act_low", torch.as_tensor(low, dtype=torch.float32))
+            self.register_buffer("_act_high", torch.as_tensor(high, dtype=torch.float32))
+        else:
+            self._act_low = None
+            self._act_high = None
 
         self._device = torch.device(device) if device is not None else torch.device("cpu")
         self.to(self._device)
@@ -106,54 +105,28 @@ class GaussianPolicy(nn.Module):
         return out
 
     def _head(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply normalizer + MLP, return raw (mu_pre, log_sigma) — unsquashed."""
+        """Apply normalizer + MLP, return (mu, log_sigma)."""
         x = self.normalizer(obs) if self.normalizer is not None else obs
         out = self.net(x)
-        mu_pre, log_sigma = out[..., :self.act_dim], out[..., self.act_dim:]
+        mu, log_sigma = out[..., :self.act_dim], out[..., self.act_dim:]
         log_sigma = log_sigma.clamp(self.cfg.log_sigma_min, self.cfg.log_sigma_max)
-        return mu_pre, log_sigma
-
-    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """obs: (B, obs_dim) → mu: (B, act_dim), log_sigma: (B, act_dim).
-
-        When squash_tanh is on, mu is the squashed mean in action space. The
-        log_sigma returned here is still in pre-tanh (base-Gaussian) units —
-        use log_prob / sample to get correctly-corrected values.
-        """
-        mu_pre, log_sigma = self._head(obs)
-        if self._squash:
-            mu = torch.tanh(mu_pre) * self._act_scale + self._act_bias
-        else:
-            mu = mu_pre
         return mu, log_sigma
 
+    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """obs: (B, obs_dim) → mu: (B, act_dim), log_sigma: (B, act_dim)."""
+        return self._head(obs)
+
     def log_prob(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """log π(actions | obs), shape (B,). Applies tanh change-of-vars if enabled."""
-        mu_pre, log_sigma = self._head(obs)
+        """log π(actions | obs), shape (B,). Plain diagonal Gaussian."""
+        mu, log_sigma = self._head(obs)
         sigma = log_sigma.exp()
-
-        if self._squash:
-            # Invert the squash: u_pre such that action = tanh(u_pre)*scale + bias.
-            # Numerically stable atanh via clamp.
-            norm = (actions - self._act_bias) / self._act_scale
-            norm = norm.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
-            u_pre = torch.atanh(norm)
-            base = -0.5 * (((u_pre - mu_pre) / sigma) ** 2 + 2 * log_sigma + np.log(2 * np.pi))
-            # Change-of-variables: subtract log|d tanh / d u| = log(1 - tanh²),
-            # plus the linear rescaling log(scale).
-            jac = torch.log(1.0 - torch.tanh(u_pre) ** 2 + 1e-6) + torch.log(self._act_scale + 1e-12)
-            return (base - jac).sum(dim=-1)
-
-        lp = -0.5 * (((actions - mu_pre) / sigma) ** 2 + 2 * log_sigma + np.log(2 * np.pi))
+        lp = -0.5 * (((actions - mu) / sigma) ** 2 + 2 * log_sigma + np.log(2 * np.pi))
         return lp.sum(dim=-1)
 
     def sample(self, obs: torch.Tensor) -> torch.Tensor:
         """Reparameterized sample of an action."""
-        mu_pre, log_sigma = self._head(obs)
-        u_pre = mu_pre + log_sigma.exp() * torch.randn_like(mu_pre)
-        if self._squash:
-            return torch.tanh(u_pre) * self._act_scale + self._act_bias
-        return u_pre
+        mu, log_sigma = self._head(obs)
+        return mu + log_sigma.exp() * torch.randn_like(mu)
 
     def train_weighted(
         self,
@@ -186,10 +159,7 @@ class GaussianPolicy(nn.Module):
         return mu
 
     def mse_step(self, obs: np.ndarray, actions: np.ndarray) -> float:
-        """One gradient step of MSE loss on the mean (deterministic regression).
-
-        log_sigma is not supervised; only mu gets gradient. Used by DAgger.
-        """
+        """One gradient step of MSE on the mean. log_sigma is not supervised."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
         if self.normalizer is not None:
@@ -209,11 +179,13 @@ class GaussianPolicy(nn.Module):
 
     @torch.no_grad()
     def act_np(self, obs: np.ndarray) -> np.ndarray:
-        """Mean action from numpy obs. Used by eval / MPPI warm-start."""
+        """Mean action from numpy obs, clipped to action bounds if known."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         squeeze = obs_t.ndim == 1
         if squeeze:
             obs_t = obs_t.unsqueeze(0)
         mu, _ = self.forward(obs_t)
+        if self._act_low is not None:
+            mu = torch.clamp(mu, self._act_low, self._act_high)
         mu_np = mu.cpu().numpy()
         return mu_np[0] if squeeze else mu_np
