@@ -125,6 +125,24 @@ class Hopper(MuJoCoEnv):
         # No terminal cost — the running cost fully specifies the objective.
         return np.zeros(states.shape[0])
 
+    def running_cost_torch(self, states, actions, sensordata=None):
+        qpos = self.state_qpos(states)
+        qvel = self.state_qvel(states)
+        vx = qvel[:, :, 0]
+        ctrl_cost = (actions ** 2).sum(dim=-1)
+        z = qpos[:, :, 1]
+        angle = qpos[:, :, 2]
+        healthy = ((z > _Z_MIN) & (angle.abs() < _ANGLE_MAX)).to(vx.dtype)
+        return (
+            -self._fwd_w * vx
+            - self._healthy_reward * healthy
+            + self._ctrl_w * ctrl_cost
+        )
+
+    def terminal_cost_torch(self, states, sensordata=None):
+        import torch
+        return torch.zeros(states.shape[0], dtype=states.dtype, device=states.device)
+
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         """Single environment step with termination on unhealthy state.
 

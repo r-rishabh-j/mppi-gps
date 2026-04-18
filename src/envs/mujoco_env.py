@@ -1,34 +1,39 @@
-"""mujoco env with batched rollouts using mujoco.rollout."""
+"""mujoco env with pluggable batched-rollout backend (cpu threads or mujoco_warp)."""
 
-import os
-import numpy as np 
-import mujoco 
+import numpy as np
+import mujoco
 from jaxtyping import Array, Float
-from mujoco import rollout 
 
 from src.envs.base import BaseEnv
+from src.envs.rollout_backends import RolloutBackend, make_backend
+
 
 class MuJoCoEnv(BaseEnv):
-    def __init__(self, model_path: str, nthread: int | None = None, frame_skip: int = 1):
+    def __init__(
+        self,
+        model_path: str,
+        nthread: int | None = None,
+        frame_skip: int = 1,
+        backend: str = "cpu",
+        backend_kwargs: dict | None = None,
+    ):
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
 
-        # adding frame skip 
         self._frame_skip = frame_skip
         self._dt = self.model.opt.timestep * frame_skip
 
-        # state size for full physics state (qpos, qvel, actions, etc)
         self._nstate = mujoco.mj_stateSize(
             self.model, mujoco.mjtState.mjSTATE_FULLPHYSICS
         )
 
-        # thread pool for the batched rollouts 
-        self._nthread = nthread or os.cpu_count()
-        self._data_pool = [
-            mujoco.MjData(self.model) for _ in range(self._nthread)
-        ]
-
-        self._rollout_ctx = rollout.Rollout(nthread = self._nthread)
+        bkwargs = dict(backend_kwargs or {})
+        if backend == "cpu" and nthread is not None:
+            bkwargs.setdefault("nthread", nthread)
+        self._backend_name = backend
+        self._backend: RolloutBackend = make_backend(
+            backend, self.model, frame_skip=frame_skip, **bkwargs
+        )
 
     def reset(self, state: np.ndarray | None = None) -> np.ndarray:
         mujoco.mj_resetData(self.model, self.data)
@@ -36,7 +41,7 @@ class MuJoCoEnv(BaseEnv):
             self.set_state(state)
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs()
-    
+
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         self.data.ctrl[:] = action
         for _ in range(self._frame_skip):
@@ -48,12 +53,12 @@ class MuJoCoEnv(BaseEnv):
                 state.reshape(1, 1, -1), action.reshape(1, 1, -1), sensor
             ).item()
         return obs, c, False, {}
-    
+
     def get_state(self) -> np.ndarray:
         state = np.empty(self._nstate)
         mujoco.mj_getState(
-            self.model, self.data, state, 
-            mujoco.mjtState.mjSTATE_FULLPHYSICS, 
+            self.model, self.data, state,
+            mujoco.mjtState.mjSTATE_FULLPHYSICS,
         )
         return state
 
@@ -78,37 +83,35 @@ class MuJoCoEnv(BaseEnv):
         return states[..., start:end]
 
     def batch_rollout(
-            self, 
-            initial_state: np.ndarray, 
-            action_sequences: np.ndarray, 
-    ) -> tuple[np.ndarray, np.ndarray]:
-        K, H, _ = action_sequences.shape 
-        
-        # repeat each action for frame_skip physics steps 
-        actions_expanded = np.repeat(action_sequences, self._frame_skip, axis = 1) 
-        states_full, sensordata_full = self._rollout_ctx.rollout(
-            self.model,
-            self._data_pool,
-            initial_state,
-            actions_expanded
+        self,
+        initial_state: np.ndarray,
+        action_sequences: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return self._backend.rollout(self, initial_state, action_sequences)
+
+    def running_cost_torch(self, states, actions, sensordata=None):
+        """Torch/GPU cost. Subclasses targeting the warp backend must override.
+
+        Signature mirrors running_cost but operates on torch tensors on the
+        backend's device; returns a (K, H) torch tensor.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.running_cost_torch not implemented; "
+            "required when rollout backend is 'warp'."
         )
 
-        # downsample states: take every frame_skip-th frame
-        states = states_full[:, ::self._frame_skip, :]
-        sensordata = sensordata_full[:, ::self._frame_skip, :]
-
-        c = self.running_cost(states, action_sequences, sensordata) # (K, H)
-        tc = self.terminal_cost(states[:, -1, :], sensordata[:, -1, :]) # (K, )
-        costs = c.sum(axis = 1) + tc
-        return states, costs, sensordata
-    
+    def terminal_cost_torch(self, states, sensordata=None):
+        raise NotImplementedError(
+            f"{type(self).__name__}.terminal_cost_torch not implemented; "
+            "required when rollout backend is 'warp'."
+        )
 
     def _get_obs(self) -> np.ndarray:
-        """ can be overrided in the sub class if you need to change the obs space"""
+        """Can be overridden in the subclass if you need to change the obs space."""
         return self.get_state()
 
     def state_to_obs(self, states: np.ndarray) -> np.ndarray:
-        """Default: return full state. Override in subclasses that have reduced obs."""
+        """Default: return full state. Override in subclasses with reduced obs."""
         return states
 
     @property
@@ -118,11 +121,11 @@ class MuJoCoEnv(BaseEnv):
     @property
     def state_dim(self) -> int:
         return self._nstate
-    
-    @property 
+
+    @property
     def action_dim(self) -> int:
-        return self.model.nu 
-    
+        return self.model.nu
+
     @property
     def action_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         return (
@@ -131,5 +134,4 @@ class MuJoCoEnv(BaseEnv):
         )
 
     def close(self):
-        self._rollout_ctx.__exit__(None, None, None)
-
+        self._backend.close()

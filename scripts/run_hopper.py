@@ -17,9 +17,10 @@ T = 2000
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true", help="interactive viewer instead of recording")
+    parser.add_argument("--rollout-backend", default="cpu", choices=["cpu", "warp"])
     args = parser.parse_args()
 
-    env = Hopper()
+    env = Hopper(backend=args.rollout_backend)
     cfg = MPPIConfig.load("hopper")
     controller = MPPI(env, cfg)
 

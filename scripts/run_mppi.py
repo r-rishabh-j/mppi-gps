@@ -1,13 +1,17 @@
-import numpy as np 
+import argparse
+import numpy as np
 from src.envs.acrobot import Acrobot
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
-import gymnasium as gym 
+import gymnasium as gym
 import mujoco
 
 
 def main():
-    env = Acrobot()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rollout-backend", default="cpu", choices=["cpu", "warp"])
+    args = parser.parse_args()
+    env = Acrobot(backend=args.rollout_backend)
     cfg = MPPIConfig(K=256, H=10, lam=0.020650190864803457, noise_sigma=0.4255750435453001, adaptive_lam=False)
     controller = MPPI(env, cfg)
 

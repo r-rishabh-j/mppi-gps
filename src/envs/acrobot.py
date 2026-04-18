@@ -106,6 +106,51 @@ class Acrobot(MuJoCoEnv):
         vel_cost = np.sum(qvel**2, axis=-1)
         return self._w_terminal * (2.0 * dist + 5.0 * vel_cost)
 
+    def running_cost_torch(self, states, actions, sensordata=None):
+        import torch
+        tip_pos = sensordata[:, :, :3]
+        tip_z = tip_pos[..., 2]
+        qvel = self.state_qvel(states)
+        vel_sq = (qvel ** 2).sum(dim=-1)
+
+        target = torch.as_tensor(_TARGET, dtype=tip_pos.dtype, device=tip_pos.device)
+        dist = torch.linalg.vector_norm(tip_pos - target, dim=-1)
+
+        dist_cost = dist / 4.0
+
+        target_radius = 0.20
+        value_at_margin = 0.1
+        margin = 4.0
+        scale = float(np.sqrt(-2.0 * np.log(value_at_margin)))
+        d_beyond = torch.clamp(dist - target_radius, min=0.0)
+        reward = torch.where(
+            dist <= target_radius,
+            torch.ones_like(dist),
+            torch.exp(-0.5 * (d_beyond * scale / margin) ** 2),
+        )
+        tip_cost = dist_cost + (1.0 - reward)
+
+        E = 0.5 * vel_sq + tip_z
+        energy_deficit = torch.clamp(self._energy_target - E, min=0.0)
+        energy_cost = self._energy_weight * energy_deficit ** 2
+
+        near_top = (dist < self._near_top_radius).to(vel_sq.dtype)
+        vel_cost = (self._vel_weight * vel_sq
+                    + self._vel_weight_near_top * near_top * vel_sq)
+
+        ctrl_cost = self._ctrl_weight * (actions ** 2).sum(dim=-1)
+
+        return tip_cost + energy_cost + vel_cost + ctrl_cost
+
+    def terminal_cost_torch(self, states, sensordata=None):
+        import torch
+        tip_pos = sensordata[:, :3]
+        target = torch.as_tensor(_TARGET, dtype=tip_pos.dtype, device=tip_pos.device)
+        dist = torch.linalg.vector_norm(tip_pos - target, dim=-1)
+        qvel = self.state_qvel(states)
+        vel_cost = (qvel ** 2).sum(dim=-1)
+        return self._w_terminal * (2.0 * dist + 5.0 * vel_cost)
+
     def _get_obs(self) -> Float[ndarray, "6"]:
         # sin/cos encoding removes the ±π wrap-around discontinuity the MLP
         # would otherwise have to memorise around the upright state.

@@ -24,6 +24,12 @@ dependencies = [
     "stable-baselines3>=2.3.0",
 ]
 
+[project.optional-dependencies]
+gpu = [
+    "warp-lang>=1.3.0",
+    "mujoco-warp",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]

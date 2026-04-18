@@ -1,3 +1,4 @@
+import argparse
 import mujoco
 import numpy as np
 
@@ -6,7 +7,10 @@ from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
 
 def main():
-    env = Acrobot()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rollout-backend", default="cpu", choices=["cpu", "warp"])
+    args = parser.parse_args()
+    env = Acrobot(backend=args.rollout_backend)
     cfg = MPPIConfig.load("acrobot")
     controller = MPPI(env, cfg)
 

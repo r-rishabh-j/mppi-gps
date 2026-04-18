@@ -24,9 +24,9 @@ from src.utils.evaluation import evaluate_mppi, evaluate_policy
 from src.gps.dagger import DAggerTrainer
 
 
-def make_env(name: str):
+def make_env(name: str, backend: str = "cpu"):
     if name == "acrobot":
-        return Acrobot()
+        return Acrobot(backend=backend)
     raise ValueError(f"unsupported env for DAgger: {name}")
 
 
@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-ep-len", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
+    p.add_argument("--rollout-backend", default="cpu", choices=["cpu", "warp"],
+                   help="cpu (mujoco.rollout + threads) or warp (mujoco_warp on CUDA)")
     p.add_argument("--seed-from", default=None,
                    help="path to existing BC h5 (e.g. data/acrobot_bc.h5) to warm-start the buffer")
     p.add_argument("--ckpt-dir", default="checkpoints/dagger")
@@ -73,7 +75,7 @@ def main() -> None:
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
-    env = make_env(args.env)
+    env = make_env(args.env, backend=args.rollout_backend)
     mppi_cfg = MPPIConfig.load(args.env)
     mppi = MPPI(env, cfg=mppi_cfg)
 

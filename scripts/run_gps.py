@@ -55,6 +55,8 @@ def parse_args():
     p.add_argument("--nu", type=float, default=None,
                    help="Constant nu for the policy prior when --disable-kl is set")
     p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda (policy only)")
+    p.add_argument("--rollout-backend", default="cpu", choices=["cpu", "warp"],
+                   help="cpu (mujoco.rollout + threads) or warp (mujoco_warp on CUDA)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt-dir", type=str, default="checkpoints")
     p.add_argument("--n-eval", type=int, default=10,
@@ -69,7 +71,7 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    env = make_env(args.env)
+    env = make_env(args.env, backend=args.rollout_backend)
 
     # Load tuned MPPI hyperparameters from configs/<env>_best.json
     mppi_cfg = MPPIConfig.load(args.env)
