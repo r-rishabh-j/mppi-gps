@@ -131,7 +131,9 @@ def main() -> None:
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.warmup_rollouts > 0:
+    if args.init_ckpt is not None and args.warmup_rollouts > 0:
+        print("\nskipping warmup because --init-ckpt was provided")
+    elif args.warmup_rollouts > 0:
         print(f"\nwarmup: collecting {args.warmup_rollouts} pure-MPPI rollouts + "
               f"{args.warmup_epochs} epochs of BC pre-training...")
         losses = trainer.warmup(args.warmup_rollouts, args.warmup_epochs)

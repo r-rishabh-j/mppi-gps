@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from src.envs.base import BaseEnv
 from src.mppi.mppi import MPPI
@@ -88,35 +89,50 @@ class DAggerTrainer:
         half = max(1, K // 2)
         return max(0.0, 1.0 - k / half)
 
-    def _collect(self, n_rollouts: int, beta: float, seed_base: int,
-                 episode_len: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def _collect(
+        self,
+        n_rollouts: int,
+        beta: float,
+        seed_base: int,
+        episode_len: int | None = None,
+        progress_label: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Roll out `n_rollouts` episodes under the given β and return flat
         (obs, expert_actions). Always queries MPPI for the relabel target."""
         ep_len = episode_len if episode_len is not None else self.cfg.episode_len
         obs_rows: list[np.ndarray] = []
         act_rows: list[np.ndarray] = []
 
-        for ep in range(n_rollouts):
-            np.random.seed(seed_base + ep)
-            self.env.reset()
-            self.mppi.reset()
+        total_steps = n_rollouts * ep_len
+        with tqdm(
+            total=total_steps,
+            desc=progress_label,
+            leave=False,
+            dynamic_ncols=True,
+            disable=progress_label is None,
+        ) as pbar:
+            for ep in range(n_rollouts):
+                np.random.seed(seed_base + ep)
+                self.env.reset()
+                self.mppi.reset()
 
-            for _ in range(ep_len):
-                obs = self.env._get_obs()
-                state = self.env.get_state()
-                expert_action, _ = self.mppi.plan_step(state)
+                for _ in range(ep_len):
+                    obs = self.env._get_obs()
+                    state = self.env.get_state()
+                    expert_action, _ = self.mppi.plan_step(state)
 
-                if self.rng.random() < beta:
-                    exec_action = expert_action
-                else:
-                    exec_action = self.policy.act_np(obs)
+                    if self.rng.random() < beta:
+                        exec_action = expert_action
+                    else:
+                        exec_action = self.policy.act_np(obs)
 
-                obs_rows.append(obs.astype(np.float32))
-                act_rows.append(expert_action.astype(np.float32))
+                    obs_rows.append(obs.astype(np.float32))
+                    act_rows.append(expert_action.astype(np.float32))
 
-                _, _, done, _ = self.env.step(exec_action)
-                if done:
-                    break
+                    _, _, done, _ = self.env.step(exec_action)
+                    pbar.update(1)
+                    if done:
+                        break
 
         obs_arr = np.stack(obs_rows, axis=0)
         act_arr = np.stack(act_rows, axis=0)
@@ -130,6 +146,7 @@ class DAggerTrainer:
             n_rollouts=self.cfg.rollouts_per_iter,
             beta=self.beta(k),
             seed_base=self.cfg.seed + 1000 * k,
+            progress_label=f"round {k} rollout",
         )
 
     def warmup(self, n_rollouts: int, epochs: int) -> list[float]:
@@ -143,20 +160,29 @@ class DAggerTrainer:
         obs_r, act_r = self._collect(
             n_rollouts=n_rollouts, beta=1.0,
             seed_base=self.cfg.seed + 999_000,  # distinct from any round seed
+            progress_label="warmup rollout",
         )
         self.append(obs_r, act_r, round_idx=-1)
 
         N = len(obs_r)
         idx = np.arange(N)
         losses: list[float] = []
-        for _ in range(epochs):
+        epoch_bar = tqdm(
+            range(epochs),
+            desc="warmup fit",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for _ in epoch_bar:
             self.rng.shuffle(idx)
             running, nb = 0.0, 0
             for start in range(0, N, self.cfg.batch_size):
                 b = idx[start:start + self.cfg.batch_size]
                 running += self._train_step_mse(obs_r[b], act_r[b])
                 nb += 1
-            losses.append(running / max(nb, 1))
+            loss = running / max(nb, 1)
+            losses.append(loss)
+            epoch_bar.set_postfix(train_mse=f"{loss:.4f}")
         return losses
 
     # ---------- training ----------
@@ -175,7 +201,12 @@ class DAggerTrainer:
             n += a.numel()
         return total / max(n, 1)
 
-    def finetune(self, latest_obs: np.ndarray, latest_act: np.ndarray) -> tuple[float, float]:
+    def finetune(
+        self,
+        latest_obs: np.ndarray,
+        latest_act: np.ndarray,
+        round_idx: int | None = None,
+    ) -> tuple[float, float]:
         """Finetune on the full aggregated buffer. Validation uses a held-out
         slice of the most-recent round to catch covariate shift."""
         # held-out val from most-recent round
@@ -197,7 +228,13 @@ class DAggerTrainer:
         N = len(tr_o)
         idx = np.arange(N)
         last_train = last_val = float("nan")
-        for _ in range(self.cfg.distill_epochs):
+        epoch_bar = tqdm(
+            range(self.cfg.distill_epochs),
+            desc=f"round {round_idx} fit" if round_idx is not None else "dagger fit",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for _ in epoch_bar:
             self.rng.shuffle(idx)
             running, nb = 0.0, 0
             for start in range(0, N, self.cfg.batch_size):
@@ -206,13 +243,14 @@ class DAggerTrainer:
                 nb += 1
             last_train = running / max(nb, 1)
             last_val = self._eval_mse(va_o, va_a)
+            epoch_bar.set_postfix(train_mse=f"{last_train:.4f}", val_mse=f"{last_val:.4f}")
         return last_train, last_val
 
     # ---------- full iteration ----------
     def step(self, k: int) -> dict:
         obs_r, act_r = self.collect_round(k)
         self.append(obs_r, act_r, round_idx=k)
-        train_mse, val_mse = self.finetune(obs_r, act_r)
+        train_mse, val_mse = self.finetune(obs_r, act_r, round_idx=k)
         return {
             "round": k,
             "beta": self.beta(k),
