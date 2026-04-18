@@ -60,9 +60,8 @@ def evaluate_policy(
             device = getattr(policy, "_device", torch.device("cpu"))
             obs_t = torch.as_tensor(env._get_obs(), dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                mu, _ = policy.forward(obs_t)
-            # Use the mean action (deterministic — no exploration noise)
-            action = mu.squeeze(0).cpu().numpy()
+                act_t = policy.action(obs_t)
+            action = act_t.squeeze(0).cpu().numpy()
             _, cost, done, _ = env.step(action)
             ep_cost += cost
 

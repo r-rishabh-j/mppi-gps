@@ -67,6 +67,14 @@ No unit test framework is configured. Validation is done via `scripts/test_sl.py
 - **`configs/`** — JSON hyperparameter configs (e.g., `acrobot_best.json`).
 - **`assets/`** — MuJoCo XML model files.
 
+## Keeping docs in sync
+
+`commands.md` is the authoritative, user-facing cheat sheet for runnable commands
+(setup, MPPI, BC, DAgger, GPS, checkpoint eval, tuning, ablations). When you add
+or change a CLI flag, rename a script, or introduce a new training variant,
+update `commands.md` in the same change — the brief command list in this file
+stays as a high-level overview; detailed flag docs live in `commands.md`.
+
 ## Key Patterns
 
 - States are `(K, H, state_dim)` arrays, actions `(K, H, action_dim)`, costs `(K,)` — heavy NumPy broadcasting throughout.

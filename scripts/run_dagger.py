@@ -18,6 +18,7 @@ import torch
 from src.envs.acrobot import Acrobot
 from src.mppi.mppi import MPPI
 from src.policy.gaussian_policy import GaussianPolicy
+from src.policy.deterministic_policy import DeterministicPolicy
 from src.utils.config import DAggerConfig, MPPIConfig, PolicyConfig
 from src.utils.device import pick_device
 from src.utils.evaluation import evaluate_mppi, evaluate_policy
@@ -44,8 +45,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-ep-len", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
+    p.add_argument("--deterministic", action="store_true",
+                   help="use DeterministicPolicy (direct action regression) instead of GaussianPolicy")
     p.add_argument("--seed-from", default=None,
                    help="path to existing BC h5 (e.g. data/acrobot_bc.h5) to warm-start the buffer")
+    p.add_argument("--warmup-rollouts", type=int, default=0,
+                   help="Pre-DAgger: collect this many pure-MPPI rollouts and BC-train the policy on them")
+    p.add_argument("--warmup-epochs", type=int, default=20,
+                   help="Epochs of BC pre-training on the warmup rollouts (ignored if --warmup-rollouts=0)")
     p.add_argument("--ckpt-dir", default="checkpoints/dagger")
     p.add_argument("--results-dir", default="results/dagger_acrobot")
     return p.parse_args()
@@ -77,9 +84,18 @@ def main() -> None:
     mppi_cfg = MPPIConfig.load(args.env)
     mppi = MPPI(env, cfg=mppi_cfg)
 
-    obs_dim = env.model.nq + env.model.nv
+    obs_dim = env.obs_dim
     act_dim = env.action_dim
-    policy = GaussianPolicy(obs_dim, act_dim, PolicyConfig(), device=device)
+    policy_cfg = PolicyConfig()
+    bounds = env.action_bounds if policy_cfg.squash_tanh else None
+    if args.deterministic:
+        policy = DeterministicPolicy(obs_dim, act_dim, policy_cfg,
+                                     device=device, action_bounds=bounds)
+        print("policy: DeterministicPolicy (MSE regression)")
+    else:
+        policy = GaussianPolicy(obs_dim, act_dim, policy_cfg,
+                                device=device, action_bounds=bounds)
+        print("policy: GaussianPolicy (mu/sigma head, MSE on mu)")
 
     trainer = DAggerTrainer(env, mppi, policy, cfg, rng=rng)
     if args.seed_from is not None:
@@ -95,6 +111,14 @@ def main() -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.warmup_rollouts > 0:
+        print(f"\nwarmup: collecting {args.warmup_rollouts} pure-MPPI rollouts + "
+              f"{args.warmup_epochs} epochs of BC pre-training...")
+        losses = trainer.warmup(args.warmup_rollouts, args.warmup_epochs)
+        if losses:
+            print(f"  warmup train_mse: {losses[0]:.5f} → {losses[-1]:.5f}  "
+                  f"(buf={trainer.buffer_size():,})")
 
     # --- MPPI baseline (once, shared across iterations) ---
     print("\nevaluating MPPI baseline...")

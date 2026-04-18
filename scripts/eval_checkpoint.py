@@ -14,6 +14,7 @@ import mediapy
 
 from src.envs import make_env
 from src.policy.gaussian_policy import GaussianPolicy
+from src.policy.deterministic_policy import DeterministicPolicy
 from src.utils.config import PolicyConfig
 from src.utils.device import pick_device
 from src.utils.evaluation import evaluate_policy
@@ -27,10 +28,12 @@ def parse_args():
     p.add_argument("--env", default="acrobot", choices=_ENVS)
     p.add_argument("--ckpt", required=True, help="path to .pt policy state_dict")
     p.add_argument("--n-eval", type=int, default=10)
-    p.add_argument("--eval-len", type=int, default=1500)
+    p.add_argument("--eval-len", type=int, default=3000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda")
     p.add_argument("--render", action="store_true", help="save mp4 of episode 0")
+    p.add_argument("--deterministic", action="store_true",
+                   help="load weights into DeterministicPolicy instead of GaussianPolicy")
     p.add_argument("--video-out", default=None,
                    help="video path (default: <ckpt>_eval.mp4)")
     return p.parse_args()
@@ -45,14 +48,14 @@ def main():
     env = make_env(args.env)
 
     policy_cfg = PolicyConfig()
-    policy = GaussianPolicy(env.obs_dim, env.action_dim, policy_cfg,
-                            device=device,
-                            action_bounds=env.action_bounds \
-                            if policy_cfg.squash_tanh else None,)
+    bounds = env.action_bounds if policy_cfg.squash_tanh else None
+    PolicyCls = DeterministicPolicy if args.deterministic else GaussianPolicy
+    policy = PolicyCls(env.obs_dim, env.action_dim, policy_cfg,
+                       device=device, action_bounds=bounds)
     policy.load_state_dict(torch.load(args.ckpt, map_location=device))
     policy.eval()
 
-    print(f"env={args.env}  device={device}  ckpt={args.ckpt}")
+    print(f"env={args.env}  device={device}  policy={PolicyCls.__name__}  ckpt={args.ckpt}")
     stats = evaluate_policy(
         policy, env,
         n_episodes=args.n_eval,

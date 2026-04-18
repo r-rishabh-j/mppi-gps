@@ -19,16 +19,13 @@ class Acrobot(MuJoCoEnv):
         self._nv = self.model.nv #2
 
         self._w_terminal = 3.0
-        # Pseudo-energy shaping (Spong-style): penalise only the deficit
-        # (E_target - E)+². KE proxy 0.5||qvel||², PE proxy tip_z. One-sided
-        # so MPPI always wants to add energy when below target, and there's
-        # no degenerate "pump at the bottom" optimum at E=E_target.
-        self._energy_target = 4.0
-        self._energy_weight = 0.08
-        self._near_top_radius = 0.5
-        self._vel_weight = 0.002           # tiny global damping
-        self._vel_weight_near_top = 0.05   # stabilisation near the top
-        self._ctrl_weight = 0.001
+        # --- previous reward-shaping params (commented for reference) ---
+        # self._energy_target = 4.0
+        # self._energy_weight = 0.08
+        # self._near_top_radius = 0.5
+        # self._vel_weight = 0.002
+        # self._vel_weight_near_top = 0.05
+        # self._ctrl_weight = 0.001
 
 
     def reset(
@@ -51,49 +48,44 @@ class Acrobot(MuJoCoEnv):
             sensordata: Float[Array, "K H nsensor"] | None = None,
     ) -> Float[Array, "K H"]:
         tip_pos = sensordata[:, :, :3]
-        tip_z = tip_pos[..., 2]                                 # (K, H) — PE proxy
-        qvel = self.state_qvel(states)                          # (K, H, nv)
-        vel_sq = np.sum(qvel ** 2, axis=-1)                     # (K, H)
-
         dist = np.linalg.norm(tip_pos - _TARGET, axis=-1)       # (K, H)
-
-        # Linear far-field pull toward the target direction. Energy cost
-        # alone only matches magnitudes; this term says *which way* is up.
-        dist_cost = dist / 4.0                                  # in [0, 2]
-
-        # Flat-bottomed Gaussian-tolerance bonus: sharp attractor near the
-        # top so the planner strictly prefers "at top" over any same-energy
-        # state elsewhere.
-        target_radius = 0.20
-        value_at_margin = 0.1
         margin = 4.0
-        scale = np.sqrt(-2.0 * np.log(value_at_margin))
-        d_beyond = np.maximum(dist - target_radius, 0.0)
-        reward = np.where(
-            dist <= target_radius,
-            1.0,
-            np.exp(-0.5 * (d_beyond * scale / margin) ** 2),
-        )
-        tip_cost = dist_cost + (1.0 - reward)
+        return dist / margin + 2 *(4 - np.linalg.norm(sensordata, axis=2))
 
-        # One-sided pseudo-energy deficit: max(E_target - E, 0)².
-        # Monotone-decreasing in KE for any state with E < E_target, so
-        # random MPPI samples that add velocity get lower cost and bias the
-        # weighted-mean U toward a pumping sequence.
-        E = 0.5 * vel_sq + tip_z
-        energy_deficit = np.maximum(self._energy_target - E, 0.0)
-        energy_cost = self._energy_weight * energy_deficit ** 2
-
-        # Global light damping + near-top stabilisation (energy cost goes
-        # to zero once E ≥ E_target, so the near-top term is what finally
-        # kills residual KE at the upright).
-        near_top = (dist < self._near_top_radius).astype(vel_sq.dtype)
-        vel_cost = (self._vel_weight * vel_sq
-                    + self._vel_weight_near_top * near_top * vel_sq)
-
-        ctrl_cost = self._ctrl_weight * np.sum(actions ** 2, axis=-1)
-
-        return tip_cost + energy_cost + vel_cost + ctrl_cost
+        # --- previous shaped reward (commented for reference) -------------
+        # Combined linear far-field pull + Gaussian-tolerance near-top
+        # attractor + one-sided pseudo-energy deficit + near-top velocity
+        # damping. Worked on easy starts but trapped on low-energy starts
+        # at tip_z≈2 where modest KE satisfies the energy target.
+        #
+        # tip_z = tip_pos[..., 2]
+        # qvel = self.state_qvel(states)
+        # vel_sq = np.sum(qvel ** 2, axis=-1)
+        #
+        # dist_cost = dist / 4.0
+        #
+        # target_radius = 0.20
+        # value_at_margin = 0.1
+        # scale = np.sqrt(-2.0 * np.log(value_at_margin))
+        # d_beyond = np.maximum(dist - target_radius, 0.0)
+        # reward = np.where(
+        #     dist <= target_radius,
+        #     1.0,
+        #     np.exp(-0.5 * (d_beyond * scale / margin) ** 2),
+        # )
+        # tip_cost = dist_cost + (1.0 - reward)
+        #
+        # E = 0.5 * vel_sq + tip_z
+        # energy_deficit = np.maximum(self._energy_target - E, 0.0)
+        # energy_cost = self._energy_weight * energy_deficit ** 2
+        #
+        # near_top = (dist < self._near_top_radius).astype(vel_sq.dtype)
+        # vel_cost = (self._vel_weight * vel_sq
+        #             + self._vel_weight_near_top * near_top * vel_sq)
+        #
+        # ctrl_cost = self._ctrl_weight * np.sum(actions ** 2, axis=-1)
+        #
+        # return tip_cost + energy_cost + vel_cost + ctrl_cost
 
     def terminal_cost(
             self,
@@ -103,8 +95,8 @@ class Acrobot(MuJoCoEnv):
         tip_pos = sensordata[:, :3]
         dist = np.linalg.norm(tip_pos - _TARGET, axis=-1)
         qvel = self.state_qvel(states)
-        vel_cost = np.sum(qvel**2, axis=-1)
-        return self._w_terminal * (2.0 * dist + 5.0 * vel_cost)
+        vel_cost = np.sum(qvel ** 2, axis=-1)
+        return self._w_terminal * (dist + 5.0 * vel_cost)
 
     def _get_obs(self) -> Float[ndarray, "6"]:
         # sin/cos encoding removes the ±π wrap-around discontinuity the MLP

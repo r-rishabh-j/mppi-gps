@@ -29,13 +29,21 @@ python -m scripts.test_sl
 ## DAgger (MPPI-in-the-loop BC)
 
 Iteratively rolls the policy, relabels visited states with MPPI, and finetunes.
-MPPI runs on CPU; policy training uses the selected device.
+MPPI runs on CPU; policy training uses the selected device. Works with either
+a stochastic `GaussianPolicy` (default; trained on MSE-of-mean, log_sigma head
+unused) or a `DeterministicPolicy` (direct action regression, via `--deterministic`).
 
 ```bash
 # full run on acrobot, seeded from the BC dataset if present
 python -m scripts.run_dagger --env acrobot \
     --dagger-iters 10 --rollouts-per-iter 20 --episode-len 200 \
     --seed-from data/acrobot_bc.h5 --device auto
+
+# deterministic policy + BC warmup before the DAgger loop
+python -m scripts.run_dagger --env acrobot --deterministic \
+    --warmup-rollouts 20 --warmup-epochs 30 \
+    --dagger-iters 10 --rollouts-per-iter 20 --episode-len 200 \
+    --beta-schedule linear --device auto
 
 # quick smoke test (~1–2 min)
 python -m scripts.run_dagger --env acrobot \
@@ -45,9 +53,12 @@ python -m scripts.run_dagger --env acrobot \
 
 Flags:
 - `--device auto|cpu|mps|cuda` — auto resolves to cuda → mps → cpu.
+- `--deterministic` — use `DeterministicPolicy` (single-head, direct action regression) instead of `GaussianPolicy`.
 - `--beta-schedule linear|constant_zero` — β decays 1→0 over K/2 iters, or always 0.
 - `--buffer-cap 200000` — aggregated buffer capacity (oldest evicted).
-- `--seed-from PATH` — warm-start buffer from an existing BC h5.
+- `--seed-from PATH` — warm-start buffer from an existing BC h5 (no pre-training, just seeded rows).
+- `--warmup-rollouts N` — collect N pure-MPPI rollouts **and BC-train the policy on them** before the DAgger loop. Rows land in the aggregate buffer with `round_idx=-1`.
+- `--warmup-epochs E` — epochs of BC pre-training on warmup rollouts (default 20; ignored when `--warmup-rollouts=0`).
 
 Outputs:
 - `checkpoints/dagger/dagger_<env>_iter<k>.pt` — per-iteration policy weights.
@@ -99,13 +110,20 @@ Load any `.pt` policy state_dict and evaluate it (observation-normalizer
 stats and tanh-squash buffers are restored automatically via `state_dict`).
 
 ```bash
+# stochastic policy (GaussianPolicy — GPS default and DAgger default)
 python -m scripts.eval_checkpoint --env acrobot \
     --ckpt checkpoints/gps_acrobot_best.pt \
+    --n-eval 10 --render
+
+# deterministic policy checkpoint (DAgger with --deterministic)
+python -m scripts.eval_checkpoint --env acrobot --deterministic \
+    --ckpt checkpoints/dagger/dagger_acrobot_iter09.pt \
     --n-eval 10 --render
 ```
 
 Flags:
 - `--ckpt` — path to a policy `state_dict` (GPS / DAgger / BC all compatible).
+- `--deterministic` — load weights into `DeterministicPolicy`. Must match the class the checkpoint was trained under (shapes differ: deterministic head has `act_dim` outputs, Gaussian head has `2*act_dim`).
 - `--n-eval`, `--eval-len` — evaluation episode count / length.
 - `--render` — save an mp4 of episode 0 next to the checkpoint (or at `--video-out`).
 - `--device auto|cpu|mps|cuda` — inference device.

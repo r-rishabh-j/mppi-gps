@@ -35,7 +35,7 @@ class PolicyConfig:
 @dataclass
 class GPSConfig:
     num_iterations: int = 50
-    num_conditions: int = 20         # number of initial states
+    num_conditions: int = 5         # number of initial states
     episode_length: int = 500       # steps per episode during GPS training
     kl_estimator: str = "moment_matched" # "moment_matched" (Eq 3): fits Gaussian to MPPI samples, closed-form KL — stable but unimodal
     # "sample_based" (Eq 4): estimates KL directly from weighted particles variance

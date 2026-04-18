@@ -88,29 +88,24 @@ class DAggerTrainer:
         half = max(1, K // 2)
         return max(0.0, 1.0 - k / half)
 
-    def collect_round(self, k: int) -> tuple[np.ndarray, np.ndarray]:
-        """Roll out N_roll trajectories with β-mixing and relabel every state.
-
-        Returns flat (obs, expert_actions) for this round.
-        """
-        beta = self.beta(k)
+    def _collect(self, n_rollouts: int, beta: float, seed_base: int,
+                 episode_len: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Roll out `n_rollouts` episodes under the given β and return flat
+        (obs, expert_actions). Always queries MPPI for the relabel target."""
+        ep_len = episode_len if episode_len is not None else self.cfg.episode_len
         obs_rows: list[np.ndarray] = []
         act_rows: list[np.ndarray] = []
 
-        for ep in range(self.cfg.rollouts_per_iter):
-            # deterministic seed schedule per round so runs are reproducible
-            np.random.seed(self.cfg.seed + 1000 * k + ep)
+        for ep in range(n_rollouts):
+            np.random.seed(seed_base + ep)
             self.env.reset()
             self.mppi.reset()
 
-            for _ in range(self.cfg.episode_len):
+            for _ in range(ep_len):
                 obs = self.env._get_obs()
                 state = self.env.get_state()
-
-                # expert query — always, so we can relabel
                 expert_action, _ = self.mppi.plan_step(state)
 
-                # choose execution action
                 if self.rng.random() < beta:
                     exec_action = expert_action
                 else:
@@ -129,17 +124,44 @@ class DAggerTrainer:
             act_arr = act_arr[:, None]
         return obs_arr, act_arr
 
+    def collect_round(self, k: int) -> tuple[np.ndarray, np.ndarray]:
+        """Roll out N_roll trajectories with β-mixing and relabel every state."""
+        return self._collect(
+            n_rollouts=self.cfg.rollouts_per_iter,
+            beta=self.beta(k),
+            seed_base=self.cfg.seed + 1000 * k,
+        )
+
+    def warmup(self, n_rollouts: int, epochs: int) -> list[float]:
+        """Pre-train the policy on pure-MPPI rollouts before the DAgger loop.
+
+        Appends to the aggregate buffer with round_idx=-1 so warmup data is
+        reused across subsequent finetune() calls. Returns per-epoch train MSE.
+        """
+        if n_rollouts <= 0 or epochs <= 0:
+            return []
+        obs_r, act_r = self._collect(
+            n_rollouts=n_rollouts, beta=1.0,
+            seed_base=self.cfg.seed + 999_000,  # distinct from any round seed
+        )
+        self.append(obs_r, act_r, round_idx=-1)
+
+        N = len(obs_r)
+        idx = np.arange(N)
+        losses: list[float] = []
+        for _ in range(epochs):
+            self.rng.shuffle(idx)
+            running, nb = 0.0, 0
+            for start in range(0, N, self.cfg.batch_size):
+                b = idx[start:start + self.cfg.batch_size]
+                running += self._train_step_mse(obs_r[b], act_r[b])
+                nb += 1
+            losses.append(running / max(nb, 1))
+        return losses
+
     # ---------- training ----------
     def _train_step_mse(self, obs: np.ndarray, act: np.ndarray) -> float:
-        device = self.policy.device
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
-        act_t = torch.as_tensor(act, dtype=torch.float32, device=device)
-        mu, _ = self.policy.forward(obs_t)
-        loss = ((mu - act_t) ** 2).mean()
-        self.policy.optimizer.zero_grad()
-        loss.backward()
-        self.policy.optimizer.step()
-        return float(loss.item())
+        return self.policy.mse_step(obs, act)
 
     @torch.no_grad()
     def _eval_mse(self, obs: np.ndarray, act: np.ndarray, batch: int = 16384) -> float:
@@ -148,8 +170,8 @@ class DAggerTrainer:
         for s in range(0, len(obs), batch):
             o = torch.as_tensor(obs[s:s + batch], dtype=torch.float32, device=device)
             a = torch.as_tensor(act[s:s + batch], dtype=torch.float32, device=device)
-            mu, _ = self.policy.forward(o)
-            total += float(((mu - a) ** 2).sum().item())
+            pred = self.policy.action(o)
+            total += float(((pred - a) ** 2).sum().item())
             n += a.numel()
         return total / max(n, 1)
 

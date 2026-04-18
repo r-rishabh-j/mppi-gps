@@ -14,7 +14,7 @@ def main():
     render = True
     frames = []
 
-    for vid in range(5):
+    for vid in range(2):
         env.reset()
         controller.reset()
         print(env.data.qpos)

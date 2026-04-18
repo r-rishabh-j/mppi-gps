@@ -180,6 +180,27 @@ class GaussianPolicy(nn.Module):
         self.optimizer.step()
         return loss.item()
 
+    def action(self, obs: torch.Tensor) -> torch.Tensor:
+        """Deterministic action tensor (policy mean). For MSE training / eval."""
+        mu, _ = self.forward(obs)
+        return mu
+
+    def mse_step(self, obs: np.ndarray, actions: np.ndarray) -> float:
+        """One gradient step of MSE loss on the mean (deterministic regression).
+
+        log_sigma is not supervised; only mu gets gradient. Used by DAgger.
+        """
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+        act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
+        if self.normalizer is not None:
+            self.normalizer.update(obs_t)
+        mu, _ = self.forward(obs_t)
+        loss = ((mu - act_t) ** 2).mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return float(loss.item())
+
     @torch.no_grad()
     def log_prob_np(self, obs: np.ndarray, actions: np.ndarray) -> np.ndarray:
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
