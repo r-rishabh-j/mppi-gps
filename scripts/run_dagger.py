@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
                    help="Pre-DAgger: collect this many pure-MPPI rollouts and BC-train the policy on them")
     p.add_argument("--warmup-epochs", type=int, default=20,
                    help="Epochs of BC pre-training on the warmup rollouts (ignored if --warmup-rollouts=0)")
+    p.add_argument("--warmup-cache", default=None,
+                   help="optional h5 path for warmup rollouts. If the file exists it's "
+                        "loaded (skipping collection); otherwise rollouts are collected "
+                        "and saved here for reuse. Disabled by default. Compatible with "
+                        "collect_bc_demos output — point this at an existing "
+                        "data/<env>_bc.h5 to skip warmup collection entirely.")
     p.add_argument("--auto-reset", action="store_true",
                    help="On episode termination during rollout/relabel, auto-reset and keep "
                         "collecting until episode_len steps are taken for that slot. Recommended "
@@ -168,9 +174,19 @@ def main() -> None:
     if args.init_ckpt is not None and args.warmup_rollouts > 0:
         print("\nskipping warmup because --init-ckpt was provided")
     elif args.warmup_rollouts > 0:
-        print(f"\nwarmup: collecting {args.warmup_rollouts} pure-MPPI rollouts + "
-              f"{args.warmup_epochs} epochs of BC pre-training...")
-        losses = trainer.warmup(args.warmup_rollouts, args.warmup_epochs)
+        warmup_cache = Path(args.warmup_cache) if args.warmup_cache else None
+        if warmup_cache is not None and warmup_cache.exists():
+            print(f"\nwarmup: reusing cached rollouts at {warmup_cache} + "
+                  f"{args.warmup_epochs} epochs of BC pre-training...")
+        else:
+            print(f"\nwarmup: collecting {args.warmup_rollouts} pure-MPPI rollouts + "
+                  f"{args.warmup_epochs} epochs of BC pre-training"
+                  + (f"  (will cache to {warmup_cache})" if warmup_cache else "")
+                  + "...")
+        losses = trainer.warmup(
+            args.warmup_rollouts, args.warmup_epochs,
+            cache_path=warmup_cache,
+        )
         if losses:
             print(f"  warmup train_mse: {losses[0]:.5f} → {losses[-1]:.5f}  "
                   f"(buf={trainer.buffer_size():,})")

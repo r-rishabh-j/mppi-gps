@@ -12,6 +12,8 @@ is kept at the trainer methods so callers don't have to think about it.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
 from tqdm.auto import tqdm
@@ -154,19 +156,82 @@ class DAggerTrainer:
             progress_label=f"round {k} rollout",
         )
 
-    def warmup(self, n_rollouts: int, epochs: int) -> list[float]:
+    def warmup(
+        self,
+        n_rollouts: int,
+        epochs: int,
+        cache_path: "Path | str | None" = None,
+    ) -> list[float]:
         """Pre-train the policy on pure-MPPI rollouts before the DAgger loop.
 
         Appends to the aggregate buffer with round_idx=-1 so warmup data is
         reused across subsequent finetune() calls. Returns per-epoch train MSE.
+
+        If `cache_path` is given:
+          - and the file exists: load flat (states, actions) from it and skip
+            the (expensive) MPPI rollout collection. Trajectory-shaped arrays
+            from a BC-style h5 (M, T, dim) are auto-flattened, so a
+            `collect_bc_demos.py` dataset works here too.
+          - otherwise: collect fresh, then save to `cache_path` using the same
+            schema as `collect_bc_demos.py` so the file is reusable both ways.
+        If `cache_path` is None, nothing is read or written — this is the
+        default; pass a path only when you explicitly want to persist.
+
+        The BC training epochs always run — we only cache the collection step,
+        which is where the wall-clock cost lives. To invalidate a stale cache,
+        delete the file or pass a new path.
         """
         if n_rollouts <= 0 or epochs <= 0:
             return []
-        obs_r, act_r = self._collect(
-            n_rollouts=n_rollouts, beta=1.0,
-            seed_base=self.cfg.seed + 999_000,  # distinct from any round seed
-            progress_label="warmup rollout",
-        )
+
+        cache_path = Path(cache_path) if cache_path is not None else None
+        obs_r: np.ndarray
+        act_r: np.ndarray
+
+        if cache_path is not None and cache_path.exists():
+            import h5py
+
+            with h5py.File(cache_path, "r") as f:
+                obs_r = f["states"][:].astype(np.float32)
+                act_r = f["actions"][:].astype(np.float32)
+                cached_n = int(f.attrs.get("n_rollouts", -1))
+                cached_len = int(f.attrs.get("episode_len", -1))
+            # BC-style caches are (M, T, dim); warmup-native caches are (N, dim).
+            # Flatten either to (N, dim) so the buffer gets consistent rows.
+            if obs_r.ndim == 3:
+                obs_r = obs_r.reshape(-1, obs_r.shape[-1])
+                act_r = act_r.reshape(-1, act_r.shape[-1])
+            print(f"  loaded {len(obs_r):,} warmup rows from cache {cache_path}")
+            if cached_n > 0 and (
+                cached_n != n_rollouts or cached_len != self.cfg.episode_len
+            ):
+                print(
+                    f"  warning: cache was collected with n_rollouts={cached_n}, "
+                    f"episode_len={cached_len}; you requested "
+                    f"{n_rollouts}/{self.cfg.episode_len}. Using the cache as-is — "
+                    f"delete the file to recollect."
+                )
+        else:
+            obs_r, act_r = self._collect(
+                n_rollouts=n_rollouts, beta=1.0,
+                seed_base=self.cfg.seed + 999_000,  # distinct from any round seed
+                progress_label="warmup rollout",
+            )
+            if cache_path is not None:
+                import h5py
+
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with h5py.File(cache_path, "w") as f:
+                    f.create_dataset("states", data=obs_r)
+                    f.create_dataset("actions", data=act_r)
+                    f.attrs["n_rollouts"] = n_rollouts
+                    f.attrs["episode_len"] = self.cfg.episode_len
+                    f.attrs["auto_reset"] = bool(getattr(self.cfg, "auto_reset", False))
+                    f.attrs["seed"] = self.cfg.seed
+                    f.attrs["obs_dim"] = self.obs_dim
+                    f.attrs["act_dim"] = self.act_dim
+                print(f"  saved {len(obs_r):,} warmup rows to {cache_path}")
+
         self.append(obs_r, act_r, round_idx=-1)
 
         N = len(obs_r)

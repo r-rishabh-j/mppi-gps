@@ -103,6 +103,7 @@ Flags:
 - `--seed-from PATH` — warm-start buffer from an existing BC h5 (no pre-training, just seeded rows).
 - `--warmup-rollouts N` — collect N pure-MPPI rollouts **and BC-train the policy on them** before the DAgger loop. Rows land in the aggregate buffer with `round_idx=-1`.
 - `--warmup-epochs E` — epochs of BC pre-training on warmup rollouts (default 20; ignored when `--warmup-rollouts=0`).
+- `--warmup-cache PATH` — optional h5 path for warmup rollouts. If the file exists it's loaded (skipping the MPPI collection); otherwise rollouts are collected and saved there for the next run. **Off by default** — pass a path only when you want to persist. Compatible with `collect_bc_demos` output: point this at an existing `data/<env>_bc.h5` to skip warmup collection. Delete the file to invalidate a stale cache.
 - `--exp-name NAME` — human-readable experiment name (default `run`). Appended to the run dir.
 - `--exp-dir PATH` — parent dir under which a `<timestamp>_<env>_<name>/` run dir is created. Default `experiments/dagger`.
 
