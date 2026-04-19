@@ -12,6 +12,8 @@ Usage:
     python -m scripts.run_gps --env hopper --gps-iters 30 --alpha 0.05
     python -m scripts.run_gps --env acrobot --disable-kl --distill-loss nll \
         --alpha 0.1 --gps-iters 20 --exp-name prior_only
+    python -m scripts.run_gps --env acrobot --exp-name warmstart \
+        --init-ckpt checkpoints/dagger/<run>/best.pt
 """
 
 import argparse
@@ -33,6 +35,7 @@ from src.utils.evaluation import evaluate_mppi, evaluate_policy
 from src.utils.experiment import (
     copy_as,
     git_sha,
+    load_checkpoint,
     make_run_dir,
     save_checkpoint,
     update_config,
@@ -60,15 +63,26 @@ def parse_args():
                    help="Distillation loss (default from GPSConfig: nll)")
     p.add_argument("--nu", type=float, default=None,
                    help="Constant nu for the policy prior when --disable-kl is set")
+    p.add_argument("--auto-reset", action="store_true",
+                   help="On env termination during C-step rollout, reset to a fresh random "
+                        "init and keep collecting until episode_length steps are taken for "
+                        "the condition. Recommended for terminating envs like hopper.")
+    p.add_argument("--warm-start-policy", action="store_true",
+                   help="(Advanced) Seed MPPI nominal U from a policy rollout each condition. "
+                        "Off by default — double-biases MPPI toward the policy and pads zeros "
+                        "past termination; only useful late in training on non-terminating envs.")
     p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda (policy only)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-eval", type=int, default=10,
                    help="Number of evaluation episodes")
     p.add_argument("--eval-len", type=int, default=500,
                    help="Max steps per evaluation episode")
+    p.add_argument("--init-ckpt", default=None,
+                   help="path to a policy checkpoint (wrapped or raw state_dict) "
+                        "to load into gps.policy before the training loop")
     p.add_argument("--exp-name", default="run",
                    help="Human-readable experiment name (used in the run dir name).")
-    p.add_argument("--exp-dir", default="experiments/gps",
+    p.add_argument("--exp-dir", default="checkpoints/gps",
                    help="Parent dir under which a <timestamp>_<env>_<name>/ run dir is created.")
     return p.parse_args()
 
@@ -98,6 +112,10 @@ def main():
         gps_cfg.distill_loss = args.distill_loss
     if args.nu is not None:
         gps_cfg.badmm_init_nu = args.nu
+    if args.auto_reset:
+        gps_cfg.auto_reset = True
+    if args.warm_start_policy:
+        gps_cfg.warm_start_policy = True
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
@@ -105,6 +123,25 @@ def main():
         print(f"KL constraint DISABLED — policy-prior-only GPS "
               f"(alpha={gps_cfg.policy_augmented_alpha}, nu={gps_cfg.badmm_init_nu}, "
               f"distill_loss={gps_cfg.distill_loss})")
+
+    # ---- Construct trainer (needed early so we can load --init-ckpt and
+    #      record the actual policy class in config.json) ----
+    gps = MPPIGPS(env, mppi_cfg, policy_cfg, gps_cfg, device=device)
+
+    if args.init_ckpt is not None:
+        init_ckpt = Path(args.init_ckpt)
+        if not init_ckpt.exists():
+            raise FileNotFoundError(f"--init-ckpt not found: {init_ckpt}")
+        blob = load_checkpoint(init_ckpt, map_location=device)
+        try:
+            gps.policy.load_state_dict(blob["state_dict"])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"failed to load --init-ckpt {init_ckpt} into "
+                f"{type(gps.policy).__name__} — shapes / policy class mismatch?"
+            ) from exc
+        print(f"loaded initial policy weights from {init_ckpt}"
+              + (f"  (policy_class={blob['policy_class']})" if 'policy_class' in blob else ""))
 
     # ---- Run dir + config dump ----
     run_dir = make_run_dir(args.exp_dir, args.env, args.exp_name)
@@ -115,7 +152,7 @@ def main():
         "name": args.exp_name,
         "env": args.env,
         "device": str(device),
-        "policy_class": "GaussianPolicy",
+        "policy_class": type(gps.policy).__name__,
         "start_time": start_time,
         "end_time": None,
         "git_sha": git_sha(),
@@ -130,7 +167,6 @@ def main():
     })
 
     # ---- Training ----
-    gps = MPPIGPS(env, mppi_cfg, policy_cfg, gps_cfg, device=device)
     history = gps.train(run_dir=run_dir)
 
     # ---- Save final checkpoint (wrapped) + copy to final.pt ----

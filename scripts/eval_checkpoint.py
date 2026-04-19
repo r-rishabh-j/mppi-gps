@@ -24,6 +24,16 @@ import json
 
 _ENVS = ["acrobot", "half_cheetah", "point_mass", "hopper"]
 
+# Per-env camera names (must match <camera name="..."> in the MuJoCo XML).
+# Tracking cameras follow the body for locomotion envs; fixed cameras
+# give a stable third-person view for the pendulum-style envs.
+_CAMERA = {
+    "hopper": "track",
+    "half_cheetah": "track",
+    "acrobot": "fixed",
+    "point_mass": "fixed",
+}
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -31,11 +41,11 @@ def parse_args():
                    help="If omitted and --ckpt points to a run dir, env is read from config.json.")
     p.add_argument("--ckpt", required=True,
                    help="Path to a .pt checkpoint OR a run dir (in which case best.pt is used).")
-    p.add_argument("--n-eval", type=int, default=10)
-    p.add_argument("--eval-len", type=int, default=3000)
+    p.add_argument("--n-eval", type=int, default=1)
+    p.add_argument("--eval-len", type=int, default=2000)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda")
-    p.add_argument("--render", action="store_true", help="save mp4 of episode 0")
+    p.add_argument("--render", action="store_true", help="save mp4 of episode 0", default=True)
     p.add_argument("--deterministic", action="store_true",
                    help="Load into DeterministicPolicy. Auto-detected when the checkpoint "
                         "or sibling config.json records policy_class.")
@@ -95,6 +105,7 @@ def main():
         episode_len=args.eval_len,
         seed=args.seed,
         render=args.render,
+        camera=_CAMERA.get(env_name),
     )
     print(f"mean cost: {stats['mean_cost']:.2f} +/- {stats['std_cost']:.2f}")
     for ep, c in enumerate(stats["per_ep"]):
@@ -103,8 +114,11 @@ def main():
     if args.render and stats["frames"]:
         video_path = Path(args.video_out) if args.video_out else \
             ckpt_path.with_name(f"{ckpt_path.stem}_eval.mp4")
-        mediapy.write_video(str(video_path), stats["frames"], fps=30)
-        print(f"saved rollout video to {video_path}")
+        # Match the sim's wall-clock speed: dt per env step = timestep * frame_skip
+        dt = env.model.opt.timestep * env._frame_skip
+        fps = int(round(1.0 / dt))
+        mediapy.write_video(str(video_path), stats["frames"], fps=fps)
+        print(f"saved rollout video to {video_path} (fps={fps})")
 
     env.close()
 

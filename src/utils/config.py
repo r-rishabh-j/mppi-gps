@@ -43,12 +43,16 @@ class GPSConfig:
     badmm_step_size: float = 2.0
     policy_augmented_alpha: float = 0.1 # weight on -log π(u|x) in MPPI cost (Eq 5)
     distill_batch_size: int = 256   # mini-batch size for policy distillation
-    distill_epochs: int = 5         # gradient epochs per GPS iteration
-    warm_start_policy: bool = True  # warm-start MPPI nominal U from policy rollout
+    distill_epochs: int = 10         # gradient epochs per GPS iteration
+    warm_start_policy: bool = False  # warm-start MPPI nominal U from policy rollout
     disable_kl_constraint: bool = False  # if True: skip KL/BADMM, keep nu fixed at badmm_init_nu,
                                          # i.e. run MPPI with a policy prior of weight alpha*nu (const),
                                          # then plain BC. This is the "policy-prior-only" GPS variant.
     distill_loss: str = "nll"       # "nll" (weighted NLL on policy log-prob) or "mse" (MSE on mean)
+    auto_reset: bool = False        # On env termination mid-episode during the C-step,
+                                    # reset to a fresh random init and keep collecting until
+                                    # episode_length steps are taken. Required for terminating
+                                    # envs like hopper; otherwise dataset size collapses early.
 
 
 @dataclass

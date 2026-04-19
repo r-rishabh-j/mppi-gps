@@ -86,17 +86,30 @@ Outputs (all inside the run dir `experiments/dagger/<timestamp>_<env>_<name>/`):
 
 ## GPS (KL-constrained distillation)
 
+Each run creates a timestamped dir `experiments/gps/<YYYYmmdd-HHMMSS>_<env>_<name>/`
+(override parent via `--exp-dir`, name via `--exp-name`).
+
 ```bash
 python -m scripts.run_gps --env acrobot --device auto
-python -m scripts.run_gps --env hopper --gps-iters 30 --device auto
+python -m scripts.run_gps --env hopper --auto-reset --gps-iters 30 --device auto
+
+# warm-start from a DAgger / BC checkpoint before the GPS loop
+python -m scripts.run_gps --env acrobot --exp-name warmstart \
+    --init-ckpt checkpoints/dagger/<run>/best.pt --device auto
+
+# hopper — terminating env, needs auto-reset so dataset size doesn't collapse on early iters
+python -m scripts.run_gps --env hopper --auto-reset \
+    --disable-kl --distill-loss mse --alpha 0.1 --nu 1.0 \
+    --gps-iters 30 --episode-length 500 --device auto
 ```
 
-Outputs (in `--ckpt-dir`, default `checkpoints/`):
-- `gps_<env>_iter<k:03d>.pt` — per-iteration policy weights.
-- `gps_<env>_best.pt` — weights from the iteration with the lowest mean rollout cost.
-- `gps_<env>.pt` — final iteration weights.
-- `gps_<env>_curves.json` / `.png` — cost / KL / nu / distill-loss curves.
-- `gps_<env>.mp4` — first eval-episode video of the trained policy.
+Outputs (inside the run dir):
+- `iter_<k:03d>.pt` — per-iteration wrapped checkpoints (state_dict + `policy_class` + metrics).
+- `best.pt` — copy of the iteration with the lowest mean rollout cost.
+- `final.pt` — copy of the last iteration's weights.
+- `config.json` — CLI args, all dataclass configs, policy class, git sha, eval summary.
+- `curves.json` / `curves.png` — cost / KL / nu / distill-loss curves.
+- `<env>.mp4` — first eval-episode video of the trained policy.
 
 ### Policy-prior-only GPS (no KL / no BADMM)
 
@@ -119,9 +132,12 @@ Flags:
 - `--distill-loss {nll,mse}` — `mse` matches plain BC, `nll` uses weighted NLL (default).
 - `--alpha` — weight on `-log π` inside the MPPI cost (policy-prior strength).
 - `--nu` — constant multiplier on the prior; effective weight is `alpha * nu`.
+- `--init-ckpt PATH` — load a wrapped or raw state_dict into the policy before the GPS loop (warm-start from BC / DAgger / a previous GPS run).
+- `--auto-reset` — on env termination during the C-step, reset to a fresh random init and keep collecting until `episode_length` steps are taken. Recommended for hopper and any other env that can terminate early; without it, early iters produce tiny distillation datasets.
+- `--warm-start-policy` — (advanced) seed MPPI's nominal `U` from a policy rollout before each condition. Off by default — the `-α·log π` prior already biases MPPI toward the policy, and on terminating envs the zero-padding past `done` actively hurts.
 - `--gps-iters`, `--num-conditions`, `--episode-length` — override `GPSConfig` defaults.
 - `--n-eval`, `--eval-len` — evaluation episode count / length.
-- `--ckpt-dir` — where per-iter / best / final checkpoints are saved (default `checkpoints/`).
+- `--exp-name`, `--exp-dir` — run-dir naming (parent defaults to `experiments/gps`).
 - `--device auto|cpu|mps|cuda` — policy training device (MPPI always runs on CPU).
 
 ## Evaluate a saved checkpoint
@@ -172,3 +188,11 @@ python -m scripts.tuning.tune_hopper
 python -m scripts.run_ablations --env acrobot
 python -m scripts.visualisation.plot_results --env acrobot
 ```
+
+
+### Bookeeping for experiments
+
+#### Hopper MPPI GPS
+python -m scripts.run_gps --env hopper --auto-reset \
+    --disable-kl --distill-loss nll --alpha 0.1 --nu 1.0 \
+    --gps-iters 10 --episode-length 200 --device auto --exp-name hopper_autoreset

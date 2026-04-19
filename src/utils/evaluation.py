@@ -22,6 +22,7 @@ def evaluate_policy(
     episode_len: int,
     seed: int,
     render: bool = False,
+    camera: str | int | None = None,
 ) -> dict:
     """Roll out a trained policy for n_episodes and collect cost statistics.
 
@@ -67,11 +68,14 @@ def evaluate_policy(
 
             # Capture video frames from the first episode only
             if renderer is not None and ep == 0:
-                renderer.update_scene(env.data)
+                if camera is not None:
+                    renderer.update_scene(env.data, camera=camera)
+                else:
+                    renderer.update_scene(env.data)
                 frames.append(renderer.render().copy())
 
-            if done:
-                break
+            # if done:
+            #     break
         returns.append(ep_cost)
 
     arr = np.array(returns)

@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
                         "for terminating envs like hopper where policy-driven episodes fall early.")
     p.add_argument("--exp-name", default="run",
                    help="Human-readable experiment name (used in the run dir name).")
-    p.add_argument("--exp-dir", default="experiments/dagger",
+    p.add_argument("--exp-dir", default="checkpoints/dagger",
                    help="Parent dir under which a <timestamp>_<env>_<name>/ run dir is created.")
     return p.parse_args()
 

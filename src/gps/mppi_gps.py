@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from dataclasses import dataclass, field
+from tqdm.auto import tqdm
 
 from src.envs.base import BaseEnv
 from src.mppi.mppi import MPPI
@@ -343,7 +344,7 @@ class MPPIGPS:
             for start in range(0, N, cfg.distill_batch_size):
                 batch = indices[start : start + cfg.distill_batch_size]
                 if cfg.distill_loss == "mse":
-                    last_loss = self._train_step_mse(obs[batch], actions[batch])
+                    last_loss = self.policy.mse_step(obs, actions)
                 else:
                     # train_weighted computes -Σ w log π / Σ w  and does one Adam step
                     last_loss = self.policy.train_weighted(
@@ -351,13 +352,13 @@ class MPPIGPS:
                     )
         return last_loss
 
-    def _train_step_mse(self, obs: np.ndarray, actions: np.ndarray) -> float:
-        """Plain MSE on the policy mean — used when distill_loss='mse' (BC-style).
+    # def _train_step_mse(self, obs: np.ndarray, actions: np.ndarray) -> float:
+    #     """Plain MSE on the policy mean — used when distill_loss='mse' (BC-style).
 
-        Reuse GaussianPolicy.mse_step so the running observation normalizer is
-        updated exactly the same way as the standalone BC and DAgger paths.
-        """
-        return self.policy.mse_step(obs, actions)
+    #     Reuse GaussianPolicy.mse_step so the running observation normalizer is
+    #     updated exactly the same way as the standalone BC and DAgger paths.
+    #     """
+    #     return self.policy.mse_step(obs, actions)
 
     def _update_badmm(self, kl_value: float):
         """Adjust the BADMM dual variable nu based on the current KL.
@@ -395,7 +396,7 @@ class MPPIGPS:
         done = False
         for _ in range(self.mppi_cfg.H):
             if done:
-                # Env has terminated (e.g. hopper fell) — pad the remaining
+                # Env has terminated — pad the remaining
                 # horizon with zeros so we don't feed post-terminal garbage
                 # states into the policy.
                 actions.append(np.zeros(self.env.action_dim))
@@ -446,7 +447,8 @@ class MPPIGPS:
 
         skip_kl = cfg.disable_kl_constraint
 
-        for iteration in range(num_iterations):
+        outer_bar = tqdm(range(num_iterations), desc="GPS", unit="iter")
+        for iteration in outer_bar:
             alpha = cfg.policy_augmented_alpha
 
             # Accumulators for distillation data (aggregated across conditions)
@@ -464,6 +466,15 @@ class MPPIGPS:
             condition_costs: list[float] = []
 
             # ========== C-STEP: Run MPPI on each initial condition ==========
+            # Nested progress bar over total MPPI steps (num_conditions * episode_length).
+            # `leave=False` so it clears after each iteration and the outer bar stays clean.
+            c_step_total = cfg.num_conditions * cfg.episode_length
+            c_bar = tqdm(
+                total=c_step_total,
+                desc=f"  iter {iteration:3d} C-step",
+                unit="step",
+                leave=False,
+            )
             for ic_idx, ic_state in enumerate(initial_conditions):
                 # Build the policy prior closure for this iteration.
                 # This captures the *current* policy weights and nu value.
@@ -515,9 +526,20 @@ class MPPIGPS:
                     # Step the environment with the MPPI-chosen action
                     _, cost, done, _ = self.env.step(action)
                     episode_cost += cost
+                    c_bar.update(1)
 
-                    if done:
-                        break
+                    # TODO: DO we really need such done handling?
+                    # if done:
+                    #     if cfg.auto_reset and t < cfg.episode_length - 1:
+                    #         # Terminating env (hopper, etc.): re-seed to a fresh random init
+                    #         # and keep collecting until we've taken episode_length steps.
+                    #         # MPPI nominal U is also reset so it doesn't carry post-fall state.
+                    #         self.env.reset()
+                    #         self.mppi.reset()
+                    #         continue
+                    #     # Short-circuited: pad the bar so the total stays consistent.
+                    #     c_bar.update(cfg.episode_length - (t + 1))
+                    #     break
 
                 # Store this condition's data for distillation.
                 # We use uniform weights on the executed actions (simple SL).
@@ -533,6 +555,11 @@ class MPPIGPS:
                     all_kl_obs.append(episode_obs)
 
                 condition_costs.append(episode_cost)
+                c_bar.set_postfix(
+                    ic=f"{ic_idx + 1}/{cfg.num_conditions}",
+                    last_cost=f"{episode_cost:.1f}",
+                )
+            c_bar.close()
 
             # ========== S-STEP: Distill into policy ==========
             # Concatenate data from all conditions into flat arrays
@@ -590,7 +617,14 @@ class MPPIGPS:
                     history.best_iter = iteration
                     copy_as(iter_path, run_dir / "best.pt")
 
-            print(
+            outer_bar.set_postfix(
+                cost=f"{mean_cost:.2f}",
+                loss=f"{loss:.3f}",
+                kl=f"{kl_mean:.3f}",
+                nu=f"{self.nu:.3f}",
+                best=history.best_iter if history.best_iter >= 0 else "-",
+            )
+            tqdm.write(
                 f"[GPS iter {iteration:3d}]  "
                 f"cost={mean_cost:8.2f}  "
                 f"distill_loss={loss:.4f}  "
@@ -598,4 +632,5 @@ class MPPIGPS:
                 f"nu={self.nu:.4f}"
             )
 
+        outer_bar.close()
         return history
