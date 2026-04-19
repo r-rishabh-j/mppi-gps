@@ -14,6 +14,11 @@ class MPPIConfig:
     noise_sigma: float = 0.5 # exploration noise std
     adaptive_lam: bool = False # adapt lam in order to maintain the n_eff
     n_eff_threshold: float = 64.0 # number of samples that you want to contribute to the weighted mean
+    # open-loop execution horizon: replan once, then execute this many actions from the
+    # resulting nominal U before replanning. 1 (default) = replan every step (MPC).
+    # Intermediate calls skip the sample/rollout/weight pipeline, so wall-clock drops
+    # roughly linearly in open_loop_steps at the cost of reactivity. Must be in [1, H].
+    open_loop_steps: int = 1
 
     @staticmethod
     def load(env_name: str) -> "MPPIConfig":

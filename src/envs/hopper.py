@@ -1,17 +1,10 @@
 """Hopper env — contact-rich locomotion task.
 
-This is the "contact-rich" evaluation environment from the project proposal.
-The hopper has intermittent ground contact, making it significantly harder
-than the acrobot swing-up task.
-
-Model details (from hopper.xml):
-  - 6 generalised positions (qpos): rootx, rootz, rooty, thigh, leg, foot
-  - 6 generalised velocities (qvel): corresponding joint velocities
-  - 3 actuators: thigh_joint, leg_joint, foot_joint (range [-1, 1])
-  - Observation: qpos[1:] (skip root x) + clip(qvel, -10, 10) → 11 dims
-
-The cost function negates the standard Gymnasium Hopper-v5 reward:
-  cost = -(forward_velocity_reward + healthy_reward) + ctrl_cost
+Supports two running-cost modes:
+  - ``v1``: the original Gymnasium-style additive forward reward + alive bonus
+    with quadratic control penalty.
+  - ``v2``: a dm_control-style multiplicative hop reward. The hopper only gets
+    rewarded for moving quickly when it is also standing tall.
 """
 
 import mujoco
@@ -29,6 +22,7 @@ _XML = str(Path(__file__).resolve().parents[2] / "assets" / "hopper.xml")
 # These values match Gymnasium's Hopper-v5 defaults.
 _Z_MIN = 0.7
 _ANGLE_MAX = 0.2
+_VALID_COST_MODES = {"v1", "v2"}
 
 
 class Hopper(MuJoCoEnv):
@@ -38,6 +32,7 @@ class Hopper(MuJoCoEnv):
         ctrl_cost_weight: float = 0.001,
         forward_reward_weight: float = 1.0,
         healthy_reward: float = 1.0,
+        cost_mode: str = "v2",
         **kwargs,
     ) -> None:
         super().__init__(model_path=_XML, frame_skip=frame_skip, **kwargs)
@@ -46,6 +41,21 @@ class Hopper(MuJoCoEnv):
         self._ctrl_w = ctrl_cost_weight
         self._fwd_w = forward_reward_weight
         self._healthy_reward = healthy_reward
+        if cost_mode not in _VALID_COST_MODES:
+            raise ValueError(
+                f"Unknown hopper cost_mode={cost_mode!r}. "
+                f"Expected one of {sorted(_VALID_COST_MODES)}."
+            )
+        self._cost_mode = cost_mode
+
+        # Sensor layout from assets/hopper.xml:
+        #   torso_pos          framepos(body=torso)         -> 3 floats
+        #   foot_pos           framepos(body=foot)          -> 3 floats
+        #   torso_subtreelinvel subtreelinvel(body=torso)   -> 3 floats
+        self._torso_pos_slice = slice(0, 3)
+        self._foot_pos_slice = slice(3, 6)
+        self._torso_linvel_slice = slice(6, 9)
+        self._public_sensor_dim = 0
 
     def reset(
         self,
@@ -59,8 +69,8 @@ class Hopper(MuJoCoEnv):
         obs = super().reset()
         # Small random perturbation around the default standing pose
         # to diversify initial conditions.
-        self.data.qpos[:] += np.random.uniform(-0.005, 0.005, size=self._nq)
-        self.data.qvel[:] += np.random.uniform(-0.005, 0.005, size=self._nv)
+        self.data.qpos[:] += np.random.uniform(-0.005, 0.1, size=self._nq)
+        self.data.qvel[:] += np.random.uniform(-0.005, 0.2, size=self._nv)
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs()
 
@@ -81,49 +91,118 @@ class Hopper(MuJoCoEnv):
             healthy = healthy & state_ok
         return healthy
 
+    def _tolerance(
+        self,
+        x: np.ndarray,
+        bounds: tuple[float, float],
+        margin: float = 0.0,
+        sigmoid: str = "gaussian",
+        value_at_margin: float = 0.1,
+    ) -> np.ndarray:
+        """Minimal copy of dm_control's tolerance helper for Hopper reward terms."""
+        lower, upper = bounds
+        in_bounds = (lower <= x) & (x <= upper)
+        if margin == 0.0:
+            return np.where(in_bounds, 1.0, 0.0)
+
+        d = np.where(x < lower, lower - x, x - upper) / margin
+        if sigmoid == "linear":
+            scaled = d * (1.0 - value_at_margin)
+            return np.where(np.abs(scaled) < 1.0, 1.0 - scaled, 0.0)
+        raise ValueError(f"Unsupported sigmoid={sigmoid!r} for Hopper tolerance.")
+
+    def _running_cost_v1(
+        self,
+        states: Float[Array, "K H nstate"],
+        actions: Float[Array, "K H nu"],
+    ) -> Float[Array, "K H"]:
+        qpos = self.state_qpos(states)
+        qvel = self.state_qvel(states)
+        vx = qvel[:, :, 0]
+        ctrl_cost = np.sum(np.square(actions), axis=-1)
+        z = qpos[:, :, 1]
+        angle = qpos[:, :, 2]
+        healthy = self._is_healthy(z, angle).astype(np.float64)
+        return (
+            -self._fwd_w * vx
+            - self._healthy_reward * healthy
+            + self._ctrl_w * ctrl_cost
+        )
+
+    def _running_cost_v2(
+        self,
+        sensordata: Float[Array, "K H nsensor"],
+    ) -> Float[Array, "K H"]:
+        torso_z = sensordata[:, :, self._torso_pos_slice.stop - 1]
+        foot_z = sensordata[:, :, self._foot_pos_slice.stop - 1]
+        torso_vx = sensordata[:, :, self._torso_linvel_slice.start]
+
+        standing = self._tolerance(
+            torso_z - foot_z,
+            bounds=(0.6, 2.0),
+        )
+        hopping = self._tolerance(
+            self._fwd_w * torso_vx,
+            bounds=(2.0, float("inf")),
+            margin=1.0,
+            value_at_margin=0.5,
+            sigmoid="linear",
+        )
+        reward = standing * hopping
+        return -reward
+
+    def _public_sensordata(
+        self,
+        sensordata: np.ndarray,
+    ) -> np.ndarray:
+        """Hide dm_control-style reward sensors from external callers."""
+        return sensordata[..., :self._public_sensor_dim]
+
     def running_cost(
         self,
         states: Float[Array, "K H nstate"],
         actions: Float[Array, "K H nu"],
         sensordata: Float[Array, "K H nsensor"] | None = None,
     ) -> Float[Array, "K H"]:
-        """Vectorised per-step cost for K×H (sample, horizon) grid.
-
-        Cost = -(forward_velocity × fwd_w) - (healthy_reward × is_healthy) + ctrl_w × ||u||²
-
-        Note: during MPPI planning rollouts we do NOT terminate on unhealthy
-        states — we just let the high cost accumulate so that MPPI naturally
-        avoids falling.  Termination only happens in the real step().
-        """
-        qpos = self.state_qpos(states)  # (K, H, 6) — uses the +1 offset for time
-        qvel = self.state_qvel(states)  # (K, H, 6)
-
-        # Forward velocity = d(rootx)/dt = qvel[0]
-        vx = qvel[:, :, 0]
-
-        # Quadratic control cost: penalise large actuator efforts
-        ctrl_cost = np.sum(np.square(actions), axis=-1)
-
-        # Healthy reward: +1 per step when the hopper is upright, else 0
-        z = qpos[:, :, 1]       # rootz (vertical position)
-        angle = qpos[:, :, 2]   # rooty (torso pitch angle)
-        healthy = self._is_healthy(z, angle).astype(np.float64)
-
-        # Combine into cost (we minimise, so negate the reward terms)
-        cost = (
-            -self._fwd_w * vx
-            - self._healthy_reward * healthy
-            + self._ctrl_w * ctrl_cost
-        )
-        return cost
+        """Vectorised per-step cost for K×H (sample, horizon) grid."""
+        if self._cost_mode == "v1":
+            return self._running_cost_v1(states, actions)
+        return self._running_cost_v2(sensordata)
 
     def terminal_cost(
         self,
         states: Float[Array, "K nstate"],
         sensordata: Float[Array, "K nsensor"] | None = None,
     ) -> Float[Array, "K"]:
-        # No terminal cost — the running cost fully specifies the objective.
+        # Both Hopper cost modes are fully specified by the running cost.
         return np.zeros(states.shape[0])
+
+    def batch_rollout(
+        self,
+        initial_state: np.ndarray,
+        action_sequences: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Run Hopper rollouts while keeping reward-only sensors private.
+
+        The v2 cost uses extra MuJoCo sensors internally, but callers still see
+        the pre-v2 public sensor payload (empty for Hopper).
+        """
+        actions_expanded = np.repeat(action_sequences, self._frame_skip, axis=1)
+        states_full, sensordata_full = self._rollout_ctx.rollout(
+            self.model,
+            self._data_pool,
+            initial_state,
+            actions_expanded,
+        )
+
+        states = states_full[:, ::self._frame_skip, :]
+        private_sensordata = sensordata_full[:, ::self._frame_skip, :]
+        costs = (
+            self.running_cost(states, action_sequences, private_sensordata).sum(axis=1)
+            + self.terminal_cost(states[:, -1, :], private_sensordata[:, -1, :])
+        )
+        public_sensordata = self._public_sensordata(private_sensordata)
+        return states, costs, public_sensordata
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         """Single environment step with termination on unhealthy state.

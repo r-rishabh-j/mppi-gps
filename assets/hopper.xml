@@ -42,6 +42,11 @@ modified by @saran_t
     <motor ctrllimited="true" ctrlrange="-1.0 1.0" gear="200.0" joint="leg_joint"/>
     <motor ctrllimited="true" ctrlrange="-1.0 1.0" gear="200.0" joint="foot_joint"/>
   </actuator>
+  <sensor>
+    <framepos name="torso_pos" objtype="body" objname="torso"/>
+    <framepos name="foot_pos" objtype="body" objname="foot"/>
+    <subtreelinvel name="torso_subtreelinvel" body="torso"/>
+  </sensor>
     <asset>
         <texture type="skybox" builtin="gradient" rgb1=".4 .5 .6" rgb2="0 0 0"
             width="100" height="100"/>

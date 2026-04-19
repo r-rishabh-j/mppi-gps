@@ -1,8 +1,9 @@
 {
-  "noise_sigma": 0.2,
-  "lam": 0.02,
+  "noise_sigma": 0.3,
+  "lam": 0.024,
   "K": 256,
   "H": 256,
   "adaptive_lam": false,
-  "n_eff_threshold": 128
+  "n_eff_threshold": 128,
+  "open_loop_steps": 4
 }

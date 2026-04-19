@@ -1,60 +1,119 @@
-"""Pure SL behavior cloning with MSE loss on MPPI executed trajectories.
+"""Pure supervised BC on cached MPPI rollouts.
 
-Loads (M, T) executed (state, action) pairs from collect_bc_demos.py and fits
-the policy mean by MSE. No weights, no NLL — just regression.
+Fits a `GaussianPolicy` (MSE on mean, default) or `DeterministicPolicy`
+(direct action regression, via `--deterministic`) on (obs, action) pairs
+loaded from an h5 produced by `collect_bc_demos.py`. Baseline for DAgger /
+GPS — no policy-in-the-loop, no expert relabeling.
+
+Creates a run dir `experiments/bc/<timestamp>_<env>_<name>/` containing:
+    config.json        CLI args + dataclass configs + metadata
+    iter_<k:03d>.pt    per-epoch wrapped checkpoints (kept only every
+                       --ckpt-every epochs; always kept for the best epoch)
+    best.pt / final.pt copies of best-by-val-mse / last epoch
+    bc_log.csv         per-epoch train/val MSE (+ eval cost at eval epochs)
+    loss.png           train/val curve
+    <env>.mp4          rollout of the best policy with env-appropriate camera
+
+Example:
+    # 1. collect demos (cached — rerunning is a no-op unless --force)
+    python -m scripts.collect_bc_demos --env acrobot
+
+    # 2. train BC
+    python -m scripts.test_sl --env acrobot --device auto
+    python -m scripts.test_sl --env hopper --deterministic --device auto
+
+    # warm-start from a prior checkpoint and continue training
+    python -m scripts.test_sl --env acrobot --device auto \\
+        --init-ckpt experiments/bc/<run>/best.pt --num-epochs 30
 """
+from __future__ import annotations
 
-import numpy as np
-import h5py
-import torch
-import mujoco
-import mediapy
-import matplotlib.pyplot as plt
-from dataclasses import dataclass
+import argparse
+from datetime import datetime
 from pathlib import Path
 
-from src.policy.gaussian_policy import GaussianPolicy
-from src.utils.config import PolicyConfig, MPPIConfig
-from src.utils.evaluation import evaluate_policy, evaluate_mppi
-from src.envs.acrobot import Acrobot
+import h5py
+import matplotlib.pyplot as plt
+import mediapy
+import numpy as np
+import torch
+from tqdm.auto import tqdm
+
+from src.envs import make_env
 from src.mppi.mppi import MPPI
+from src.policy.deterministic_policy import DeterministicPolicy
+from src.policy.gaussian_policy import GaussianPolicy
+from src.utils.config import MPPIConfig, PolicyConfig
+from src.utils.device import pick_device
+from src.utils.evaluation import evaluate_mppi, evaluate_policy
+from src.utils.experiment import (
+    copy_as,
+    git_sha,
+    load_checkpoint,
+    make_run_dir,
+    save_checkpoint,
+    update_config,
+    write_config,
+)
 
 
-@dataclass
-class BCConfig:
-    demo_path:   Path  = Path("data/acrobot_bc.h5")
-    ckpt_path:   Path  = Path("checkpoints/bc_acrobot.pt")
-    loss_plot:   Path  = Path("bc_loss.png")
-    video_path:  Path  = Path("policy_sl.mp4")
+_ENVS = ["acrobot", "half_cheetah", "point_mass", "hopper"]
 
-    obs_dim:     int   = 4
-    act_dim:     int   = 1
-
-    batch_size:  int   = 4096
-    num_epochs:  int   = 50
-    val_frac:    float = 0.2       # fraction of trajectories held out
-    n_eval_eps:  int   = 10
-    eval_ep_len: int   = 500
-
-    seed:        int   = 0
+# Camera per env — must match <camera name="..."> in the MuJoCo XML.
+_CAMERA = {
+    "hopper": "track",
+    "half_cheetah": "track",
+    "acrobot": "fixed",
+    "point_mass": "fixed",
+}
 
 
-# ---------- data ----------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--env", default="acrobot", choices=_ENVS)
+    p.add_argument("--demos", default=None,
+                   help="path to h5 demos (default: data/<env>_bc.h5). "
+                        "If the file is missing, you'll be told to run collect_bc_demos.")
+    p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda")
+    p.add_argument("--deterministic", action="store_true",
+                   help="use DeterministicPolicy (direct action regression) instead of "
+                        "GaussianPolicy (MSE on mean, log_sigma head unused).")
+    p.add_argument("--init-ckpt", default=None,
+                   help="warm-start: load a wrapped or raw state_dict into the policy "
+                        "before training. Must match --deterministic.")
+    p.add_argument("--num-epochs", type=int, default=50)
+    p.add_argument("--batch-size", type=int, default=4096)
+    p.add_argument("--val-frac", type=float, default=0.2,
+                   help="fraction of trajectories (not transitions) held out for val")
+    p.add_argument("--eval-every", type=int, default=5,
+                   help="run env eval every N epochs (0 disables mid-training eval)")
+    p.add_argument("--ckpt-every", type=int, default=5,
+                   help="save iter_<epoch>.pt every N epochs (best.pt/final.pt always saved)")
+    p.add_argument("--n-eval-eps", type=int, default=10)
+    p.add_argument("--eval-ep-len", type=int, default=500)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--exp-name", default="run",
+                   help="human-readable experiment name (goes in the run dir name)")
+    p.add_argument("--exp-dir", default="experiments/bc",
+                   help="parent dir under which <timestamp>_<env>_<name>/ is created")
+    return p.parse_args()
+
+
 def load_demos(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Returns (M, T, obs_dim), (M, T, act_dim) — preserves trajectory structure
-    so we can split train/val by trajectory before flattening."""
+    """(M, T, obs_dim), (M, T, act_dim) — trajectory-preserving so we can
+    split train/val by trajectory before flattening."""
     with h5py.File(path, "r") as f:
-        states  = f["states"][:].astype(np.float32)
+        states = f["states"][:].astype(np.float32)
         actions = f["actions"][:].astype(np.float32)
     return states, actions
 
 
-def split_and_flatten(states: np.ndarray,
-                      actions: np.ndarray,
-                      val_frac: float,
-                      rng: np.random.Generator):
-    """Split trajectories (not transitions) into train/val, then flatten each
-    half to (N, obs_dim) / (N, act_dim)."""
+def split_and_flatten(
+    states: np.ndarray,
+    actions: np.ndarray,
+    val_frac: float,
+    rng: np.random.Generator,
+) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray], int, int]:
     M = states.shape[0]
     perm = rng.permutation(M)
     n_val = max(1, int(M * val_frac))
@@ -65,139 +124,264 @@ def split_and_flatten(states: np.ndarray,
         a = actions[idx].reshape(-1, actions.shape[-1])
         return s, a
 
-    tr_s, tr_a = flatten(train_idx)
-    va_s, va_a = flatten(val_idx)
-    return (tr_s, tr_a), (va_s, va_a), len(train_idx), len(val_idx)
-
-
-# ---------- training ----------
-def train_step_mse(policy: GaussianPolicy,
-                   obs: np.ndarray,
-                   actions: np.ndarray) -> float:
-    """One Adam step on the MSE between policy mean and target action."""
-    obs_t = torch.as_tensor(obs, dtype=torch.float32)
-    act_t = torch.as_tensor(actions, dtype=torch.float32)
-
-    mu, _ = policy.forward(obs_t)
-    loss = ((mu - act_t) ** 2).mean()
-
-    policy.optimizer.zero_grad()
-    loss.backward()
-    policy.optimizer.step()
-    return loss.item()
+    return flatten(train_idx), flatten(val_idx), len(train_idx), len(val_idx)
 
 
 @torch.no_grad()
-def eval_mse(policy: GaussianPolicy,
-             obs: np.ndarray,
-             actions: np.ndarray,
-             batch: int = 16384) -> float:
-    """Mean MSE over a dataset, computed in chunks to bound memory."""
+def eval_mse(policy, obs: np.ndarray, actions: np.ndarray, batch: int = 16384) -> float:
+    device = policy.device
     total, n = 0.0, 0
     for s in range(0, len(obs), batch):
-        o = torch.as_tensor(obs[s:s + batch], dtype=torch.float32)
-        a = torch.as_tensor(actions[s:s + batch], dtype=torch.float32)
-        mu, _ = policy.forward(o)
-        total += ((mu - a) ** 2).sum().item()
-        n     += a.numel()
+        o = torch.as_tensor(obs[s:s + batch], dtype=torch.float32, device=device)
+        a = torch.as_tensor(actions[s:s + batch], dtype=torch.float32, device=device)
+        pred = policy.action(o)
+        total += float(((pred - a) ** 2).sum().item())
+        n += a.numel()
     return total / max(n, 1)
 
 
-# ---------- main ----------
-def main(cfg: BCConfig = BCConfig()) -> None:
-    rng = np.random.default_rng(cfg.seed)
-    torch.manual_seed(cfg.seed)
+def main() -> None:
+    args = parse_args()
 
-    states, actions = load_demos(cfg.demo_path)
-    M, T, _ = states.shape
-    print(f"loaded {M} trajectories of length {T}")
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
+
+    # -------- Demos --------
+    demo_path = Path(args.demos) if args.demos else Path(f"data/{args.env}_bc.h5")
+    if not demo_path.exists():
+        raise FileNotFoundError(
+            f"{demo_path} not found. Collect first:\n"
+            f"    python -m scripts.collect_bc_demos --env {args.env}"
+        )
+    states, actions = load_demos(demo_path)
+    M, T, obs_dim = states.shape
+    act_dim = actions.shape[-1]
+    print(f"loaded {M} trajectories of length {T} from {demo_path}  "
+          f"(obs_dim={obs_dim}, act_dim={act_dim})")
 
     (tr_s, tr_a), (va_s, va_a), n_tr, n_va = split_and_flatten(
-        states, actions, cfg.val_frac, rng,
+        states, actions, args.val_frac, rng,
     )
     print(f"train trajs: {n_tr}  val trajs: {n_va}")
     print(f"train samples: {len(tr_s):,}   val samples: {len(va_s):,}")
 
-    policy = GaussianPolicy(cfg.obs_dim, cfg.act_dim, PolicyConfig())
+    # -------- Env + policy --------
+    device = pick_device(args.device)
+    env = make_env(args.env)
+    mppi_cfg = MPPIConfig.load(args.env)
 
-    cfg.ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    train_losses: list[float] = []
-    val_losses:   list[float] = []
-    best_val = float("inf")
+    if env.obs_dim != obs_dim or env.action_dim != act_dim:
+        raise ValueError(
+            f"demo/env shape mismatch: demos have obs_dim={obs_dim}, act_dim={act_dim}; "
+            f"env has obs_dim={env.obs_dim}, act_dim={env.action_dim}. "
+            f"Regenerate the demos after an env change: "
+            f"python -m scripts.collect_bc_demos --env {args.env} --force"
+        )
 
+    policy_cfg = PolicyConfig()
+    PolicyCls = DeterministicPolicy if args.deterministic else GaussianPolicy
+    policy = PolicyCls(obs_dim, act_dim, policy_cfg,
+                       device=device, action_bounds=env.action_bounds)
+    print(f"policy: {PolicyCls.__name__}  device: {device}")
+
+    if args.init_ckpt is not None:
+        init_ckpt = Path(args.init_ckpt)
+        if not init_ckpt.exists():
+            raise FileNotFoundError(f"--init-ckpt not found: {init_ckpt}")
+        blob = load_checkpoint(init_ckpt, map_location=device)
+        try:
+            policy.load_state_dict(blob["state_dict"])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"failed to load --init-ckpt {init_ckpt}; make sure it matches "
+                f"--deterministic={args.deterministic}"
+            ) from exc
+        print(f"loaded initial policy weights from {init_ckpt}"
+              + (f"  (policy_class={blob['policy_class']})" if 'policy_class' in blob else ""))
+
+    # -------- Run dir --------
+    run_dir = make_run_dir(args.exp_dir, args.env, args.exp_name)
+    print(f"run dir: {run_dir}")
+
+    start_time = datetime.now().isoformat(timespec="seconds")
+    write_config(run_dir, {
+        "name": args.exp_name,
+        "env": args.env,
+        "device": str(device),
+        "policy_class": type(policy).__name__,
+        "start_time": start_time,
+        "end_time": None,
+        "git_sha": git_sha(),
+        "cli_args": vars(args),
+        "demo_path": str(demo_path),
+        "dataset": {
+            "M": int(M), "T": int(T),
+            "obs_dim": int(obs_dim), "act_dim": int(act_dim),
+            "n_train_trajs": int(n_tr), "n_val_trajs": int(n_va),
+            "n_train_samples": int(len(tr_s)), "n_val_samples": int(len(va_s)),
+        },
+        "configs": {
+            "policy": policy_cfg,
+            "mppi": mppi_cfg,
+        },
+        "best_epoch": None,
+        "best_val_mse": None,
+    })
+
+    # -------- Training loop --------
     N = len(tr_s)
     idx = np.arange(N)
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    best_val = float("inf")
+    best_epoch = -1
+    last_ckpt_path: Path | None = None
 
-    for epoch in range(cfg.num_epochs):
+    log_lines = [
+        f"# BC on {args.env}, device={device}, policy={type(policy).__name__}",
+        f"# demos={demo_path}  n_train={len(tr_s)}  n_val={len(va_s)}",
+        "epoch,train_mse,val_mse,eval_mean_cost,eval_std_cost",
+    ]
+
+    epoch_bar = tqdm(range(args.num_epochs), desc="BC", unit="ep")
+    for epoch in epoch_bar:
+        policy.train()
         rng.shuffle(idx)
-        running, n_batches = 0.0, 0
-        for start in range(0, N, cfg.batch_size):
-            b = idx[start:start + cfg.batch_size]
-            running += train_step_mse(policy, tr_s[b], tr_a[b])
-            n_batches += 1
+        running, nb = 0.0, 0
+        for start in range(0, N, args.batch_size):
+            b = idx[start:start + args.batch_size]
+            running += policy.mse_step(tr_s[b], tr_a[b])
+            nb += 1
+        train_mse = running / max(nb, 1)
+        val_mse = eval_mse(policy, va_s, va_a)
+        train_losses.append(train_mse)
+        val_losses.append(val_mse)
 
-        train_losses.append(running / n_batches)
-        val_losses.append(eval_mse(policy, va_s, va_a))
+        # optional mid-training env eval — expensive on long episodes
+        eval_mean = eval_std = float("nan")
+        do_eval = args.eval_every > 0 and (
+            (epoch + 1) % args.eval_every == 0 or epoch == args.num_epochs - 1
+        )
+        if do_eval:
+            policy.eval()
+            stats = evaluate_policy(policy, env,
+                                    n_episodes=args.n_eval_eps,
+                                    episode_len=args.eval_ep_len,
+                                    seed=args.seed)
+            eval_mean = stats["mean_cost"]
+            eval_std = stats["std_cost"]
 
-        if val_losses[-1] < best_val:
-            best_val = val_losses[-1]
-            torch.save(policy.state_dict(), cfg.ckpt_path)
-            tag = "  ↳ new best"
+        is_best = val_mse < best_val
+        if is_best:
+            best_val = val_mse
+            best_epoch = epoch
+
+        # Checkpoints: always save best; save per-epoch only every --ckpt-every.
+        # Per-epoch saves are wrapped so downstream eval_checkpoint auto-detects
+        # the policy class. Best + final are plain copies of an iter ckpt.
+        keep_this = (args.ckpt_every > 0 and (epoch + 1) % args.ckpt_every == 0) \
+            or is_best or epoch == args.num_epochs - 1
+        if keep_this:
+            ckpt_path = run_dir / f"iter_{epoch:03d}.pt"
+            save_checkpoint(
+                ckpt_path, policy,
+                round=epoch,
+                train_mse=train_mse,
+                val_mse=val_mse,
+                eval_mean_cost=eval_mean,
+                eval_std_cost=eval_std,
+            )
+            last_ckpt_path = ckpt_path
+            if is_best:
+                copy_as(ckpt_path, run_dir / "best.pt")
+
+        if do_eval:
+            log_lines.append(
+                f"{epoch},{train_mse:.6f},{val_mse:.6f},"
+                f"{eval_mean:.4f},{eval_std:.4f}"
+            )
         else:
-            tag = ""
+            log_lines.append(f"{epoch},{train_mse:.6f},{val_mse:.6f},,")
+        (run_dir / "bc_log.csv").write_text("\n".join(log_lines))
 
-        print(f"epoch {epoch:3d}  "
-              f"train_mse={train_losses[-1]:.5f}  "
-              f"val_mse={val_losses[-1]:.5f}{tag}")
+        postfix = {"train": f"{train_mse:.4f}", "val": f"{val_mse:.4f}",
+                   "best": f"{best_val:.4f}@{best_epoch}"}
+        if do_eval:
+            postfix["cost"] = f"{eval_mean:.1f}"
+        epoch_bar.set_postfix(postfix)
 
-    # loss curve
+    if last_ckpt_path is not None:
+        copy_as(last_ckpt_path, run_dir / "final.pt")
+
+    # -------- Loss curve --------
     plt.figure()
     plt.plot(train_losses, label="train")
-    plt.plot(val_losses,   label="val")
+    plt.plot(val_losses, label="val")
     plt.xlabel("epoch")
     plt.ylabel("MSE")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(cfg.loss_plot, dpi=120)
-    print(f"saved loss curve to {cfg.loss_plot}")
+    plt.savefig(run_dir / "loss.png", dpi=120)
+    plt.close()
+    print(f"saved loss curve to {run_dir / 'loss.png'}")
 
-    # reload best-val checkpoint before env eval
-    policy.load_state_dict(torch.load(cfg.ckpt_path))
+    # -------- Reload best weights before final env eval --------
+    best_blob = load_checkpoint(run_dir / "best.pt", map_location=device)
+    policy.load_state_dict(best_blob["state_dict"])
     policy.eval()
-    print(f"reloaded best-val checkpoint (val_mse={best_val:.5f})")
+    print(f"reloaded best checkpoint (epoch={best_epoch}, val_mse={best_val:.5f})")
 
-    # multi-seed env eval
-    env = Acrobot()
-    stats = evaluate_policy(
+    # -------- Final env eval: BC vs MPPI --------
+    print("\n--- Evaluating BC policy ---")
+    bc_stats = evaluate_policy(
         policy, env,
-        n_episodes=cfg.n_eval_eps,
-        episode_len=cfg.eval_ep_len,
-        seed=cfg.seed,
+        n_episodes=args.n_eval_eps,
+        episode_len=args.eval_ep_len,
+        seed=args.seed,
         render=True,
+        camera=_CAMERA.get(args.env),
     )
 
-    # MPPI baseline on the exact same initial conditions
-    mppi = MPPI(env, cfg=MPPIConfig.load("acrobot"))
+    print("--- Evaluating MPPI baseline ---")
+    mppi = MPPI(env, cfg=mppi_cfg)
     mppi_stats = evaluate_mppi(
         env, mppi,
-        n_episodes=cfg.n_eval_eps,
-        episode_len=cfg.eval_ep_len,
-        seed=cfg.seed,
+        n_episodes=args.n_eval_eps,
+        episode_len=args.eval_ep_len,
+        seed=args.seed,
     )
 
     print()
-    print(f"BC  policy:    {stats['mean_cost']:8.2f} ± {stats['std_cost']:.2f}")
+    print(f"BC policy:     {bc_stats['mean_cost']:8.2f} ± {bc_stats['std_cost']:.2f}")
     print(f"MPPI baseline: {mppi_stats['mean_cost']:8.2f} ± {mppi_stats['std_cost']:.2f}")
-    print(f"gap (BC - MPPI): {stats['mean_cost'] - mppi_stats['mean_cost']:+8.2f}")
+    print(f"gap (BC - MPPI): {bc_stats['mean_cost'] - mppi_stats['mean_cost']:+8.2f}")
     print()
     print("per-episode (BC vs MPPI):")
-    for ep, (b, m) in enumerate(zip(stats["per_ep"], mppi_stats["per_ep"])):
+    for ep, (b, m) in enumerate(zip(bc_stats["per_ep"], mppi_stats["per_ep"])):
         print(f"  ep {ep:2d}  BC={b:8.2f}  MPPI={m:8.2f}  gap={b - m:+8.2f}")
 
-    if stats["frames"]:
-        mediapy.write_video(str(cfg.video_path), stats["frames"], fps=30)
-        print(f"saved rollout video to {cfg.video_path}")
+    if bc_stats["frames"]:
+        dt = env.model.opt.timestep * env._frame_skip
+        fps = int(round(1.0 / dt))
+        video_path = run_dir / f"{args.env}.mp4"
+        mediapy.write_video(str(video_path), bc_stats["frames"], fps=fps)
+        print(f"\nsaved rollout video to {video_path} (fps={fps})")
 
+    # -------- Finalize config.json --------
+    update_config(run_dir, {
+        "end_time": datetime.now().isoformat(timespec="seconds"),
+        "best_epoch": best_epoch,
+        "best_val_mse": best_val,
+        "eval": {
+            "bc_mean_cost": bc_stats["mean_cost"],
+            "bc_std_cost": bc_stats["std_cost"],
+            "mppi_mean_cost": mppi_stats["mean_cost"],
+            "mppi_std_cost": mppi_stats["std_cost"],
+        },
+    })
+
+    print(f"\nrun dir: {run_dir}")
     env.close()
 
 

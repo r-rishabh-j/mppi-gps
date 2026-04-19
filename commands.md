@@ -18,13 +18,57 @@ python -m scripts.run_mppi           # generic entry
 
 ## Behavior cloning (one-shot)
 
-```bash
-# 1. collect (state, action) demos with MPPI → data/acrobot_bc.h5
-python -m scripts.collect_bc_demos
+Cached pipeline: `collect_bc_demos` writes `data/<env>_bc.h5` and is a no-op
+if the file already exists (pass `--force` to re-collect). `test_sl` loads
+that h5 and produces a full run dir under `experiments/bc/` with config,
+per-epoch CSV log, best/final/iter checkpoints, loss curve, and an
+env-camera rollout video.
 
-# 2. train BC policy with MSE on policy mean
-python -m scripts.test_sl
+```bash
+# 1. collect (obs, action) demos with MPPI — cached by default
+python -m scripts.collect_bc_demos --env acrobot
+python -m scripts.collect_bc_demos --env hopper --auto-reset -M 30 -T 500
+python -m scripts.collect_bc_demos --env acrobot --force          # re-collect
+
+# 2. train BC (Gaussian MSE-on-mean, default)
+python -m scripts.test_sl --env acrobot --device auto
+
+# deterministic policy (direct action regression)
+python -m scripts.test_sl --env hopper --deterministic --device auto
+
+# warm-start from a prior BC / DAgger / GPS checkpoint
+python -m scripts.test_sl --env acrobot --device auto \
+    --init-ckpt experiments/bc/<run>/best.pt --num-epochs 30
+
+# quick smoke
+python -m scripts.test_sl --env acrobot --num-epochs 5 \
+    --eval-every 0 --n-eval-eps 3 --eval-ep-len 150 --device cpu
 ```
+
+`collect_bc_demos.py` flags:
+- `--env {acrobot,half_cheetah,hopper,point_mass}` — resolved via `make_env`.
+- `-M / --num-trajectories` (default 50), `-T / --trajectory-length` (default 1000).
+- `--out PATH` — override output path (default `data/<env>_bc.h5`).
+- `--force` — overwrite an existing cached dataset.
+- `--auto-reset` — on env termination, reset env+MPPI and keep collecting until
+  `T` steps are taken (recommended for hopper).
+- `--seed` — per-trajectory deterministic seeding (`seed + i`).
+
+`test_sl.py` flags:
+- `--env`, `--device auto|cpu|mps|cuda`.
+- `--deterministic` — use `DeterministicPolicy` instead of `GaussianPolicy`.
+- `--init-ckpt PATH` — wrapped or raw state_dict; must match `--deterministic`.
+- `--demos PATH` — override demo h5 (default `data/<env>_bc.h5`).
+- `--num-epochs`, `--batch-size`, `--val-frac` — standard BC knobs.
+- `--eval-every N` — env eval every N epochs (0 disables mid-training eval).
+- `--ckpt-every N` — save `iter_<epoch>.pt` every N epochs (best + final always saved).
+- `--n-eval-eps`, `--eval-ep-len` — eval rollout count / length.
+- `--exp-name`, `--exp-dir` — run-dir naming (parent default `experiments/bc`).
+
+Outputs (inside `experiments/bc/<timestamp>_<env>_<name>/`):
+- `config.json`, `bc_log.csv`, `loss.png`, `<env>.mp4`.
+- `iter_<epoch>.pt` — wrapped `{state_dict, policy_class, round, train_mse, val_mse, eval_*}`.
+- `best.pt` — copy of the best-val-mse epoch; `final.pt` — copy of the last saved iter.
 
 ## DAgger (MPPI-in-the-loop BC)
 

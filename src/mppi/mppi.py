@@ -9,12 +9,15 @@ from src.utils.math import (
 class MPPI:
     
     def __init__(self, env: BaseEnv, cfg: MPPIConfig):
-        self.env = env 
+        self.env = env
         self.cfg = cfg
-        self.K = cfg.K 
+        self.K = cfg.K
         self.H = cfg.H
         self.lam = cfg.lam
         self.sigma = cfg.noise_sigma
+        # open-loop chunk size: number of actions to execute per full replan.
+        # Clamp to [1, H] so the chunk always fits inside the nominal trajectory.
+        self.open_loop_steps = max(1, min(int(cfg.open_loop_steps), self.H))
 
         self.nu = env.action_dim
         self.act_low, self.act_high = env.action_bounds
@@ -29,18 +32,43 @@ class MPPI:
 
     def reset(self):
         self.U = np.zeros((self.H, self.nu))
+        # Cursor into the current open-loop chunk. 0 = next call must replan.
+        self._plan_cursor = 0
+        # Cached info from the last replan — returned on open-loop follow-up calls
+        # so `info['lam']` etc. remain meaningful instead of going stale/NaN.
+        self._last_info: dict | None = None
 
     def plan_step(
-            self, 
-            state: np.ndarray, 
+            self,
+            state: np.ndarray,
             prior = None,
     ) -> tuple[np.ndarray, dict]:
         """running one MPPI iteration
-        state: current environment state 
+        state: current environment state
         prior: this is an optional callable (states, actions) -> log_prob (K, )
+
+        Open-loop cadence: only every `open_loop_steps`-th call does a full MPPI
+        replan (sample/rollout/weights/update). Intermediate calls return the next
+        action from the already-planned nominal `U` and skip the expensive work.
+        When the chunk is exhausted, `U` is shifted left by `open_loop_steps` so
+        the next replan uses a correctly-aligned warm start.
         """
+        # --- Open-loop follow-up: serve the next action from the current plan.
+        # No rollout, no weight update. `prior` is ignored on these calls since
+        # it's only meaningful during the weight computation of a replan.
+        if self._plan_cursor > 0:
+            action = self.U[self._plan_cursor].copy()
+            self._plan_cursor += 1
+            if self._plan_cursor >= self.open_loop_steps:
+                self._shift_horizon(self.open_loop_steps)
+                self._plan_cursor = 0
+            info = dict(self._last_info) if self._last_info is not None else {}
+            info["replanned"] = False
+            return action, info
+
+        # --- Full replan path ---
         # sample from q = N(U_nominal, sigma^2 I)
-        # noise is eps 
+        # noise is eps
         eps = np.random.randn(self.K, self.H, self.nu) * self.sigma
         U_perturbed = self.U[None, :, :] + eps
 
@@ -85,15 +113,20 @@ class MPPI:
         # compute the weighted mean (weight raw perturbations to avoid clipping bias)
         self.U = self.U + np.einsum('k, kha -> ha', weights, eps)
         self.U = np.clip(self.U, self.act_low, self.act_high)
-        
-        # extract action 
+
+        # extract the first action of the newly planned chunk
         action = self.U[0].copy()
 
-        # shift horizon 
-        self.U[:-1] = self.U[1:]
-        self.U[-1] = self.U[-2].copy()
+        # Advance the cursor. If open_loop_steps == 1 this also triggers the
+        # (legacy) shift-by-1 so next replan's warm start is identical to the
+        # pre-open-loop behaviour. For open_loop_steps > 1, subsequent calls
+        # will serve U[1..N-1] before the shift-by-N fires.
+        self._plan_cursor = 1
+        if self._plan_cursor >= self.open_loop_steps:
+            self._shift_horizon(self.open_loop_steps)
+            self._plan_cursor = 0
 
-        # store for GPS 
+        # store for GPS
         self._last_states = states
         self._last_actions = U_clipped
         self._last_weights = weights
@@ -101,12 +134,28 @@ class MPPI:
         self._last_sensordata = sensordata
 
         info = {
-            'cost_mean': np.mean(costs),
-            'cost_min': np.min(costs),
+            'cost_mean': float(np.mean(costs)),
+            'cost_min': float(np.min(costs)),
             # 'n_eff': n_eff,
-            'lam': lam,
+            'lam': float(lam),
+            'replanned': True,
         }
+        self._last_info = info
         return action, info
+
+    def _shift_horizon(self, shift: int) -> None:
+        """Shift the nominal trajectory left by `shift` steps, repeating the
+        last action to pad. Keeps warm-start consistent after executing an
+        open-loop chunk of `shift` actions."""
+        if shift <= 0:
+            return
+        if shift >= self.H:
+            # Whole horizon consumed — reset to a zero trajectory rather than
+            # repeating a single stale action H times.
+            self.U[:] = 0.0
+            return
+        self.U[:-shift] = self.U[shift:]
+        self.U[-shift:] = self.U[-shift - 1]
     
     def get_rollout_data(self) -> dict:
         return {
