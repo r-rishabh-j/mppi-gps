@@ -48,7 +48,7 @@ class GPSConfig:
     badmm_step_size: float = 2.0
     policy_augmented_alpha: float = 0.1 # weight on -log π(u|x) in MPPI cost (Eq 5)
     distill_batch_size: int = 256   # mini-batch size for policy distillation
-    distill_epochs: int = 10         # gradient epochs per GPS iteration
+    distill_epochs: int = 30         # gradient epochs per GPS iteration
     warm_start_policy: bool = False  # warm-start MPPI nominal U from policy rollout
     disable_kl_constraint: bool = False  # if True: skip KL/BADMM, keep nu fixed at badmm_init_nu,
                                          # i.e. run MPPI with a policy prior of weight alpha*nu (const),

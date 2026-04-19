@@ -5,5 +5,5 @@
   "H": 256,
   "adaptive_lam": false,
   "n_eff_threshold": 128,
-  "open_loop_steps": 4
+  "open_loop_steps": 2
 }

@@ -8,9 +8,7 @@ import torch
 from src.envs.hopper import Hopper
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
-
-np.random.seed(420)
-torch.manual_seed(420)
+from src.utils.seeding import add_seed_arg, seed_everything
 
 T = 1000
 
@@ -19,7 +17,9 @@ def main():
     parser.add_argument("--live", action="store_true", help="interactive viewer instead of recording")
     parser.add_argument("--cost-mode", default="v2", choices=["v1", "v2"],
                         help="hopper running cost: original v1 or dm_control-style v2")
+    add_seed_arg(parser, default=42)
     args = parser.parse_args()
+    seed_everything(args.seed)
 
     env = Hopper(cost_mode=args.cost_mode)
     cfg = MPPIConfig.load("hopper")

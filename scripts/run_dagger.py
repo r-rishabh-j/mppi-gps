@@ -30,6 +30,7 @@ from src.policy.deterministic_policy import DeterministicPolicy
 from src.utils.config import DAggerConfig, MPPIConfig, PolicyConfig
 from src.utils.device import pick_device
 from src.utils.evaluation import evaluate_mppi, evaluate_policy
+from src.utils.seeding import seed_everything
 from src.utils.experiment import (
     copy_as,
     git_sha,
@@ -97,7 +98,7 @@ def main() -> None:
     device = pick_device(args.device)
     print(f"policy device: {device}")
 
-    torch.manual_seed(cfg.seed)
+    seed_everything(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
     env = make_env(args.env)

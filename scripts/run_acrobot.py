@@ -1,11 +1,18 @@
+import argparse
 import mujoco
 import numpy as np
 
 from src.envs.acrobot import Acrobot
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
+from src.utils.seeding import add_seed_arg, seed_everything
 
 def main():
+    parser = argparse.ArgumentParser()
+    add_seed_arg(parser, default=0)
+    args = parser.parse_args()
+    seed_everything(args.seed)
+
     env = Acrobot()
     cfg = MPPIConfig.load("acrobot")
     controller = MPPI(env, cfg)

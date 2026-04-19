@@ -25,6 +25,8 @@ import gymnasium as gym
 from pathlib import Path
 from stable_baselines3 import SAC, PPO
 
+from src.utils.seeding import seed_everything
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -72,6 +74,9 @@ def evaluate(model, env_id: str, n_episodes: int, episode_len: int, seed: int) -
 
 def main():
     args = parse_args()
+    # Seed numpy/torch/random *before* constructing env/model; SB3's
+    # `seed=` kwarg only covers its own internal RNGs, not ours.
+    seed_everything(args.seed)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 

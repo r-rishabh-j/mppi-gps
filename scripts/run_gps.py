@@ -32,6 +32,7 @@ from src.mppi.mppi import MPPI
 from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
 from src.utils.device import pick_device
 from src.utils.evaluation import evaluate_mppi, evaluate_policy
+from src.utils.seeding import seed_everything
 from src.utils.experiment import (
     copy_as,
     git_sha,
@@ -89,8 +90,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    seed_everything(args.seed)
 
     env = make_env(args.env)
 

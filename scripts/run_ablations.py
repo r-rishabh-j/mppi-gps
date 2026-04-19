@@ -33,6 +33,7 @@ from src.utils.config import MPPIConfig, PolicyConfig, GPSConfig
 from src.utils.evaluation import evaluate_policy, evaluate_mppi
 from src.mppi.mppi import MPPI
 from src.envs import make_env as _make_env
+from src.utils.seeding import seed_everything
 
 
 def make_env(name: str):
@@ -51,8 +52,7 @@ def run_gps_trial(env_name, gps_overrides: dict, seed: int, eval_len: int = 500,
     Returns:
         Dict with GPS cost, MPPI cost, KL, loss, training time, and cost curve.
     """
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    seed_everything(seed)
 
     env = make_env(env_name)
     mppi_cfg = MPPIConfig.load(env_name)
@@ -181,8 +181,7 @@ def main():
     for K in [128, 256, 512]:
         print(f"\nK={K}")
         overrides = {**base_overrides}
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+        seed_everything(args.seed)
         env = make_env(args.env)
         mppi_cfg = MPPIConfig.load(args.env)
         mppi_cfg.K = K  # override sample count

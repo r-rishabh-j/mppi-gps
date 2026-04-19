@@ -18,57 +18,41 @@ python -m scripts.run_mppi           # generic entry
 
 ## Behavior cloning (one-shot)
 
-Cached pipeline: `collect_bc_demos` writes `data/<env>_bc.h5` and is a no-op
-if the file already exists (pass `--force` to re-collect). `test_sl` loads
-that h5 and produces a full run dir under `experiments/bc/` with config,
-per-epoch CSV log, best/final/iter checkpoints, loss curve, and an
-env-camera rollout video.
+Two-step pipeline: **collect** MPPI demos to `data/<env>_bc.h5` (cached —
+re-running is a no-op unless `--force`), then **train** a policy on that
+h5 into a run dir under `experiments/bc/<timestamp>_<env>_<name>/`
+(config.json, per-epoch csv, best/final/iter checkpoints, loss curve, mp4).
 
 ```bash
-# 1. collect (obs, action) demos with MPPI — cached by default
+# Acrobot — Gaussian policy (MSE on mean)
 python -m scripts.collect_bc_demos --env acrobot
-python -m scripts.collect_bc_demos --env hopper --auto-reset -M 30 -T 500
-python -m scripts.collect_bc_demos --env acrobot --force          # re-collect
-
-# 2. train BC (Gaussian MSE-on-mean, default)
 python -m scripts.test_sl --env acrobot --device auto
 
-# deterministic policy (direct action regression)
+# Hopper — terminating env → --auto-reset on collection; deterministic policy
+python -m scripts.collect_bc_demos --env hopper --auto-reset -M 30 -T 500
 python -m scripts.test_sl --env hopper --deterministic --device auto
 
-# warm-start from a prior BC / DAgger / GPS checkpoint
+# Re-collect a cached dataset after an env / reward change
+python -m scripts.collect_bc_demos --env acrobot --force
+
+# Warm-start from any wrapped BC / DAgger / GPS checkpoint
 python -m scripts.test_sl --env acrobot --device auto \
     --init-ckpt experiments/bc/<run>/best.pt --num-epochs 30
 
-# quick smoke
+# Fast smoke (CPU, ~1 min)
 python -m scripts.test_sl --env acrobot --num-epochs 5 \
     --eval-every 0 --n-eval-eps 3 --eval-ep-len 150 --device cpu
 ```
 
-`collect_bc_demos.py` flags:
-- `--env {acrobot,half_cheetah,hopper,point_mass}` — resolved via `make_env`.
-- `-M / --num-trajectories` (default 50), `-T / --trajectory-length` (default 1000).
-- `--out PATH` — override output path (default `data/<env>_bc.h5`).
-- `--force` — overwrite an existing cached dataset.
-- `--auto-reset` — on env termination, reset env+MPPI and keep collecting until
-  `T` steps are taken (recommended for hopper).
-- `--seed` — per-trajectory deterministic seeding (`seed + i`).
+Key flags (run with `--help` for the full list):
+- **collect_bc_demos** — `--env`, `-M / --num-trajectories`, `-T / --trajectory-length`,
+  `--out`, `--force`, `--auto-reset`, `--seed`.
+- **test_sl** — `--env`, `--device`, `--deterministic`, `--init-ckpt`, `--demos`,
+  `--num-epochs`, `--batch-size`, `--val-frac`, `--eval-every`, `--ckpt-every`,
+  `--n-eval-eps`, `--eval-ep-len`, `--exp-name`, `--exp-dir`.
 
-`test_sl.py` flags:
-- `--env`, `--device auto|cpu|mps|cuda`.
-- `--deterministic` — use `DeterministicPolicy` instead of `GaussianPolicy`.
-- `--init-ckpt PATH` — wrapped or raw state_dict; must match `--deterministic`.
-- `--demos PATH` — override demo h5 (default `data/<env>_bc.h5`).
-- `--num-epochs`, `--batch-size`, `--val-frac` — standard BC knobs.
-- `--eval-every N` — env eval every N epochs (0 disables mid-training eval).
-- `--ckpt-every N` — save `iter_<epoch>.pt` every N epochs (best + final always saved).
-- `--n-eval-eps`, `--eval-ep-len` — eval rollout count / length.
-- `--exp-name`, `--exp-dir` — run-dir naming (parent default `experiments/bc`).
-
-Outputs (inside `experiments/bc/<timestamp>_<env>_<name>/`):
-- `config.json`, `bc_log.csv`, `loss.png`, `<env>.mp4`.
-- `iter_<epoch>.pt` — wrapped `{state_dict, policy_class, round, train_mse, val_mse, eval_*}`.
-- `best.pt` — copy of the best-val-mse epoch; `final.pt` — copy of the last saved iter.
+Run-dir contents: `config.json`, `bc_log.csv`, `loss.png`, `<env>.mp4`,
+wrapped `iter_<epoch>.pt` checkpoints, plus `best.pt` (best-val-mse) and `final.pt`.
 
 ## DAgger (MPPI-in-the-loop BC)
 
@@ -237,6 +221,4 @@ python -m scripts.visualisation.plot_results --env acrobot
 ### Bookeeping for experiments
 
 #### Hopper MPPI GPS
-python -m scripts.run_gps --env hopper --auto-reset \
-    --disable-kl --distill-loss nll --alpha 0.1 --nu 1.0 \
-    --gps-iters 10 --episode-length 200 --device auto --exp-name hopper_autoreset
+python -m scripts.run_gps --env hopper --auto-reset --disable-kl --distill-loss nll --alpha 0.5 --nu 1.0  --gps-iters 20 --episode-length 1000 --device auto --exp-name hopper_autoreset --num-conditions 2

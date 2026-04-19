@@ -1,12 +1,19 @@
-import numpy as np 
+import argparse
+import numpy as np
 from src.envs.half_cheetah import HalfCheetah
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
-import gymnasium as gym 
+from src.utils.seeding import add_seed_arg, seed_everything
+import gymnasium as gym
 import mujoco
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    add_seed_arg(parser, default=0)
+    args = parser.parse_args()
+    seed_everything(args.seed)
+
     env = HalfCheetah()
     cfg = MPPIConfig(K=1024, H=20, lam=0.025187910703501223, noise_sigma=0.35180969970545684, adaptive_lam=False)
     controller = MPPI(env, cfg)
