@@ -75,9 +75,16 @@ def parse_args():
     p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda (policy only)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--n-eval", type=int, default=10,
-                   help="Number of evaluation episodes")
+                   help="Number of evaluation episodes for the final eval "
+                        "(end-of-training comparison against MPPI).")
     p.add_argument("--eval-len", type=int, default=500,
-                   help="Max steps per evaluation episode")
+                   help="Max steps per evaluation episode (final eval + in-loop eval).")
+    p.add_argument("--n-eval-train", type=int, default=None,
+                   help="Episodes for the per-iter policy eval that picks best.pt "
+                        "(default from GPSConfig.n_eval_eps).")
+    p.add_argument("--eval-every", type=int, default=None,
+                   help="Run the per-iter policy eval every N iterations "
+                        "(default from GPSConfig.eval_every). Last iter is always evaluated.")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint (wrapped or raw state_dict) "
                         "to load into gps.policy before the training loop")
@@ -116,6 +123,12 @@ def main():
         gps_cfg.auto_reset = True
     if args.warm_start_policy:
         gps_cfg.warm_start_policy = True
+    if args.n_eval_train is not None:
+        gps_cfg.n_eval_eps = args.n_eval_train
+    if args.eval_every is not None:
+        gps_cfg.eval_every = args.eval_every
+    if args.eval_len is not None:
+        gps_cfg.eval_ep_len = args.eval_len
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
@@ -174,7 +187,8 @@ def main():
     save_checkpoint(
         final_path, gps.policy,
         iteration=gps_cfg.num_iterations - 1,
-        mean_cost=history.iteration_costs[-1] if history.iteration_costs else None,
+        mppi_cost=history.iteration_costs[-1] if history.iteration_costs else None,
+        eval_cost=history.iteration_eval_costs[-1] if history.iteration_eval_costs else None,
     )
     print(f"\nsaved final policy checkpoint to {final_path}")
     if history.best_iter >= 0:
@@ -186,7 +200,8 @@ def main():
     # ---- Save learning curves as JSON ----
     curves_path = run_dir / "curves.json"
     curves_path.write_text(json.dumps({
-        "costs": history.iteration_costs,
+        "mppi_costs": history.iteration_costs,
+        "eval_costs": history.iteration_eval_costs,
         "kl": history.iteration_kl,
         "nu": history.iteration_nu,
         "distill_loss": history.distill_losses,
@@ -196,10 +211,17 @@ def main():
     # ---- Plot learning curves ----
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
 
-    axes[0].plot(history.iteration_costs)
+    iters = np.arange(len(history.iteration_costs))
+    axes[0].plot(iters, history.iteration_costs, label="MPPI C-step", alpha=0.6)
+    eval_arr = np.array(history.iteration_eval_costs, dtype=float)
+    eval_mask = ~np.isnan(eval_arr)
+    if eval_mask.any():
+        axes[0].plot(iters[eval_mask], eval_arr[eval_mask],
+                     marker="o", linewidth=2, label="policy eval (selects best)")
     axes[0].set_xlabel("GPS iteration")
     axes[0].set_ylabel("mean episode cost")
     axes[0].set_title("Cost")
+    axes[0].legend()
 
     axes[1].plot(history.iteration_kl)
     axes[1].axhline(gps_cfg.kl_target, color="r", linestyle="--", label="target")

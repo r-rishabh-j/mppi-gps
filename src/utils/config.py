@@ -43,9 +43,9 @@ class GPSConfig:
     episode_length: int = 500       # steps per episode during GPS training
     kl_estimator: str = "moment_matched" # "moment_matched" (Eq 3): fits Gaussian to MPPI samples, closed-form KL — stable but unimodal
     # "sample_based" (Eq 4): estimates KL directly from weighted particles variance
-    kl_target: float = 1.0          # target KL for BADMM dual update
+    kl_target: float = 10.0          # target KL for BADMM dual update
     badmm_init_nu: float = 1.0     # initial dual variable (penalizes KL between MPPI and policy)
-    badmm_step_size: float = 2.0
+    badmm_step_size: float = 1.0
     policy_augmented_alpha: float = 0.1 # weight on -log π(u|x) in MPPI cost (Eq 5)
     distill_batch_size: int = 256   # mini-batch size for policy distillation
     distill_epochs: int = 30         # gradient epochs per GPS iteration
@@ -58,6 +58,16 @@ class GPSConfig:
                                     # reset to a fresh random init and keep collecting until
                                     # episode_length steps are taken. Required for terminating
                                     # envs like hopper; otherwise dataset size collapses early.
+    # ---- Periodic policy evaluation during training ------------------------
+    # After the S-step of each iteration, roll out the (greedy) policy for
+    # `n_eval_eps` episodes of up to `eval_ep_len` steps and record its mean
+    # cost. `best.pt` is selected on this eval cost — NOT on the C-step MPPI
+    # rollout cost, which reflects the teacher (with policy prior), not the
+    # student. `eval_every=1` evaluates every iteration; set higher to skip.
+    # The final iteration is always evaluated.
+    n_eval_eps: int = 3
+    eval_ep_len: int = 800
+    eval_every: int = 1
 
 
 @dataclass

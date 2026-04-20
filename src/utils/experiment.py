@@ -103,7 +103,7 @@ def load_checkpoint(path: str | Path, map_location: Any = None) -> dict:
     Back-compat: if the file is a raw state_dict (legacy), wraps it as
     {"state_dict": blob} with no policy_class.
     """
-    blob = torch.load(path, map_location=map_location)
+    blob = torch.load(path, map_location=map_location, weights_only=False)
     if isinstance(blob, dict) and "state_dict" in blob:
         return blob
     return {"state_dict": blob}

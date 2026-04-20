@@ -25,6 +25,7 @@ from src.envs.base import BaseEnv
 from src.mppi.mppi import MPPI
 from src.policy.gaussian_policy import GaussianPolicy
 from src.utils.config import MPPIConfig, PolicyConfig, GPSConfig
+from src.utils.evaluation import evaluate_policy
 from src.utils.experiment import copy_as, save_checkpoint
 from src.utils.math import weighted_mean_cov
 
@@ -240,7 +241,11 @@ def compute_kl_sample_based(
 @dataclass
 class GPSHistory:
     """Training metrics collected during GPS, one entry per iteration."""
-    iteration_costs: list[float] = field(default_factory=list)   # mean episode cost
+    # Mean C-step MPPI rollout cost (teacher-under-policy-prior) — diagnostic only.
+    iteration_costs: list[float] = field(default_factory=list)
+    # Greedy-policy eval cost; NaN on iterations where evaluation was skipped.
+    # This is what `best.pt` is selected on.
+    iteration_eval_costs: list[float] = field(default_factory=list)
     iteration_kl: list[float] = field(default_factory=list)      # mean KL across conditions
     iteration_nu: list[float] = field(default_factory=list)      # BADMM dual variable
     distill_losses: list[float] = field(default_factory=list)    # last distillation loss
@@ -427,8 +432,10 @@ class MPPIGPS:
         Args:
             num_iterations: Override for gps_cfg.num_iterations.
             run_dir: If set, save per-iter wrapped checkpoints as
-                `{run_dir}/iter_{k:03d}.pt` and copy the best-by-eval to
-                `{run_dir}/best.pt`.
+                `{run_dir}/iter_{k:03d}.pt` and copy the best-by-policy-eval
+                to `{run_dir}/best.pt`. "Best" is decided from the greedy
+                policy's eval cost (see `gps_cfg.n_eval_eps` / `eval_ep_len`
+                / `eval_every`), not from the C-step MPPI rollout cost.
         Returns:
             GPSHistory with per-iteration metrics.
         """
@@ -595,11 +602,34 @@ class MPPIGPS:
                 self._update_badmm(kl_mean)
 
             # ========== Logging ==========
-            mean_cost = float(np.mean(condition_costs))
-            history.iteration_costs.append(mean_cost)
+            mppi_cost = float(np.mean(condition_costs))
+            history.iteration_costs.append(mppi_cost)
             history.iteration_kl.append(kl_mean)
             history.iteration_nu.append(self.nu)
             history.distill_losses.append(loss)
+
+            # ========== Policy evaluation (drives best-checkpoint selection) ==========
+            # We evaluate the student policy on fresh env resets and use THAT cost
+            # to pick best.pt. The C-step rollout cost above is the MPPI teacher
+            # under a policy prior — not a faithful measure of the student.
+            eval_every = max(int(getattr(cfg, "eval_every", 1)), 1)
+            is_last = (iteration == num_iterations - 1)
+            do_eval = is_last or ((iteration + 1) % eval_every == 0)
+
+            eval_cost = float("nan")
+            if do_eval:
+                was_training = self.policy.training
+                self.policy.eval()
+                eval_stats = evaluate_policy(
+                    self.policy, self.env,
+                    n_episodes=cfg.n_eval_eps,
+                    episode_len=cfg.eval_ep_len,
+                    seed=iteration,  # vary conditions across iters but deterministic per-iter
+                )
+                if was_training:
+                    self.policy.train()
+                eval_cost = float(eval_stats["mean_cost"])
+            history.iteration_eval_costs.append(eval_cost)
 
             # ========== Checkpointing ==========
             if run_dir is not None:
@@ -607,30 +637,40 @@ class MPPIGPS:
                 save_checkpoint(
                     iter_path, self.policy,
                     iteration=iteration,
-                    mean_cost=mean_cost,
+                    mppi_cost=mppi_cost,
+                    eval_cost=eval_cost,
                     distill_loss=loss,
                     kl=kl_mean,
                     nu=self.nu,
                 )
-                if mean_cost < history.best_cost:
-                    history.best_cost = mean_cost
+                # Best is selected on eval cost only (NaN comparisons are false,
+                # so skipped-eval iters never overwrite best.pt).
+                if do_eval and eval_cost < history.best_cost:
+                    history.best_cost = eval_cost
                     history.best_iter = iteration
                     copy_as(iter_path, run_dir / "best.pt")
 
-            outer_bar.set_postfix(
-                cost=f"{mean_cost:.2f}",
-                loss=f"{loss:.3f}",
-                kl=f"{kl_mean:.3f}",
-                nu=f"{self.nu:.3f}",
-                best=history.best_iter if history.best_iter >= 0 else "-",
-            )
-            tqdm.write(
+            postfix = {
+                "mppi_cost": f"{mppi_cost:.2f}",
+                "loss": f"{loss:.3f}",
+                "kl": f"{kl_mean:.3f}",
+                "nu": f"{self.nu:.3f}",
+                "best": history.best_iter if history.best_iter >= 0 else "-",
+            }
+            if do_eval:
+                postfix["eval_cost"] = f"{eval_cost:.2f}"
+            outer_bar.set_postfix(**postfix)
+
+            base_line = (
                 f"[GPS iter {iteration:3d}]  "
-                f"cost={mean_cost:8.2f}  "
+                f"mppi_cost={mppi_cost:8.2f}  "
                 f"distill_loss={loss:.4f}  "
                 f"kl={kl_mean:.4f}  "
                 f"nu={self.nu:.4f}"
             )
+            if do_eval:
+                base_line += f"  eval_cost={eval_cost:8.2f}"
+            tqdm.write(base_line)
 
         outer_bar.close()
         return history
