@@ -349,7 +349,7 @@ class MPPIGPS:
             for start in range(0, N, cfg.distill_batch_size):
                 batch = indices[start : start + cfg.distill_batch_size]
                 if cfg.distill_loss == "mse":
-                    last_loss = self.policy.mse_step(obs, actions)
+                    last_loss = self.policy.mse_step(obs[batch], actions[batch])
                 else:
                     # train_weighted computes -Σ w log π / Σ w  and does one Adam step
                     last_loss = self.policy.train_weighted(
@@ -535,18 +535,21 @@ class MPPIGPS:
                     episode_cost += cost
                     c_bar.update(1)
 
-                    # TODO: DO we really need such done handling?
-                    # if done:
-                    #     if cfg.auto_reset and t < cfg.episode_length - 1:
-                    #         # Terminating env (hopper, etc.): re-seed to a fresh random init
-                    #         # and keep collecting until we've taken episode_length steps.
-                    #         # MPPI nominal U is also reset so it doesn't carry post-fall state.
-                    #         self.env.reset()
-                    #         self.mppi.reset()
-                    #         continue
-                    #     # Short-circuited: pad the bar so the total stays consistent.
-                    #     c_bar.update(cfg.episode_length - (t + 1))
-                    #     break
+                    if done and t < cfg.episode_length - 1:
+                        if cfg.auto_reset:
+                            # Terminating env (hopper, etc.): re-seed to a fresh random
+                            # init and keep collecting until episode_length steps are
+                            # taken. MPPI nominal U is also reset so it doesn't carry
+                            # post-fall state. Without this, the C-step would keep
+                            # stepping MuJoCo from a fallen state and the S-step would
+                            # distill on mostly-post-fall (obs, action) pairs.
+                            self.env.reset()
+                            self.mppi.reset()
+                            continue
+                        # No auto_reset: cut the episode short here. Pad the progress
+                        # bar so totals stay consistent.
+                        c_bar.update(cfg.episode_length - (t + 1))
+                        break
 
                 # Store this condition's data for distillation.
                 # We use uniform weights on the executed actions (simple SL).

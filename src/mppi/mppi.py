@@ -92,23 +92,26 @@ class MPPI:
         # compute weights
         lam = self.lam
         weights = compute_weights(costs, lam, log_prior, log_proposal)
-        self._last_weights = weights
         n_eff = effective_sample_size(weights)
 
-        # you want to make sure that the weights don't collapse aka lambda is not too small 
+        # you want to make sure that the weights don't collapse aka lambda is not too small
         # if lambda is small then the policy isn't exploring
         if self.cfg.adaptive_lam:
             for _ in range(5):
                 if n_eff < self.cfg.n_eff_threshold:
                     lam *= 2.0
                 elif n_eff > 0.75 * self.K:
-                    lam *= 0.5 
+                    lam *= 0.5
                 else:
-                    break 
+                    break
                 lam = np.clip(lam, 0.01, 100.0)
                 weights = compute_weights(costs, lam, log_prior, log_proposal)
                 n_eff = effective_sample_size(weights)
-            self.lam = lam 
+            self.lam = lam
+
+        # Store final (post-adaptation) weights so GPS KL estimation sees the
+        # same distribution MPPI actually used to update U.
+        self._last_weights = weights
 
         # compute the weighted mean (weight raw perturbations to avoid clipping bias)
         self.U = self.U + np.einsum('k, kha -> ha', weights, eps)

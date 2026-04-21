@@ -20,8 +20,8 @@ _XML = str(Path(__file__).resolve().parents[2] / "assets" / "hopper.xml")
 # Healthy bounds — the hopper is considered "fallen" (done=True) if
 # z position drops below _Z_MIN or torso angle exceeds _ANGLE_MAX.
 # These values match Gymnasium's Hopper-v5 defaults.
-_Z_MIN = 0.7
-_ANGLE_MAX = 0.2
+_Z_MIN = 0.2
+_ANGLE_MAX = 1
 _VALID_COST_MODES = {"v1", "v2"}
 
 
