@@ -299,6 +299,12 @@ class MPPIGPS:
         # (we reset its nominal U between conditions).
         self.mppi = MPPI(env, mppi_cfg)
 
+        # Cross-iteration episode replay buffer. Each entry is one whole
+        # sub-episode (dict with 'obs', 'actions', 'weights'), physically
+        # contiguous (split at every `done` boundary during C-step). Empty
+        # and unused when `gps_cfg.episode_buffer_cap == 0`.
+        self._episode_buffer: list[dict] = []
+
     # ----- helpers ---------------------------------------------------------
 
     def _sample_initial_conditions(self, n: int) -> list[np.ndarray]:
@@ -501,11 +507,31 @@ class MPPIGPS:
                 # Reset environment to this initial condition
                 self.env.reset(state=ic_state)
 
-                episode_obs = []
-                episode_actions = []
+                # --- Sub-episode accumulators (one sub-episode closes at each
+                #     `done`; without auto_reset there's exactly one sub-episode
+                #     per condition). Each closed sub-episode is a contiguous
+                #     slice of (obs, action) — never spans a reset.
+                condition_sub_episodes: list[dict] = []
+                cur_obs: list[np.ndarray] = []
+                cur_actions: list[np.ndarray] = []
+                # KL data stays aggregated per-condition (the KL estimator
+                # consumes a flat per-timestep list); sub-episode boundaries
+                # don't matter for the KL average.
                 episode_kl_actions = []   # per-timestep: (K, act_dim)
                 episode_kl_weights = []   # per-timestep: (K,)
+                episode_obs_for_kl: list[np.ndarray] = []  # per-timestep obs
                 episode_cost = 0.0
+
+                def _flush_sub_episode():
+                    if not cur_obs:
+                        return
+                    condition_sub_episodes.append({
+                        "obs": np.array(cur_obs),
+                        "actions": np.array(cur_actions),
+                        "weights": np.ones(len(cur_obs)),
+                    })
+                    cur_obs.clear()
+                    cur_actions.clear()
 
                 for t in range(cfg.episode_length):
                     state = self.env.get_state()
@@ -516,8 +542,8 @@ class MPPIGPS:
                     # returns the weighted-mean action.
                     action, info = self.mppi.plan_step(state, prior=prior_fn)
 
-                    episode_obs.append(obs.copy())
-                    episode_actions.append(action.copy())  # the executed action
+                    cur_obs.append(obs.copy())
+                    cur_actions.append(action.copy())  # the executed action
 
                     if not skip_kl:
                         # Retrieve the K rollout samples for KL computation.
@@ -529,6 +555,7 @@ class MPPIGPS:
                         weights = np.array(rollout_data['weights'])
                         episode_kl_actions.append(first_step_actions)
                         episode_kl_weights.append(weights)
+                        episode_obs_for_kl.append(obs.copy())
 
                     # Step the environment with the MPPI-chosen action
                     _, cost, done, _ = self.env.step(action)
@@ -536,6 +563,9 @@ class MPPIGPS:
                     c_bar.update(1)
 
                     if done and t < cfg.episode_length - 1:
+                        # Close the current sub-episode BEFORE resetting so its
+                        # contents reflect a single contiguous rollout.
+                        _flush_sub_episode()
                         if cfg.auto_reset:
                             # Terminating env (hopper, etc.): re-seed to a fresh random
                             # init and keep collecting until episode_length steps are
@@ -551,18 +581,34 @@ class MPPIGPS:
                         c_bar.update(cfg.episode_length - (t + 1))
                         break
 
-                # Store this condition's data for distillation.
-                # We use uniform weights on the executed actions (simple SL).
-                # The "teacher" action at each step is the MPPI weighted mean.
-                all_obs.append(np.array(episode_obs))
-                all_actions.append(np.array(episode_actions))
-                all_weights.append(np.ones(len(episode_obs)))
-                
+                # Flush the tail sub-episode (the loop's last chunk, whether
+                # it ran to `episode_length` or ended on the break above).
+                _flush_sub_episode()
+
+                # Route this condition's sub-episodes either into the buffer
+                # (DAgger-style cross-iteration replay) or into the per-iter
+                # lists (current on-policy-per-iter behaviour).
+                if cfg.episode_buffer_cap > 0:
+                    for sub_ep in condition_sub_episodes:
+                        self._episode_buffer.append(sub_ep)
+                    # FIFO eviction — drop whole episodes from the front until
+                    # the buffer is back within the cap.
+                    while len(self._episode_buffer) > cfg.episode_buffer_cap:
+                        self._episode_buffer.pop(0)
+                else:
+                    for sub_ep in condition_sub_episodes:
+                        all_obs.append(sub_ep["obs"])
+                        all_actions.append(sub_ep["actions"])
+                        all_weights.append(sub_ep["weights"])
+
                 if not skip_kl:
-                    # Store per-timestep MPPI sample data for KL computation
+                    # Store per-timestep MPPI sample data for KL computation.
+                    # KL is always current-iter-only regardless of the distill
+                    # buffer (we want KL(MPPI_now || policy_now), not against
+                    # stale rollouts).
                     all_kl_actions.append(episode_kl_actions)
                     all_kl_weights.append(episode_kl_weights)
-                    all_kl_obs.append(episode_obs)
+                    all_kl_obs.append(episode_obs_for_kl)
 
                 condition_costs.append(episode_cost)
                 c_bar.set_postfix(
@@ -572,10 +618,20 @@ class MPPIGPS:
             c_bar.close()
 
             # ========== S-STEP: Distill into policy ==========
-            # Concatenate data from all conditions into flat arrays
-            obs_flat = np.concatenate(all_obs, axis=0)    # (total_steps, obs_dim)
-            act_flat = np.concatenate(all_actions, axis=0) # (total_steps, act_dim)
-            w_flat = np.concatenate(all_weights, axis=0)   # (total_steps,)
+            # Pull training data from either the cross-iteration buffer
+            # (DAgger-style replay) or the current iteration's per-condition
+            # lists. `episode_buffer_cap == 0` → current per-iter behaviour.
+            if cfg.episode_buffer_cap > 0:
+                obs_flat = np.concatenate(
+                    [ep["obs"] for ep in self._episode_buffer], axis=0)
+                act_flat = np.concatenate(
+                    [ep["actions"] for ep in self._episode_buffer], axis=0)
+                w_flat = np.concatenate(
+                    [ep["weights"] for ep in self._episode_buffer], axis=0)
+            else:
+                obs_flat = np.concatenate(all_obs, axis=0)     # (total_steps, obs_dim)
+                act_flat = np.concatenate(all_actions, axis=0)  # (total_steps, act_dim)
+                w_flat = np.concatenate(all_weights, axis=0)    # (total_steps,)
 
             # Multiple epochs of mini-batch gradient descent
             loss = self._distill_epoch(obs_flat, act_flat, w_flat)
@@ -671,6 +727,10 @@ class MPPIGPS:
                 f"kl={kl_mean:.4f}  "
                 f"nu={self.nu:.4f}"
             )
+            if cfg.episode_buffer_cap > 0:
+                n_eps = len(self._episode_buffer)
+                n_rows = sum(len(ep["obs"]) for ep in self._episode_buffer)
+                base_line += f"  buf={n_eps}eps/{n_rows}rows"
             if do_eval:
                 base_line += f"  eval_cost={eval_cost:8.2f}"
             tqdm.write(base_line)

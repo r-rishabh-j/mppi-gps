@@ -68,6 +68,14 @@ class GPSConfig:
     n_eval_eps: int = 3
     eval_ep_len: int = 800
     eval_every: int = 1
+    # ---- Cross-iteration episode replay buffer -----------------------------
+    # 0 = disabled (current per-iter behaviour: data discarded after S-step).
+    # >0 = keep this many most-recent sub-episodes across GPS iterations and
+    # distill from the aggregated buffer (DAgger-style). Sub-episodes split at
+    # each `done` boundary, so with auto_reset=True a single condition can
+    # contribute many variable-length sub-episodes. FIFO eviction — oldest
+    # whole episode popped first when len(buffer) exceeds the cap.
+    episode_buffer_cap: int = 0
 
 
 @dataclass
