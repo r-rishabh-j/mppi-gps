@@ -85,11 +85,12 @@ def parse_args():
     p.add_argument("--eval-every", type=int, default=None,
                    help="Run the per-iter policy eval every N iterations "
                         "(default from GPSConfig.eval_every). Last iter is always evaluated.")
-    p.add_argument("--episode-buffer-cap", type=int, default=None,
-                   help="Keep the last N sub-episodes across GPS iterations and distill "
-                        "from the aggregated buffer (DAgger-style). 0/unset = no buffering. "
-                        "Sub-episodes split at each done boundary, so lengths vary with "
-                        "--auto-reset. FIFO eviction — oldest whole episode dropped first.")
+    p.add_argument("--distill-buffer-cap", type=int, default=None,
+                   help="Cross-iteration distillation buffer capacity, measured in "
+                        "(obs, action) rows (matches DAgger's --buffer-cap convention). "
+                        "0/unset = no buffering. Sub-episodes split at each done boundary, "
+                        "so lengths vary with --auto-reset. FIFO eviction — oldest WHOLE "
+                        "episode popped first until total rows ≤ cap.")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint (wrapped or raw state_dict) "
                         "to load into gps.policy before the training loop")
@@ -134,8 +135,8 @@ def main():
         gps_cfg.eval_every = args.eval_every
     if args.eval_len is not None:
         gps_cfg.eval_ep_len = args.eval_len
-    if args.episode_buffer_cap is not None:
-        gps_cfg.episode_buffer_cap = args.episode_buffer_cap
+    if args.distill_buffer_cap is not None:
+        gps_cfg.distill_buffer_cap = args.distill_buffer_cap
 
     device = pick_device(args.device)
     print(f"policy device: {device}")

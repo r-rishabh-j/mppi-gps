@@ -302,7 +302,7 @@ class MPPIGPS:
         # Cross-iteration episode replay buffer. Each entry is one whole
         # sub-episode (dict with 'obs', 'actions', 'weights'), physically
         # contiguous (split at every `done` boundary during C-step). Empty
-        # and unused when `gps_cfg.episode_buffer_cap == 0`.
+        # and unused when `gps_cfg.distill_buffer_cap == 0`.
         self._episode_buffer: list[dict] = []
 
     # ----- helpers ---------------------------------------------------------
@@ -588,13 +588,19 @@ class MPPIGPS:
                 # Route this condition's sub-episodes either into the buffer
                 # (DAgger-style cross-iteration replay) or into the per-iter
                 # lists (current on-policy-per-iter behaviour).
-                if cfg.episode_buffer_cap > 0:
+                if cfg.distill_buffer_cap > 0:
                     for sub_ep in condition_sub_episodes:
                         self._episode_buffer.append(sub_ep)
-                    # FIFO eviction — drop whole episodes from the front until
-                    # the buffer is back within the cap.
-                    while len(self._episode_buffer) > cfg.episode_buffer_cap:
-                        self._episode_buffer.pop(0)
+                    # FIFO eviction by rows — pop whole episodes from the front
+                    # until total rows ≤ cap. Mirror DAgger's guard
+                    # (`len(buffer) > 1`) so we never drop the *only* episode
+                    # even if it alone exceeds the cap; otherwise the S-step
+                    # would run with an empty buffer.
+                    total_rows = sum(len(ep["obs"]) for ep in self._episode_buffer)
+                    while (total_rows > cfg.distill_buffer_cap
+                           and len(self._episode_buffer) > 1):
+                        dropped = self._episode_buffer.pop(0)
+                        total_rows -= len(dropped["obs"])
                 else:
                     for sub_ep in condition_sub_episodes:
                         all_obs.append(sub_ep["obs"])
@@ -620,8 +626,8 @@ class MPPIGPS:
             # ========== S-STEP: Distill into policy ==========
             # Pull training data from either the cross-iteration buffer
             # (DAgger-style replay) or the current iteration's per-condition
-            # lists. `episode_buffer_cap == 0` → current per-iter behaviour.
-            if cfg.episode_buffer_cap > 0:
+            # lists. `distill_buffer_cap == 0` → current per-iter behaviour.
+            if cfg.distill_buffer_cap > 0:
                 obs_flat = np.concatenate(
                     [ep["obs"] for ep in self._episode_buffer], axis=0)
                 act_flat = np.concatenate(
@@ -727,7 +733,7 @@ class MPPIGPS:
                 f"kl={kl_mean:.4f}  "
                 f"nu={self.nu:.4f}"
             )
-            if cfg.episode_buffer_cap > 0:
+            if cfg.distill_buffer_cap > 0:
                 n_eps = len(self._episode_buffer)
                 n_rows = sum(len(ep["obs"]) for ep in self._episode_buffer)
                 base_line += f"  buf={n_eps}eps/{n_rows}rows"
