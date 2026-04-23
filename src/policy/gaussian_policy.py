@@ -72,7 +72,7 @@ class GaussianPolicy(nn.Module):
         layers = []
         in_dim = obs_dim
         for h in cfg.hidden_dims:
-            layers += [nn.Linear(in_dim, h), act_fn()]
+            layers += [nn.Linear(in_dim, h), act_fn(),nn.LayerNorm(h), nn.Dropout(0.1)]
             in_dim = h
         layers.append(nn.Linear(in_dim, 2 * act_dim))
         self.net = nn.Sequential(*layers)

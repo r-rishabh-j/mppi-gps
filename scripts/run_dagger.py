@@ -46,26 +46,26 @@ from src.gps.dagger import DAggerTrainer
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--env", default="acrobot")
-    p.add_argument("--dagger-iters", type=int, default=10)
+    p.add_argument("--dagger-iters", type=int, default=20)
     p.add_argument("--rollouts-per-iter", type=int, default=20)
-    p.add_argument("--episode-len", type=int, default=200)
+    p.add_argument("--episode-len", type=int, default=500)
     p.add_argument("--beta-schedule", default="linear", choices=["linear", "constant_zero"])
-    p.add_argument("--distill-epochs", type=int, default=20)
-    p.add_argument("--batch-size", type=int, default=4096)
-    p.add_argument("--buffer-cap", type=int, default=200_000)
+    p.add_argument("--distill-epochs", type=int, default=15)
+    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--buffer-cap", type=int, default=400_000)
     p.add_argument("--n-eval-eps", type=int, default=10)
     p.add_argument("--eval-ep-len", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
-    p.add_argument("--deterministic", action="store_true",
+    p.add_argument("--deterministic", action="store_true", default=True,
                    help="use DeterministicPolicy (direct action regression) instead of GaussianPolicy")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint to load before warmup / DAgger training")
     p.add_argument("--seed-from", default=None,
                    help="path to existing BC h5 (e.g. data/acrobot_bc.h5) to warm-start the buffer")
-    p.add_argument("--warmup-rollouts", type=int, default=0,
+    p.add_argument("--warmup-rollouts", type=int, default=30,
                    help="Pre-DAgger: collect this many pure-MPPI rollouts and BC-train the policy on them")
-    p.add_argument("--warmup-epochs", type=int, default=20,
+    p.add_argument("--warmup-epochs", type=int, default=50,
                    help="Epochs of BC pre-training on the warmup rollouts (ignored if --warmup-rollouts=0)")
     p.add_argument("--warmup-cache", default=None,
                    help="optional h5 path for warmup rollouts. If the file exists it's "
@@ -191,18 +191,18 @@ def main() -> None:
             print(f"  warmup train_mse: {losses[0]:.5f} → {losses[-1]:.5f}  "
                   f"(buf={trainer.buffer_size():,})")
 
-    # --- MPPI baseline (once, shared across iterations) ---
-    print("\nevaluating MPPI baseline...")
-    mppi_eval = MPPI(env, cfg=mppi_cfg)
-    mppi_stats = evaluate_mppi(env, mppi_eval,
-                                n_episodes=cfg.n_eval_eps,
-                                episode_len=cfg.eval_ep_len,
-                                seed=cfg.seed)
-    print(f"MPPI baseline: {mppi_stats['mean_cost']:.2f} ± {mppi_stats['std_cost']:.2f}")
+    # # --- MPPI baseline (once, shared across iterations) ---
+    # print("\nevaluating MPPI baseline...")
+    # mppi_eval = MPPI(env, cfg=mppi_cfg)
+    # mppi_stats = evaluate_mppi(env, mppi_eval,
+    #                             n_episodes=cfg.n_eval_eps,
+    #                             episode_len=cfg.eval_ep_len,
+    #                             seed=cfg.seed)
+    # print(f"MPPI baseline: {mppi_stats['mean_cost']:.2f} ± {mppi_stats['std_cost']:.2f}")
 
     log_lines: list[str] = [
         f"# DAgger on {args.env}, device={device}",
-        f"# MPPI baseline: mean={mppi_stats['mean_cost']:.4f} std={mppi_stats['std_cost']:.4f}",
+        # f"# MPPI baseline: mean={mppi_stats['mean_cost']:.4f} std={mppi_stats['std_cost']:.4f}",
         "iter,beta,new_samples,buffer_size,train_mse,val_mse,policy_mean_cost,policy_std_cost",
     ]
 
@@ -223,8 +223,8 @@ def main() -> None:
                                      episode_len=cfg.eval_ep_len,
                                      seed=cfg.seed)
         policy.train()
-        print(f"  policy cost: {eval_stats['mean_cost']:.2f} ± {eval_stats['std_cost']:.2f}  "
-              f"(gap vs MPPI: {eval_stats['mean_cost'] - mppi_stats['mean_cost']:+.2f})")
+        print(f"  policy cost: {eval_stats['mean_cost']:.2f} ± {eval_stats['std_cost']:.2f}  ")
+            #   f"(gap vs MPPI: {eval_stats['mean_cost'] - mppi_stats['mean_cost']:+.2f})")
 
         log_lines.append(
             f"{k},{info['beta']:.4f},{info['new_samples']},{info['buffer_size']},"
@@ -257,10 +257,10 @@ def main() -> None:
         "end_time": datetime.now().isoformat(timespec="seconds"),
         "best_iter": best_iter,
         "best_cost": best_cost if best_iter is not None else None,
-        "mppi_baseline": {
-            "mean_cost": mppi_stats["mean_cost"],
-            "std_cost": mppi_stats["std_cost"],
-        },
+        # "mppi_baseline": {
+        #     "mean_cost": mppi_stats["mean_cost"],
+        #     "std_cost": mppi_stats["std_cost"],
+        # },
     })
 
     print(f"\nrun dir: {run_dir}")
