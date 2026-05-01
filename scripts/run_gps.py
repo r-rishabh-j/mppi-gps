@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from src.envs import make_env
-from src.gps.mppi_gps import MPPIGPS
+from src.gps.mppi_gps_clip import MPPIGPS
 from src.mppi.mppi import MPPI
 from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
 from src.utils.device import pick_device
@@ -58,7 +58,7 @@ def parse_args():
                    help="Steps per episode during GPS training")
     p.add_argument("--alpha", type=float, default=None,
                    help="Policy-augmented cost weight (0 = no augmentation)")
-    p.add_argument("--disable-kl", action="store_true",
+    p.add_argument("--disable-kl", action="store_true", default=True,
                    help="Drop KL/BADMM: run policy-prior-only GPS (BC on MPPI data)")
     p.add_argument("--distill-loss", default=None, choices=["nll", "mse"],
                    help="Distillation loss (default from GPSConfig: nll)")
@@ -77,20 +77,50 @@ def parse_args():
     p.add_argument("--n-eval", type=int, default=10,
                    help="Number of evaluation episodes for the final eval "
                         "(end-of-training comparison against MPPI).")
-    p.add_argument("--eval-len", type=int, default=500,
+    p.add_argument("--eval-len", type=int, default=1000,
                    help="Max steps per evaluation episode (final eval + in-loop eval).")
-    p.add_argument("--n-eval-train", type=int, default=None,
-                   help="Episodes for the per-iter policy eval that picks best.pt "
-                        "(default from GPSConfig.n_eval_eps).")
-    p.add_argument("--eval-every", type=int, default=None,
+    p.add_argument("--eval-every", type=int, default=1,
                    help="Run the per-iter policy eval every N iterations "
                         "(default from GPSConfig.eval_every). Last iter is always evaluated.")
-    p.add_argument("--distill-buffer-cap", type=int, default=None,
+    p.add_argument("--distill-buffer-cap", type=int, default=0,
                    help="Cross-iteration distillation buffer capacity, measured in "
                         "(obs, action) rows (matches DAgger's --buffer-cap convention). "
                         "0/unset = no buffering. Sub-episodes split at each done boundary, "
                         "so lengths vary with --auto-reset. FIFO eviction — oldest WHOLE "
                         "episode popped first until total rows ≤ cap.")
+    p.add_argument("--ema-decay", type=float, default=0,
+    # p.add_argument("--ema-decay", type=float, default=0.99,
+                   help="Exponential moving average decay over policy trainable params "
+                        "(e.g. 0.999). 0 or unset disables EMA. Eval and best.pt selection "
+                        "use the EMA snapshot. Without --ema-hard-sync the shadow is purely "
+                        "passive; MPPI's prior keeps using fresh training weights.")
+    p.add_argument("--ema-hard-sync", action="store_true", default=True,
+                   help="At end of each S-step, copy EMA shadow into the live policy (θ ← EMA) "
+                        "so the next iteration's MPPI prior and S-step both start from the "
+                        "smoothed weights. No effect unless --ema-decay > 0. Recommended to "
+                        "pair with --reset-optim-per-iter for Adam-state consistency.")
+    p.add_argument("--reset-optim-per-iter", action="store_true", default=True,
+                   help="Recreate the policy's Adam optimizer at end of each GPS iteration, "
+                        "wiping m/v moments. Recommended with --ema-hard-sync (moments are "
+                        "stale after a hard-sync) and with --prev-iter-kl-coef (accumulated "
+                        "momentum can blow through the trust region on the first few steps).")
+    p.add_argument("--prev-iter-kl-coef", type=float, default=0,
+    # p.add_argument("--prev-iter-kl-coef", type=float, default=0.05,
+                   help="Trust-region-style KL penalty to the previous iteration's policy "
+                        "(Gaussian distill loss only). Adds "
+                        "`coef * E_obs[KL(π_θ || π_prev)]` to the S-step loss. 0/unset "
+                        "disables. Typical small values (e.g. 0.01-0.1). Ignored for "
+                        "--distill-loss mse.")
+    p.add_argument("--dagger-relabel", action="store_true",
+                   help="DAgger-style decoupled relabel: per C-step timestep, run MPPI once "
+                        "WITH the policy prior (executor, steers the env + feeds KL) and a "
+                        "second time WITHOUT the prior (side-effect-free dry_run, its action "
+                        "is the training label). Removes the self-reinforcing loop where the "
+                        "executed MPPI action is already tilted toward the current policy. "
+                        "No-op when α·ν == 0. Note: under open_loop_steps > 1 the label call "
+                        "forces a full rollout every step (cached chunk actions are prior-"
+                        "biased, so can't serve as plain labels) — wallclock per step becomes "
+                        "~1 rollout instead of 1/N.")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint (wrapped or raw state_dict) "
                         "to load into gps.policy before the training loop")
@@ -129,14 +159,22 @@ def main():
         gps_cfg.auto_reset = True
     if args.warm_start_policy:
         gps_cfg.warm_start_policy = True
-    if args.n_eval_train is not None:
-        gps_cfg.n_eval_eps = args.n_eval_train
     if args.eval_every is not None:
         gps_cfg.eval_every = args.eval_every
     if args.eval_len is not None:
         gps_cfg.eval_ep_len = args.eval_len
     if args.distill_buffer_cap is not None:
         gps_cfg.distill_buffer_cap = args.distill_buffer_cap
+    if args.ema_decay is not None:
+        gps_cfg.ema_decay = args.ema_decay
+    if args.ema_hard_sync:
+        gps_cfg.ema_hard_sync = True
+    if args.reset_optim_per_iter:
+        gps_cfg.reset_optim_per_iter = True
+    if args.prev_iter_kl_coef is not None:
+        gps_cfg.prev_iter_kl_coef = args.prev_iter_kl_coef
+    if args.dagger_relabel:
+        gps_cfg.dagger_relabel = True
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
@@ -191,13 +229,16 @@ def main():
     history = gps.train(run_dir=run_dir)
 
     # ---- Save final checkpoint (wrapped) + copy to final.pt ----
+    # EMA-swap window so final.pt on disk matches the smoothed policy that
+    # best.pt was selected from. No-op when ema_decay == 0.
     final_path = run_dir / "final.pt"
-    save_checkpoint(
-        final_path, gps.policy,
-        iteration=gps_cfg.num_iterations - 1,
-        mppi_cost=history.iteration_costs[-1] if history.iteration_costs else None,
-        eval_cost=history.iteration_eval_costs[-1] if history.iteration_eval_costs else None,
-    )
+    with gps.policy.ema_swapped_in():
+        save_checkpoint(
+            final_path, gps.policy,
+            iteration=gps_cfg.num_iterations - 1,
+            mppi_cost=history.iteration_costs[-1] if history.iteration_costs else None,
+            eval_cost=history.iteration_eval_costs[-1] if history.iteration_eval_costs else None,
+        )
     print(f"\nsaved final policy checkpoint to {final_path}")
     if history.best_iter >= 0:
         print(
@@ -213,6 +254,8 @@ def main():
         "kl": history.iteration_kl,
         "nu": history.iteration_nu,
         "distill_loss": history.distill_losses,
+        "ema_drift": history.iteration_ema_drift,
+        "prev_iter_kl": history.iteration_prev_iter_kl,
     }, indent=2))
     print(f"saved learning curves to {curves_path}")
 
@@ -249,15 +292,19 @@ def main():
     print(f"saved learning curve plot to {plot_path}")
 
     # ---- Evaluation: GPS policy vs MPPI baseline ----
+    # EMA-swap for the headline eval too — matches what best.pt / final.pt
+    # contain, and therefore the numbers the user will see when they reload
+    # the checkpoint later. No-op when ema_decay == 0.
     gps.policy.eval()
     print("\n--- Evaluating GPS policy ---")
-    gps_stats = evaluate_policy(
-        gps.policy, env,
-        n_episodes=args.n_eval,
-        episode_len=args.eval_len,
-        seed=args.seed,
-        render=True,
-    )
+    with gps.policy.ema_swapped_in():
+        gps_stats = evaluate_policy(
+            gps.policy, env,
+            n_episodes=args.n_eval,
+            episode_len=args.eval_len,
+            seed=args.seed,
+            render=True,
+        )
 
     print("--- Evaluating MPPI baseline ---")
     mppi = MPPI(env, mppi_cfg)

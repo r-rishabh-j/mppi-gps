@@ -47,6 +47,12 @@ class DAggerTrainer:
         self._buf_act: list[np.ndarray] = []
         self._buf_round: list[np.ndarray] = []
 
+        # Optional EMA of policy weights. DAgger trains MSE-on-mean, so only
+        # the EMA stabiliser applies (no KL-to-prev: there's no policy
+        # distribution to constrain in the deterministic case).
+        if cfg.ema_decay > 0.0:
+            self.policy.attach_ema(cfg.ema_decay)
+
     # ---------- buffer ----------
     def buffer_size(self) -> int:
         return sum(len(o) for o in self._buf_obs)
@@ -321,6 +327,14 @@ class DAggerTrainer:
         obs_r, act_r = self.collect_round(k)
         self.append(obs_r, act_r, round_idx=k)
         train_mse, val_mse = self.finetune(obs_r, act_r, round_idx=k)
+        # End-of-round stabilisers, mirroring MPPIGPS:
+        #  - ema_hard_sync: θ ← EMA so next round's rollouts run the smoothed policy.
+        #  - reset_optim_per_iter: wipe Adam moments so stale momentum doesn't
+        #    carry into the next round (especially important after a hard-sync).
+        if getattr(self.cfg, "ema_decay", 0.0) > 0.0 and getattr(self.cfg, "ema_hard_sync", False):
+            self.policy.ema_sync()
+        if getattr(self.cfg, "reset_optim_per_iter", False):
+            self.policy.reset_optimizer()
         return {
             "round": k,
             "beta": self.beta(k),

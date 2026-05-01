@@ -1,9 +1,14 @@
 """Deterministic MLP policy: regresses actions directly (no mu/sigma head)."""
 
+from __future__ import annotations
+
+from contextlib import contextmanager
+
 import numpy as np
 import torch
 import torch.nn as nn
 
+from src.policy.ema import EMA
 from src.policy.gaussian_policy import RunningNormalizer
 from src.utils.config import PolicyConfig
 
@@ -49,6 +54,10 @@ class DeterministicPolicy(nn.Module):
         self.to(self._device)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=cfg.lr)
 
+        # Optional EMA tracker — mirrors GaussianPolicy. KL-to-prev-iter is
+        # not meaningful here (no policy distribution), so only EMA is wired.
+        self.ema: EMA | None = None
+
     @property
     def device(self) -> torch.device:
         return self._device
@@ -75,7 +84,39 @@ class DeterministicPolicy(nn.Module):
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        if self.ema is not None:
+            self.ema.update(self)
         return float(loss.item())
+
+    # ------------------------------------------------------------------
+    # EMA hooks (mirror GaussianPolicy)
+    # ------------------------------------------------------------------
+
+    def attach_ema(self, decay: float) -> None:
+        if decay <= 0.0:
+            self.ema = None
+            return
+        self.ema = EMA(self, decay=decay)
+
+    @contextmanager
+    def ema_swapped_in(self):
+        if self.ema is None:
+            yield
+            return
+        with self.ema.swapped_in(self):
+            yield
+
+    def ema_l2_drift(self) -> float:
+        return self.ema.l2_drift(self) if self.ema is not None else 0.0
+
+    def ema_sync(self) -> None:
+        """Hard-sync θ ← EMA shadow. See GaussianPolicy.ema_sync()."""
+        if self.ema is not None:
+            self.ema.sync_to(self)
+
+    def reset_optimizer(self) -> None:
+        """Recreate Adam with a fresh state. See GaussianPolicy.reset_optimizer()."""
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
 
     @torch.no_grad()
     def act_np(self, obs: np.ndarray) -> np.ndarray:

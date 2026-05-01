@@ -42,10 +42,26 @@ class MPPI:
             self,
             state: np.ndarray,
             prior = None,
+            dry_run: bool = False,
     ) -> tuple[np.ndarray, dict]:
         """running one MPPI iteration
         state: current environment state
         prior: this is an optional callable (states, actions) -> log_prob (K, )
+        dry_run: if True, compute and return the planned action WITHOUT mutating
+            any persistent MPPI state (`self.U`, `self._plan_cursor`, `self._last_*`,
+            `self.lam`). Used by GPS's DAgger-style relabel path to query a fresh
+            teacher action at a visited state without disturbing the executor's
+            nominal trajectory or the KL rollout cache. Always takes the full
+            replan path (ignores open-loop cadence) — a label call must reflect
+            THIS state, not a cached chunk action from a prior-biased plan.
+
+            Works at any `_plan_cursor` value; dry_run neither reads nor advances
+            the cursor, so it coexists with an open-loop executor mid-chunk.
+            WARNING: under `open_loop_steps > 1`, the executor's non-replan
+            timesteps are cheap (cached action serving) but every dry_run label
+            call forces a full rollout. You lose the open-loop speedup on the
+            label side — wallclock per step becomes ~1 rollout instead of 1/N.
+            The combination is correct, just not faster than `open_loop_steps=1`.
 
         Open-loop cadence: only every `open_loop_steps`-th call does a full MPPI
         replan (sample/rollout/weights/update). Intermediate calls return the next
@@ -56,7 +72,8 @@ class MPPI:
         # --- Open-loop follow-up: serve the next action from the current plan.
         # No rollout, no weight update. `prior` is ignored on these calls since
         # it's only meaningful during the weight computation of a replan.
-        if self._plan_cursor > 0:
+        # Skipped entirely on dry_run (which always does a fresh full replan).
+        if not dry_run and self._plan_cursor > 0:
             action = self.U[self._plan_cursor].copy()
             self._plan_cursor += 1
             if self._plan_cursor >= self.open_loop_steps:
@@ -77,14 +94,14 @@ class MPPI:
 
         # rollout
         states, costs, sensordata = self.env.batch_rollout(state, U_clipped)
-       
+
         # baseline warm start
         # q(V) = N(U, sigma^2 I), p(V) = N(0, sigma^2 I)
         # log p(V) - log q(V) = -(u · eps) / sigma^2 + const
         baseline_log_ratio = -np.sum(self.U[None, :, :] * eps, axis=(1, 2)) / (self.sigma ** 2)
 
-        log_prior = baseline_log_ratio 
-        log_proposal = None 
+        log_prior = baseline_log_ratio
+        log_proposal = None
 
         if prior is not None:
             log_prior = log_prior + prior(states, U_clipped)
@@ -107,18 +124,38 @@ class MPPI:
                 lam = np.clip(lam, 0.01, 100.0)
                 weights = compute_weights(costs, lam, log_prior, log_proposal)
                 n_eff = effective_sample_size(weights)
-            self.lam = lam
+            # Only persist the adapted lambda on a non-dry-run call.
+            if not dry_run:
+                self.lam = lam
+
+        # compute the weighted mean (weight raw perturbations to avoid clipping bias)
+        # On dry_run, do this against a LOCAL copy so self.U isn't modified.
+        U_updated = self.U + np.einsum('k, kha -> ha', weights, eps)
+        U_updated = np.clip(U_updated, self.act_low, self.act_high)
+
+        # extract the first action of the newly planned chunk
+        action = U_updated[0].copy()
+
+        info = {
+            'cost_mean': float(np.mean(costs)),
+            'cost_min': float(np.min(costs)),
+            # 'n_eff': n_eff,
+            'lam': float(lam),
+            'replanned': True,
+        }
+
+        if dry_run:
+            # Side-effect-free: no self.U / cursor / _last_* / _last_info writes.
+            # Caller gets the action + info; MPPI's persistent state is untouched
+            # so the next non-dry-run plan_step sees the same nominal as before.
+            return action, info
+
+        # --- Persist state for the non-dry-run path ---
+        self.U = U_updated
 
         # Store final (post-adaptation) weights so GPS KL estimation sees the
         # same distribution MPPI actually used to update U.
         self._last_weights = weights
-
-        # compute the weighted mean (weight raw perturbations to avoid clipping bias)
-        self.U = self.U + np.einsum('k, kha -> ha', weights, eps)
-        self.U = np.clip(self.U, self.act_low, self.act_high)
-
-        # extract the first action of the newly planned chunk
-        action = self.U[0].copy()
 
         # Advance the cursor. If open_loop_steps == 1 this also triggers the
         # (legacy) shift-by-1 so next replan's warm start is identical to the
@@ -136,13 +173,6 @@ class MPPI:
         self._last_costs = costs
         self._last_sensordata = sensordata
 
-        info = {
-            'cost_mean': float(np.mean(costs)),
-            'cost_min': float(np.min(costs)),
-            # 'n_eff': n_eff,
-            'lam': float(lam),
-            'replanned': True,
-        }
         self._last_info = info
         return action, info
 

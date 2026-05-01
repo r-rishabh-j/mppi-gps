@@ -65,8 +65,8 @@ class GPSConfig:
     # rollout cost, which reflects the teacher (with policy prior), not the
     # student. `eval_every=1` evaluates every iteration; set higher to skip.
     # The final iteration is always evaluated.
-    n_eval_eps: int = 3
-    eval_ep_len: int = 800
+    n_eval_eps: int = 10
+    eval_ep_len: int = 1000
     eval_every: int = 1
     # ---- Cross-iteration distillation replay buffer ------------------------
     # Capacity measured in (obs, action) rows (same convention as DAggerConfig.
@@ -77,6 +77,51 @@ class GPSConfig:
     # length sub-episodes. FIFO eviction — oldest WHOLE episode popped first
     # until total rows ≤ cap (we never split an episode mid-way).
     distill_buffer_cap: int = 0
+    # ---- Stabilisers ------------------------------------------------------
+    # EMA smoothing of the policy's trainable parameters. 0.0 = disabled.
+    # Typical: 0.99–0.9999. When > 0 the S-step updates an exponential moving
+    # average after every Adam step (`ema ← d·ema + (1-d)·θ`). Eval and
+    # best.pt selection use the EMA snapshot, so checkpoints on disk reflect
+    # the smoothed policy, not the noisy training weights.
+    ema_decay: float = 0.99
+    # When True (and ema_decay > 0): at the end of each S-step, permanently
+    # overwrite θ with the EMA shadow (θ ← EMA). The next iteration's C-step
+    # MPPI prior and the next S-step both start from the smoothed weights,
+    # not the noisy end-of-S-step training trajectory. Without this flag the
+    # EMA is shadow-only (just a smoothed snapshot for eval / best.pt).
+    # Strongly recommended to pair with `reset_optim_per_iter=True` so Adam's
+    # running moments don't carry stale estimates from the pre-sync θ.
+    ema_hard_sync: bool = True
+    # When True: recreate the policy's Adam optimizer at the end of each
+    # GPS iteration's S-step, wiping accumulated m/v moments. Rationale:
+    # (1) each GPS iter is a new supervised task (C-step data + prior shift
+    # iter-to-iter), so momentum built against the prior iter's gradient
+    # field can point in a stale direction; (2) when `ema_hard_sync` is on,
+    # θ moves non-trivially at the boundary and Adam's moments were
+    # estimated at the pre-sync θ; (3) accumulated momentum can blow
+    # through the `prev_iter_kl_coef` trust region on the first few steps.
+    # Default False preserves current behaviour.
+    reset_optim_per_iter: bool = True
+    # Trust-region-style KL penalty against the previous-iteration policy.
+    # 0.0 = disabled (current behaviour). >0 = add
+    #     coef * E_obs[ KL(π_θ(·|o) || π_{prev iter}(·|o)) ]
+    # to the S-step distill loss. A deep copy of the policy at the start of
+    # each S-step acts as π_prev. Only applied when distill_loss == "nll"
+    # (closed-form diag-Gaussian KL); silently a no-op for MSE since the
+    # deterministic mean-only loss has no policy distribution to constrain.
+    prev_iter_kl_coef: float = 0.1
+    # When True (and the effective policy prior α·ν > 0), the C-step runs TWO
+    # MPPI calls per timestep: the first with the policy prior (executes the
+    # env, feeds KL), the second without (side-effect-free dry_run, its action
+    # is the training label). Decouples "steer where we visit" from "what the
+    # teacher says" — fixes the self-reinforcing loop where the executed MPPI
+    # action is already tilted toward the current policy. DAgger-style
+    # relabeling inside the GPS loop. Default False preserves current conflated
+    # behaviour. Correct under any MPPIConfig.open_loop_steps value, but with
+    # open_loop_steps > 1 the label call forces a full rollout every step
+    # (cached chunk actions are prior-biased and can't serve as plain labels),
+    # so you lose the open-loop speedup — effective cost becomes ~1 rollout/step.
+    dagger_relabel: bool = False
 
 
 @dataclass
@@ -95,4 +140,13 @@ class DAggerConfig:
     auto_reset: bool = False             # on termination, reset and keep collecting
                                          # until episode_len steps are taken for the slot
                                          # (useful for terminating envs like hopper)
+    # EMA smoothing of the policy's trainable parameters. 0.0 = disabled.
+    # Typical: 0.99–0.9999. Eval uses the EMA snapshot and best.pt is copied
+    # while the EMA weights are swapped in, so the checkpoint on disk matches
+    # the reported eval cost. See src/policy/ema.py.
+    ema_decay: float = 0.0
+    # Hard-promote θ ← EMA at end of each DAgger round; see GPSConfig.
+    ema_hard_sync: bool = False
+    # Wipe Adam moments at end of each DAgger round; see GPSConfig.
+    reset_optim_per_iter: bool = False
 

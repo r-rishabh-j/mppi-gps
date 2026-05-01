@@ -17,6 +17,7 @@ MPPI runs on CPU (MuJoCo). Policy training uses the device selected by
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext as _nullctx
 from datetime import datetime
 from pathlib import Path
 
@@ -77,6 +78,21 @@ def parse_args() -> argparse.Namespace:
                    help="On episode termination during rollout/relabel, auto-reset and keep "
                         "collecting until episode_len steps are taken for that slot. Recommended "
                         "for terminating envs like hopper where policy-driven episodes fall early.")
+    p.add_argument("--ema-decay", type=float, default=None,
+                   help="Exponential moving average decay over the policy's trainable "
+                        "parameters (e.g. 0.999). 0 or unset disables EMA. Eval and best.pt "
+                        "selection use the EMA snapshot when enabled, so the checkpoint on "
+                        "disk matches the reported eval cost.")
+    p.add_argument("--ema-hard-sync", action="store_true", default=True,
+                   help="At end of each DAgger round, copy EMA shadow into the live policy "
+                        "(θ ← EMA) so subsequent rollouts and finetunes start from the "
+                        "smoothed weights. No effect unless --ema-decay > 0. Pair with "
+                        "--reset-optim-per-iter for Adam consistency.")
+    p.add_argument("--reset-optim-per-iter", action="store_true", default=True,
+                   help="Recreate the policy's Adam optimizer at end of each DAgger round, "
+                        "wiping m/v moments. Recommended with --ema-hard-sync (stale Adam "
+                        "state after a hard-sync) and whenever the buffer shifts distribution "
+                        "enough that stale momentum becomes a liability.")
     p.add_argument("--exp-name", default="run",
                    help="Human-readable experiment name (used in the run dir name).")
     p.add_argument("--exp-dir", default="checkpoints/dagger",
@@ -100,6 +116,12 @@ def main() -> None:
         seed=args.seed,
         auto_reset=args.auto_reset,
     )
+    if args.ema_decay is not None:
+        cfg.ema_decay = args.ema_decay
+    if args.ema_hard_sync:
+        cfg.ema_hard_sync = True
+    if args.reset_optim_per_iter:
+        cfg.reset_optim_per_iter = True
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
@@ -217,36 +239,40 @@ def main() -> None:
               f"buf={info['buffer_size']:,}  train_mse={info['train_mse']:.5f}  "
               f"val_mse={info['val_mse']:.5f}")
 
-        policy.eval()
-        eval_stats = evaluate_policy(policy, env,
-                                     n_episodes=cfg.n_eval_eps,
-                                     episode_len=cfg.eval_ep_len,
-                                     seed=cfg.seed)
-        policy.train()
-        print(f"  policy cost: {eval_stats['mean_cost']:.2f} ± {eval_stats['std_cost']:.2f}  ")
-            #   f"(gap vs MPPI: {eval_stats['mean_cost'] - mppi_stats['mean_cost']:+.2f})")
+        # EMA-swap window: eval and per-iter save happen with the smoothed
+        # weights when EMA is enabled, so the reported cost and the state_dict
+        # on disk match. No-op context when EMA is off (bit-for-bit identical).
+        with policy.ema_swapped_in() if hasattr(policy, "ema_swapped_in") else _nullctx():
+            policy.eval()
+            eval_stats = evaluate_policy(policy, env,
+                                         n_episodes=cfg.n_eval_eps,
+                                         episode_len=cfg.eval_ep_len,
+                                         seed=cfg.seed)
+            policy.train()
+            print(f"  policy cost: {eval_stats['mean_cost']:.2f} ± {eval_stats['std_cost']:.2f}  ")
+                #   f"(gap vs MPPI: {eval_stats['mean_cost'] - mppi_stats['mean_cost']:+.2f})")
 
-        log_lines.append(
-            f"{k},{info['beta']:.4f},{info['new_samples']},{info['buffer_size']},"
-            f"{info['train_mse']:.6f},{info['val_mse']:.6f},"
-            f"{eval_stats['mean_cost']:.4f},{eval_stats['std_cost']:.4f}"
-        )
+            log_lines.append(
+                f"{k},{info['beta']:.4f},{info['new_samples']},{info['buffer_size']},"
+                f"{info['train_mse']:.6f},{info['val_mse']:.6f},"
+                f"{eval_stats['mean_cost']:.4f},{eval_stats['std_cost']:.4f}"
+            )
 
-        ckpt_path = run_dir / f"iter_{k:02d}.pt"
-        save_checkpoint(
-            ckpt_path, policy,
-            round=k,
-            train_mse=info["train_mse"],
-            val_mse=info["val_mse"],
-            eval_mean_cost=eval_stats["mean_cost"],
-            eval_std_cost=eval_stats["std_cost"],
-        )
-        last_ckpt_path = ckpt_path
+            ckpt_path = run_dir / f"iter_{k:02d}.pt"
+            save_checkpoint(
+                ckpt_path, policy,
+                round=k,
+                train_mse=info["train_mse"],
+                val_mse=info["val_mse"],
+                eval_mean_cost=eval_stats["mean_cost"],
+                eval_std_cost=eval_stats["std_cost"],
+            )
+            last_ckpt_path = ckpt_path
 
-        if eval_stats["mean_cost"] < best_cost:
-            best_cost = eval_stats["mean_cost"]
-            best_iter = k
-            copy_as(ckpt_path, run_dir / "best.pt")
+            if eval_stats["mean_cost"] < best_cost:
+                best_cost = eval_stats["mean_cost"]
+                best_iter = k
+                copy_as(ckpt_path, run_dir / "best.pt")
 
         (run_dir / "dagger_log.csv").write_text("\n".join(log_lines))
 

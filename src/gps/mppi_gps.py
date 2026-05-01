@@ -14,6 +14,7 @@ The high-level loop (Algorithm 1 from the proposal) is:
   5. Optionally warm-start MPPI's nominal trajectory from the updated policy.
 """
 
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -249,6 +250,9 @@ class GPSHistory:
     iteration_kl: list[float] = field(default_factory=list)      # mean KL across conditions
     iteration_nu: list[float] = field(default_factory=list)      # BADMM dual variable
     distill_losses: list[float] = field(default_factory=list)    # last distillation loss
+    # Stabiliser diagnostics — NaN when the corresponding feature is off.
+    iteration_ema_drift: list[float] = field(default_factory=list)    # ||θ − θ_ema||₂ after S-step
+    iteration_prev_iter_kl: list[float] = field(default_factory=list) # E_obs[KL(π_new || π_prev)]
     best_iter: int = -1
     best_cost: float = float("inf")
 
@@ -305,6 +309,17 @@ class MPPIGPS:
         # and unused when `gps_cfg.distill_buffer_cap == 0`.
         self._episode_buffer: list[dict] = []
 
+        # ---- Stabilisers ----
+        # EMA of the trainable policy params — tracked by the policy itself so
+        # `train_weighted` / `mse_step` update the shadow after each Adam step
+        # without the trainer having to hook in per-batch.
+        if gps_cfg.ema_decay > 0.0:
+            self.policy.attach_ema(gps_cfg.ema_decay)
+
+        # `prev_iter_kl_coef` is applied inside the S-step via a deep-copied
+        # snapshot taken at the start of each iteration's distillation loop;
+        # no persistent state is needed here.
+
     # ----- helpers ---------------------------------------------------------
 
     def _sample_initial_conditions(self, n: int) -> list[np.ndarray]:
@@ -328,6 +343,7 @@ class MPPIGPS:
         obs: np.ndarray,
         actions: np.ndarray,
         weights: np.ndarray,
+        prev_policy: "GaussianPolicy | None" = None,
     ) -> float:
         """Run multiple mini-batch gradient steps to distill MPPI into the policy.
 
@@ -335,14 +351,19 @@ class MPPIGPS:
         to maximise the weighted log-likelihood of the MPPI teacher's actions:
 
             L = - Σ_i  w_i  log π_θ(a_i | o_i)
+                + coef * KL(π_θ || π_prev)     (optional, NLL mode only)
 
         We do `distill_epochs` full passes over the data, shuffling each time,
         with mini-batches of size `distill_batch_size`.
 
         Args:
-            obs:     (N, obs_dim)  — observations from all conditions.
-            actions: (N, act_dim)  — MPPI-executed actions.
-            weights: (N,)          — importance weights (uniform for now).
+            obs:         (N, obs_dim)  — observations from all conditions.
+            actions:     (N, act_dim)  — MPPI-executed actions.
+            weights:     (N,)          — importance weights (uniform for now).
+            prev_policy: Optional deep-copy of the policy at the start of this
+                         S-step. When given and `gps_cfg.prev_iter_kl_coef > 0`
+                         and `distill_loss == "nll"`, each batch's loss gains a
+                         KL-to-previous-iteration penalty (trust-region style).
         Returns:
             The loss value from the last mini-batch.
         """
@@ -350,6 +371,13 @@ class MPPIGPS:
         N = len(obs)
         indices = np.arange(N)
         last_loss = 0.0
+        # KL-to-prev is only defined for the Gaussian NLL path — MSE trains
+        # only the mean and has no distribution to constrain.
+        use_prev_kl = (
+            prev_policy is not None
+            and cfg.prev_iter_kl_coef > 0.0
+            and cfg.distill_loss != "mse"
+        )
         for _ in range(cfg.distill_epochs):
             np.random.shuffle(indices)
             for start in range(0, N, cfg.distill_batch_size):
@@ -359,7 +387,9 @@ class MPPIGPS:
                 else:
                     # train_weighted computes -Σ w log π / Σ w  and does one Adam step
                     last_loss = self.policy.train_weighted(
-                        obs[batch], actions[batch], weights[batch]
+                        obs[batch], actions[batch], weights[batch],
+                        prev_policy=prev_policy if use_prev_kl else None,
+                        prev_kl_coef=cfg.prev_iter_kl_coef if use_prev_kl else 0.0,
                     )
         return last_loss
 
@@ -533,23 +563,48 @@ class MPPIGPS:
                     cur_obs.clear()
                     cur_actions.clear()
 
+                # Effective prior strength for the label-call gate. When α·ν
+                # is zero the prior is inactive, so the "label without prior"
+                # degenerates to a second plain MPPI call — wasted compute.
+                # Skip the label call in that case and fall back to single-call.
+                effective_alpha_nu = alpha * self.nu
+
                 for t in range(cfg.episode_length):
                     state = self.env.get_state()
                     obs = self.env._get_obs()
 
                     # Run one MPPI planning step with the policy-augmented prior.
                     # This samples K trajectories, evaluates cost + prior, and
-                    # returns the weighted-mean action.
-                    action, info = self.mppi.plan_step(state, prior=prior_fn)
+                    # returns the weighted-mean action. Mutates self.mppi.U and
+                    # _last_* as usual — this is the "executor" call.
+                    action_exec, info = self.mppi.plan_step(state, prior=prior_fn)
+
+                    # DAgger-style relabel: fresh MPPI query at the SAME state
+                    # with NO policy prior, used only as the training label.
+                    # `dry_run=True` makes the call side-effect-free so KL's
+                    # view of rollout data (exec-call) stays intact and the
+                    # nominal-U warm start isn't disturbed. The env step below
+                    # still uses action_exec, so the state distribution is
+                    # steered by the prior — it's only the label that's
+                    # uncontaminated.
+                    if cfg.dagger_relabel and effective_alpha_nu > 0.0:
+                        action_label, _ = self.mppi.plan_step(
+                            state, prior=None, dry_run=True,
+                        )
+                    else:
+                        action_label = action_exec
 
                     cur_obs.append(obs.copy())
-                    cur_actions.append(action.copy())  # the executed action
+                    cur_actions.append(action_label.copy())  # training target
 
                     if not skip_kl:
                         # Retrieve the K rollout samples for KL computation.
                         # Copy both arrays: MPPI reuses the _last_* slots on
                         # the next plan_step, and we must not hold views into
-                        # buffers it may later overwrite.
+                        # buffers it may later overwrite. (dry_run relabel
+                        # doesn't touch _last_*, so this still reads the
+                        # prior-biased exec-call rollout — semantically
+                        # correct for KL(MPPI-with-prior || policy).)
                         rollout_data = self.mppi.get_rollout_data()
                         first_step_actions = np.array(rollout_data['actions'][:, 0, :])
                         weights = np.array(rollout_data['weights'])
@@ -557,8 +612,9 @@ class MPPIGPS:
                         episode_kl_weights.append(weights)
                         episode_obs_for_kl.append(obs.copy())
 
-                    # Step the environment with the MPPI-chosen action
-                    _, cost, done, _ = self.env.step(action)
+                    # Step the environment with the exec action — state
+                    # distribution is prior-biased, labels are not.
+                    _, cost, done, _ = self.env.step(action_exec)
                     episode_cost += cost
                     c_bar.update(1)
 
@@ -639,8 +695,53 @@ class MPPIGPS:
                 act_flat = np.concatenate(all_actions, axis=0)  # (total_steps, act_dim)
                 w_flat = np.concatenate(all_weights, axis=0)    # (total_steps,)
 
+            # Snapshot the policy at the start of the S-step for the
+            # trust-region KL-to-prev penalty. The deep-copy shares no tensor
+            # storage with `self.policy`, so subsequent gradient steps don't
+            # drift the reference. We keep it even for iter 0 (the KL starts
+            # at 0 and grows with drift — harmless) so the code path is
+            # unconditional; the loss just applies it when coef > 0.
+            prev_policy: "GaussianPolicy | None" = None
+            if cfg.prev_iter_kl_coef > 0.0 and cfg.distill_loss != "mse":
+                prev_policy = copy.deepcopy(self.policy)
+                prev_policy.eval()
+                for p in prev_policy.parameters():
+                    p.requires_grad_(False)
+
             # Multiple epochs of mini-batch gradient descent
-            loss = self._distill_epoch(obs_flat, act_flat, w_flat)
+            loss = self._distill_epoch(obs_flat, act_flat, w_flat, prev_policy=prev_policy)
+
+            # Diagnostics: post-distill EMA drift and KL to the pre-S-step
+            # policy. Both default to NaN when the corresponding stabiliser
+            # is disabled so plots show a clean "not tracked" signal.
+            #
+            # IMPORTANT ordering: compute BEFORE any hard-sync / optimizer
+            # reset so the diagnostic reflects how far θ actually moved this
+            # S-step. Post-sync, drift would always be 0 (θ == shadow).
+            ema_drift = self.policy.ema_l2_drift() if cfg.ema_decay > 0.0 else float("nan")
+            if prev_policy is not None and len(obs_flat) > 0:
+                # Use at most 4096 obs rows to keep the diagnostic cheap.
+                diag_n = min(len(obs_flat), 4096)
+                diag_idx = np.random.choice(len(obs_flat), size=diag_n, replace=False)
+                prev_iter_kl_diag = self.policy.kl_to_np(
+                    obs_flat[diag_idx], prev_policy,
+                )
+            else:
+                prev_iter_kl_diag = float("nan")
+
+            # ========== End-of-S-step stabilisers ==========
+            # 1. Hard-sync: promote the smoothed shadow to the live weights
+            #    so the NEXT iteration's MPPI prior + S-step both start from
+            #    the stable policy, not the noisy training trajectory.
+            # 2. Adam reset: wipe m/v moments. Required for correctness after
+            #    a hard-sync (moments were tied to pre-sync θ) and useful
+            #    even without it — each GPS iter is a new supervised task,
+            #    and stale momentum fights the `prev_iter_kl_coef` TR penalty.
+            # Order matters: sync first so the reset targets the post-sync θ.
+            if cfg.ema_decay > 0.0 and cfg.ema_hard_sync:
+                self.policy.ema_sync()
+            if cfg.reset_optim_per_iter:
+                self.policy.reset_optimizer()
 
             # ========== KL computation (average across conditions) ==========
             if skip_kl:
@@ -672,48 +773,61 @@ class MPPIGPS:
             history.iteration_kl.append(kl_mean)
             history.iteration_nu.append(self.nu)
             history.distill_losses.append(loss)
+            history.iteration_ema_drift.append(ema_drift)
+            history.iteration_prev_iter_kl.append(prev_iter_kl_diag)
 
             # ========== Policy evaluation (drives best-checkpoint selection) ==========
             # We evaluate the student policy on fresh env resets and use THAT cost
             # to pick best.pt. The C-step rollout cost above is the MPPI teacher
             # under a policy prior — not a faithful measure of the student.
+            #
+            # Both eval AND the per-iter checkpoint save live inside the EMA
+            # swap window, so:
+            #   - the reported eval_cost reflects the smoothed policy;
+            #   - iter_NNN.pt on disk contains the smoothed state_dict (what
+            #     was evaluated), which in turn becomes best.pt via copy.
+            # When EMA is disabled, ema_swapped_in() is a no-op context, so
+            # behaviour is bit-for-bit identical to the pre-feature code path.
             eval_every = max(int(getattr(cfg, "eval_every", 1)), 1)
             is_last = (iteration == num_iterations - 1)
             do_eval = is_last or ((iteration + 1) % eval_every == 0)
 
             eval_cost = float("nan")
-            if do_eval:
-                was_training = self.policy.training
-                self.policy.eval()
-                eval_stats = evaluate_policy(
-                    self.policy, self.env,
-                    n_episodes=cfg.n_eval_eps,
-                    episode_len=cfg.eval_ep_len,
-                    seed=iteration,  # vary conditions across iters but deterministic per-iter
-                )
-                if was_training:
-                    self.policy.train()
-                eval_cost = float(eval_stats["mean_cost"])
-            history.iteration_eval_costs.append(eval_cost)
+            with self.policy.ema_swapped_in():
+                if do_eval:
+                    was_training = self.policy.training
+                    self.policy.eval()
+                    eval_stats = evaluate_policy(
+                        self.policy, self.env,
+                        n_episodes=cfg.n_eval_eps,
+                        episode_len=cfg.eval_ep_len,
+                        seed=iteration,  # vary conditions across iters but deterministic per-iter
+                    )
+                    if was_training:
+                        self.policy.train()
+                    eval_cost = float(eval_stats["mean_cost"])
+                history.iteration_eval_costs.append(eval_cost)
 
-            # ========== Checkpointing ==========
-            if run_dir is not None:
-                iter_path = run_dir / f"iter_{iteration:03d}.pt"
-                save_checkpoint(
-                    iter_path, self.policy,
-                    iteration=iteration,
-                    mppi_cost=mppi_cost,
-                    eval_cost=eval_cost,
-                    distill_loss=loss,
-                    kl=kl_mean,
-                    nu=self.nu,
-                )
-                # Best is selected on eval cost only (NaN comparisons are false,
-                # so skipped-eval iters never overwrite best.pt).
-                if do_eval and eval_cost < history.best_cost:
-                    history.best_cost = eval_cost
-                    history.best_iter = iteration
-                    copy_as(iter_path, run_dir / "best.pt")
+                # ========== Checkpointing ==========
+                if run_dir is not None:
+                    iter_path = run_dir / f"iter_{iteration:03d}.pt"
+                    save_checkpoint(
+                        iter_path, self.policy,
+                        iteration=iteration,
+                        mppi_cost=mppi_cost,
+                        eval_cost=eval_cost,
+                        distill_loss=loss,
+                        kl=kl_mean,
+                        nu=self.nu,
+                        ema_drift=ema_drift,
+                        prev_iter_kl=prev_iter_kl_diag,
+                    )
+                    # Best is selected on eval cost only (NaN comparisons are false,
+                    # so skipped-eval iters never overwrite best.pt).
+                    if do_eval and eval_cost < history.best_cost:
+                        history.best_cost = eval_cost
+                        history.best_iter = iteration
+                        copy_as(iter_path, run_dir / "best.pt")
 
             postfix = {
                 "mppi_cost": f"{mppi_cost:.2f}",
@@ -737,6 +851,10 @@ class MPPIGPS:
                 n_eps = len(self._episode_buffer)
                 n_rows = sum(len(ep["obs"]) for ep in self._episode_buffer)
                 base_line += f"  buf={n_eps}eps/{n_rows}rows"
+            if cfg.ema_decay > 0.0:
+                base_line += f"  ema_drift={ema_drift:.4f}"
+            if cfg.prev_iter_kl_coef > 0.0 and cfg.distill_loss != "mse":
+                base_line += f"  prev_kl={prev_iter_kl_diag:.4f}"
             if do_eval:
                 base_line += f"  eval_cost={eval_cost:8.2f}"
             tqdm.write(base_line)

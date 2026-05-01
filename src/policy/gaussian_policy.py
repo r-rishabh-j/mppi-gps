@@ -1,9 +1,14 @@
 """Diagonal Gaussian MLP for GPS."""
 
+from __future__ import annotations
+
+from contextlib import contextmanager
+
 import numpy as np
 import torch
 import torch.nn as nn
 
+from src.policy.ema import EMA
 from src.utils.config import PolicyConfig
 
 
@@ -95,6 +100,12 @@ class GaussianPolicy(nn.Module):
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=cfg.lr)
 
+        # Optional EMA tracker over trainable parameters. Attached via
+        # `attach_ema(decay)` from the trainer; when set, `train_weighted`
+        # and `mse_step` call `ema.update(self)` after each Adam step so the
+        # shadow weights track the training weights with low-pass smoothing.
+        self.ema: EMA | None = None
+
     @property
     def device(self) -> torch.device:
         return self._device
@@ -133,10 +144,25 @@ class GaussianPolicy(nn.Module):
         obs: np.ndarray,
         actions: np.ndarray,
         weights: np.ndarray,
+        prev_policy: "GaussianPolicy | None" = None,
+        prev_kl_coef: float = 0.0,
     ) -> float:
-        """One gradient step of weighted NLL.
+        """One gradient step of weighted NLL, optionally regularized by
+        KL(current || prev_policy).
 
         With uniform weights this reduces to plain NLL (what GPS and BC use).
+
+        Args:
+            prev_policy:   A frozen snapshot of this policy from the previous
+                           GPS iteration (a deep copy, typically). When given
+                           with `prev_kl_coef > 0`, the loss gains a term
+                           `prev_kl_coef * E_o[ KL(π_θ(·|o) || π_prev(·|o)) ]`,
+                           computed in closed form for two diagonal Gaussians.
+                           This is the trust-region-style regularizer that
+                           prevents the student from drifting too far from its
+                           previous-iteration self in one S-step — stabilises
+                           training when the C-step data shifts iter-to-iter.
+            prev_kl_coef:  Penalty weight. 0 disables the KL term (default).
         """
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
@@ -145,12 +171,27 @@ class GaussianPolicy(nn.Module):
         if self.normalizer is not None:
             self.normalizer.update(obs_t)
 
-        lp = self.log_prob(obs_t, act_t)
+        # Single forward pass — reuse mu/log_sigma for both log_prob and KL.
+        mu, log_sigma = self._head(obs_t)
+        sigma = log_sigma.exp()
+        lp = -0.5 * (
+            ((act_t - mu) / sigma) ** 2
+            + 2.0 * log_sigma
+            + np.log(2.0 * np.pi)
+        )
+        lp = lp.sum(dim=-1)
         loss = -(w_t * lp).sum() / w_t.sum().clamp(min=1e-8)
+
+        if prev_policy is not None and prev_kl_coef > 0.0:
+            loss = loss + prev_kl_coef * self._kl_to_diag_gaussian(
+                obs_t, mu, log_sigma, prev_policy,
+            )
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        if self.ema is not None:
+            self.ema.update(self)
         return loss.item()
 
     def action(self, obs: torch.Tensor) -> torch.Tensor:
@@ -169,7 +210,108 @@ class GaussianPolicy(nn.Module):
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        if self.ema is not None:
+            self.ema.update(self)
         return float(loss.item())
+
+    # ------------------------------------------------------------------
+    # KL helpers
+    # ------------------------------------------------------------------
+
+    def _kl_to_diag_gaussian(
+        self,
+        obs_t: torch.Tensor,
+        mu_q: torch.Tensor,
+        log_sigma_q: torch.Tensor,
+        prev_policy: "GaussianPolicy",
+    ) -> torch.Tensor:
+        """Mean KL(π_θ(·|o) || π_prev(·|o)) over the batch.
+
+        Closed-form KL for two diagonal Gaussians:
+
+            KL = Σ_d [ log(σ_p / σ_q)
+                     + (σ_q² + (μ_q − μ_p)²) / (2 σ_p²)
+                     - 0.5 ]
+
+        with subscript q = current policy, p = prev_policy. Per-dim sum,
+        then mean over the batch.
+        """
+        with torch.no_grad():
+            mu_p, log_sigma_p = prev_policy._head(obs_t)
+        var_q = torch.exp(2.0 * log_sigma_q)
+        var_p = torch.exp(2.0 * log_sigma_p)
+        kl_per_dim = (
+            log_sigma_p - log_sigma_q
+            + (var_q + (mu_q - mu_p) ** 2) / (2.0 * var_p)
+            - 0.5
+        )
+        return kl_per_dim.sum(dim=-1).mean()
+
+    @torch.no_grad()
+    def kl_to_np(
+        self,
+        obs: np.ndarray,
+        prev_policy: "GaussianPolicy",
+    ) -> float:
+        """Numpy-facing mean KL(self || prev_policy) over a batch of obs.
+
+        Useful for logging iter-to-iter drift without touching the loss path.
+        """
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+        mu_q, log_sigma_q = self._head(obs_t)
+        return float(self._kl_to_diag_gaussian(obs_t, mu_q, log_sigma_q, prev_policy).item())
+
+    # ------------------------------------------------------------------
+    # EMA hooks
+    # ------------------------------------------------------------------
+
+    def attach_ema(self, decay: float) -> None:
+        """Start tracking an EMA of trainable parameters with given decay.
+
+        Idempotent in the sense that calling it again resets the shadow to
+        the current weights and switches to the new decay.
+        """
+        if decay <= 0.0:
+            self.ema = None
+            return
+        self.ema = EMA(self, decay=decay)
+
+    @contextmanager
+    def ema_swapped_in(self):
+        """Context manager: live params ← EMA shadow for the duration.
+
+        No-op (yields immediately) when EMA is not attached.
+        """
+        if self.ema is None:
+            yield
+            return
+        with self.ema.swapped_in(self):
+            yield
+
+    def ema_l2_drift(self) -> float:
+        """||θ - θ_ema||₂. Returns 0.0 when EMA is not attached."""
+        return self.ema.l2_drift(self) if self.ema is not None else 0.0
+
+    def ema_sync(self) -> None:
+        """Hard-sync: θ ← EMA shadow, in place. No-op if EMA not attached.
+
+        Meant for end-of-S-step promotion in GPS / DAgger loops. Strongly
+        recommended to follow this with `reset_optimizer()` so Adam's
+        running moments don't carry stale gradients from the pre-sync θ.
+        """
+        if self.ema is not None:
+            self.ema.sync_to(self)
+
+    def reset_optimizer(self) -> None:
+        """Recreate Adam with a fresh state (same lr). Clears m, v moments.
+
+        Useful at GPS iteration boundaries when the effective loss surface
+        shifts (new C-step data, new trust-region reference, a hard EMA
+        sync that moved θ non-trivially). The alternative — letting stale
+        momentum carry across iterations — fights the `prev_iter_kl_coef`
+        trust region and mismatches Adam's state after an `ema_sync()`.
+        """
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
 
     @torch.no_grad()
     def log_prob_np(self, obs: np.ndarray, actions: np.ndarray) -> np.ndarray:
