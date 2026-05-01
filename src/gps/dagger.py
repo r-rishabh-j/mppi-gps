@@ -128,7 +128,7 @@ class DAggerTrainer:
                 for _ in range(ep_len):
                     obs = self.env._get_obs()
                     state = self.env.get_state()
-                    expert_action, _ = self.mppi.plan_step(state)
+                    expert_action, _ = self.mppi.plan_step(state, dry_run=True)
 
                     if self.rng.random() < beta:
                         exec_action = expert_action
@@ -141,11 +141,13 @@ class DAggerTrainer:
                     _, _, done, _ = self.env.step(exec_action)
                     pbar.update(1)
                     if done:
-                        if auto_reset:
-                            self.env.reset()
-                            self.mppi.reset()
-                        else:
-                            break
+                        self.env.reset()
+                        self.mppi.reset()
+                        # if auto_reset:
+                        #     self.env.reset()
+                        #     self.mppi.reset()
+                        # else:
+                        #     break
 
         obs_arr = np.stack(obs_rows, axis=0)
         act_arr = np.stack(act_rows, axis=0)

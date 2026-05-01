@@ -27,7 +27,7 @@ def main():
         print(env.data.qpos)
         state = env.get_state()
         total_cost = 0.0 
-        for t in range(300):
+        for t in range(1000):
             action, info = controller.plan_step(state)
             obs, cost, done, _ = env.step(action)
             total_cost += cost
@@ -51,7 +51,7 @@ def main():
 
     if render and frames:
         import mediapy
-        mediapy.write_video("acrobot_mppi.mp4", frames, fps=30)
+        mediapy.write_video("acrobot_mppi.mp4", frames, fps=5*30)
         print(f"saved video")
     env.close()
 

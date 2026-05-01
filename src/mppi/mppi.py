@@ -69,11 +69,14 @@ class MPPI:
         When the chunk is exhausted, `U` is shifted left by `open_loop_steps` so
         the next replan uses a correctly-aligned warm start.
         """
+        if dry_run:
+            self.reset()
         # --- Open-loop follow-up: serve the next action from the current plan.
         # No rollout, no weight update. `prior` is ignored on these calls since
         # it's only meaningful during the weight computation of a replan.
         # Skipped entirely on dry_run (which always does a fresh full replan).
-        if not dry_run and self._plan_cursor > 0:
+
+        if self._plan_cursor > 0:
             action = self.U[self._plan_cursor].copy()
             self._plan_cursor += 1
             if self._plan_cursor >= self.open_loop_steps:
@@ -83,36 +86,26 @@ class MPPI:
             info["replanned"] = False
             return action, info
 
-        # --- Full replan path ---
-        # sample from q = N(U_nominal, sigma^2 I)
-        # noise is eps
+        # sample ε ~ N(0, σ² I), perturb, clamp for rollout
         eps = np.random.randn(self.K, self.H, self.nu) * self.sigma
         U_perturbed = self.U[None, :, :] + eps
-
-        # clamp before rollout (but keep raw eps for unbiased update)
         U_clipped = np.clip(U_perturbed, self.act_low, self.act_high)
 
         # rollout
         states, costs, sensordata = self.env.batch_rollout(state, U_clipped)
 
-        # baseline warm start
-        # q(V) = N(U, sigma^2 I), p(V) = N(0, sigma^2 I)
-        # log p(V) - log q(V) = -(u · eps) / sigma^2 + const
-        baseline_log_ratio = -np.sum(self.U[None, :, :] * eps, axis=(1, 2)) / (self.sigma ** 2)
-
-        log_prior = baseline_log_ratio
-        log_proposal = None
-
-        if prior is not None:
-            log_prior = log_prior + prior(states, U_clipped)
-
-        # compute weights
+        # assemble S_k components (paper's Algorithm 2, γ=λ, Σ=σ²I):
+        #    S_k = S_env + λ · Σ_t u_t · ε_{k,t}/σ² + (optional) λ_track · Σ_t ‖a-π‖²
         lam = self.lam
-        weights = compute_weights(costs, lam, log_prior, log_proposal)
-        n_eff = effective_sample_size(weights)
+        is_corr = self._is_correction(eps, lam)
+        # track = None
+        track = prior(states, U_clipped) if prior is not None else None
+        S = costs + is_corr + (track if track is not None else 0.0)
 
-        # you want to make sure that the weights don't collapse aka lambda is not too small
-        # if lambda is small then the policy isn't exploring
+        # paper weights: ρ = min_k S_k, w_k = exp(-(S_k - ρ)/λ) / η
+        weights, n_eff = self._softmin_weights(S, lam)
+
+        # adaptive λ (not in paper; keeps n_eff in a sensible range)
         if self.cfg.adaptive_lam:
             for _ in range(5):
                 if n_eff < self.cfg.n_eff_threshold:
@@ -121,19 +114,17 @@ class MPPI:
                     lam *= 0.5
                 else:
                     break
-                lam = np.clip(lam, 0.01, 100.0)
-                weights = compute_weights(costs, lam, log_prior, log_proposal)
-                n_eff = effective_sample_size(weights)
-            # Only persist the adapted lambda on a non-dry-run call.
-            if not dry_run:
-                self.lam = lam
+                lam = float(np.clip(lam, 0.01, 100.0))
+                # γ=λ: is_corr depends on λ; track does not
+                is_corr = self._is_correction(eps, lam)
+                S = costs + is_corr + (track if track is not None else 0.0)
+                weights, n_eff = self._softmin_weights(S, lam)
+            self.lam = lam
 
-        # compute the weighted mean (weight raw perturbations to avoid clipping bias)
-        # On dry_run, do this against a LOCAL copy so self.U isn't modified.
+        # weighted update on raw ε (not clipped U) to avoid clipping bias
         U_updated = self.U + np.einsum('k, kha -> ha', weights, eps)
         U_updated = np.clip(U_updated, self.act_low, self.act_high)
 
-        # extract the first action of the newly planned chunk
         action = U_updated[0].copy()
 
         info = {
@@ -189,6 +180,18 @@ class MPPI:
             return
         self.U[:-shift] = self.U[shift:]
         self.U[-shift:] = self.U[-shift - 1]
+    
+    def _is_correction(self, eps: np.ndarray, lam: float) -> np.ndarray:
+        """γ · Σ_t u_t^T Σ^{-1} ε_{k,t} with γ=λ, Σ=σ²I → (K,)."""
+        return lam * np.sum(self.U[None, :, :] * eps, axis=(1, 2)) / (self.sigma ** 2)
+
+    def _softmin_weights(self, S: np.ndarray, lam: float) -> tuple[np.ndarray, float]:
+        """Paper's weight formula with min-baseline stabilization."""
+        rho = np.min(S)
+        unnorm = np.exp(-(S - rho) / lam)
+        eta = np.sum(unnorm)
+        weights = unnorm / eta
+        return weights, effective_sample_size(weights)
     
     def get_rollout_data(self) -> dict:
         return {
