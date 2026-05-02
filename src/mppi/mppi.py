@@ -69,8 +69,6 @@ class MPPI:
         When the chunk is exhausted, `U` is shifted left by `open_loop_steps` so
         the next replan uses a correctly-aligned warm start.
         """
-        if dry_run:
-            self.reset()
         # --- Open-loop follow-up: serve the next action from the current plan.
         # No rollout, no weight update. `prior` is ignored on these calls since
         # it's only meaningful during the weight computation of a replan.
@@ -88,7 +86,10 @@ class MPPI:
 
         # sample ε ~ N(0, σ² I), perturb, clamp for rollout
         eps = np.random.randn(self.K, self.H, self.nu) * self.sigma
-        U_perturbed = self.U[None, :, :] + eps
+        if dry_run:
+            U_perturbed = eps
+        else:
+            U_perturbed = self.U[None, :, :] + eps
         U_clipped = np.clip(U_perturbed, self.act_low, self.act_high)
 
         # rollout
@@ -201,13 +202,3 @@ class MPPI:
             'costs': self._last_costs,
             'sensordata': self._last_sensordata, 
             }
-    
-
-
-
-                
-                
-
-
-
-

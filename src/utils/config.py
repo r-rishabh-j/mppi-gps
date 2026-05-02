@@ -122,6 +122,17 @@ class GPSConfig:
     # (cached chunk actions are prior-biased and can't serve as plain labels),
     # so you lose the open-loop speedup — effective cost becomes ~1 rollout/step.
     dagger_relabel: bool = False
+    # Target-clipping trust region for MSE distillation (deterministic policy
+    # only, used by `mppi_gps_det.MPPIGPSDet`). At the start of each S-step
+    # we snapshot the policy; for every mini-batch the MPPI label `a_label`
+    # is clipped to
+    #     [pi_old(o) - clip_eps,  pi_old(o) + clip_eps]
+    # before the MSE loss. This bounds per-iteration policy displacement in
+    # action space to ~clip_eps. 0.0 = disabled (raw MPPI labels). Typical
+    # range 0.05–0.3; 0.1 matches `mppi_gps_clip.py`'s deterministic branch.
+    # No effect on the Gaussian path (which has its own PPO-style ratio clip
+    # baked into `mppi_gps_clip._train_step_clipped`).
+    clip_eps: float = 0.1
 
 
 @dataclass

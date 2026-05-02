@@ -28,6 +28,7 @@ import torch
 
 from src.envs import make_env
 from src.gps.mppi_gps_clip import MPPIGPS
+from src.gps.mppi_gps_det import MPPIGPSDet
 from src.mppi.mppi import MPPI
 from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
 from src.utils.device import pick_device
@@ -121,6 +122,21 @@ def parse_args():
                         "forces a full rollout every step (cached chunk actions are prior-"
                         "biased, so can't serve as plain labels) — wallclock per step becomes "
                         "~1 rollout instead of 1/N.")
+    p.add_argument("--deterministic", action="store_true",
+                   help="Use the DeterministicPolicy student via src.gps.mppi_gps_det. "
+                        "Switches the prior to a quadratic distance to the policy mean "
+                        "(alpha * sum_t ||a - pi(o)||^2), drops KL/BADMM/prev-iter-KL "
+                        "(no policy distribution), forces MSE distillation. The "
+                        "--distill-loss / --nu / --prev-iter-kl-coef / --disable-kl flags "
+                        "are ignored in this mode.")
+    p.add_argument("--clip-eps", type=float, default=0.1,
+                   help="Target-clipping trust region for MSE distillation in the "
+                        "deterministic GPS path: snapshot the policy at the start of "
+                        "each S-step, then clip each MPPI label `a` to "
+                        "[pi_old(o)-eps, pi_old(o)+eps] before the MSE loss. Bounds "
+                        "per-iteration policy displacement to ~eps. 0 = disabled "
+                        "(raw MPPI labels). Default 0.1 (matches the deterministic "
+                        "branch in mppi_gps_clip.py). Ignored without --deterministic.")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint (wrapped or raw state_dict) "
                         "to load into gps.policy before the training loop")
@@ -175,6 +191,8 @@ def main():
         gps_cfg.prev_iter_kl_coef = args.prev_iter_kl_coef
     if args.dagger_relabel:
         gps_cfg.dagger_relabel = True
+    if args.clip_eps is not None:
+        gps_cfg.clip_eps = args.clip_eps
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
@@ -185,7 +203,8 @@ def main():
 
     # ---- Construct trainer (needed early so we can load --init-ckpt and
     #      record the actual policy class in config.json) ----
-    gps = MPPIGPS(env, mppi_cfg, policy_cfg, gps_cfg, device=device)
+    trainer_cls = MPPIGPSDet if args.deterministic else MPPIGPS
+    gps = trainer_cls(env, mppi_cfg, policy_cfg, gps_cfg, device=device)
 
     if args.init_ckpt is not None:
         init_ckpt = Path(args.init_ckpt)

@@ -38,17 +38,23 @@ from src.utils.math import weighted_mean_cov
 def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float, nu: float):
     """Build a callable ``(states, actions) -> (K,)`` for MPPI's ``prior`` arg.
 
-    In the MPPI importance-weight computation, log-weights are computed as:
+    The current ``MPPI.plan_step`` folds the prior return directly into the
+    trajectory **cost** (not log-weights), then computes::
 
-        log w_k = -S_k / lambda  +  log_prior
+        S_k     = S_env + is_corr + prior(states, actions)
+        log w_k = -(S_k - rho) / lambda
 
-    where S_k is the trajectory cost.  The prior is *added* to log-weights,
-    so a positive value *reduces* the effective cost.  We return:
+    So a *negative* prior return value reduces S_k and increases the weight.
+    To bias MPPI toward trajectories that are likely under the current policy
+    we therefore return::
 
-        prior(states, actions) = +alpha * nu * sum_t log pi(u_t | obs_t)
+        prior(states, actions) = -alpha * nu * sum_t log pi(u_t | obs_t)
 
-    This biases MPPI toward trajectories whose actions are likely under the
-    current policy, which is the "policy-augmented cost" described in Eq. 5.
+    Equivalently, the effective contribution to ``log w_k`` is
+    ``+(alpha * nu / lambda) * sum_t log pi`` — same direction as before, but
+    the absolute coefficient is now ``alpha * nu / lambda`` (the previous
+    log-space contract used ``alpha * nu`` directly). The knob names are
+    unchanged; rescale alpha if you want to recover the old absolute weight.
 
     Args:
         policy: The current policy network (used in eval / no-grad mode).
@@ -76,10 +82,10 @@ def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float, nu: fl
         lp = policy.log_prob_np(obs_flat, act_flat)  # (K*H,)
         lp = lp.reshape(K, H).sum(axis=1)            # (K,) — sum over time
 
-        # Scale by alpha (base weight) and nu (dual variable).
-        # Higher alpha  → MPPI samples are more strongly biased toward the policy.
-        # Higher nu     → the BADMM constraint is tighter (KL is being penalised more).
-        return alpha * nu * lp
+        # Negative-log-likelihood as a cost contribution. Scaled by alpha
+        # (base weight) and nu (BADMM dual). Higher alpha or nu  → MPPI samples
+        # are more strongly biased toward the policy / KL constraint tighter.
+        return -alpha * nu * lp
 
     return prior_fn
 

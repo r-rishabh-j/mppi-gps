@@ -36,7 +36,14 @@ from src.utils.math import weighted_mean_cov
 # ---------------------------------------------------------------------------
 
 def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float, nu: float):
-    """Build a callable ``(states, actions) -> (K,)`` for MPPI's ``prior`` arg."""
+    """Build a callable ``(states, actions) -> (K,)`` for MPPI's ``prior`` arg.
+
+    MPPI now folds the return into the trajectory cost directly
+    (``S = costs + is_corr + prior``, ``log w = -(S-rho)/lambda``), so we
+    return ``-alpha * nu * sum_t log pi(u|o)`` — a cost contribution that
+    rewards high-likelihood actions. See ``mppi_gps.make_policy_prior`` for
+    the full derivation.
+    """
     def prior_fn(states, actions) -> np.ndarray:
         states = np.asarray(states)
         actions = np.asarray(actions)
@@ -48,7 +55,7 @@ def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float, nu: fl
         lp = policy.log_prob_np(obs_flat, act_flat)  # (K*H,)
         lp = lp.reshape(K, H).sum(axis=1)            # (K,) — sum over time
 
-        return alpha * nu * lp
+        return -alpha * nu * lp
 
     return prior_fn
 
