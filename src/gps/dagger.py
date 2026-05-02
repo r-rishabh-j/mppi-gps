@@ -12,6 +12,7 @@ is kept at the trainer methods so callers don't have to think about it.
 """
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -264,7 +265,22 @@ class DAggerTrainer:
         return losses
 
     # ---------- training ----------
-    def _train_step_mse(self, obs: np.ndarray, act: np.ndarray) -> float:
+    def _train_step_mse(
+        self,
+        obs: np.ndarray,
+        act: np.ndarray,
+        old_policy: "GaussianPolicy | None" = None,
+        clip_eps: float = 0.0,
+    ) -> float:
+        """One MSE step. When ``old_policy`` and ``clip_eps > 0`` are given,
+        the targets are clipped to [pi_old(o) - eps, pi_old(o) + eps] before
+        the MSE loss — soft trust region on per-update displacement. See
+        DAggerConfig.clip_eps."""
+        if old_policy is not None and clip_eps > 0.0:
+            with torch.no_grad():
+                o_t = torch.as_tensor(obs, dtype=torch.float32, device=self.policy.device)
+                old_pred = old_policy.action(o_t).cpu().numpy()
+            act = np.clip(act, old_pred - clip_eps, old_pred + clip_eps)
         return self.policy.mse_step(obs, act)
 
     @torch.no_grad()
@@ -306,6 +322,19 @@ class DAggerTrainer:
         N = len(tr_o)
         idx = np.arange(N)
         last_train = last_val = float("nan")
+
+        # Optional pre-finetune snapshot for target clipping. Frozen, eval
+        # mode, no_grad. Gated on `clip_eps > 0` so the deepcopy + per-batch
+        # forward only runs when actually in use. NOT applied in warmup
+        # (random-init policy + clip would block useful learning).
+        clip_eps = float(getattr(self.cfg, "clip_eps", 0.0))
+        old_policy = None
+        if clip_eps > 0.0:
+            old_policy = copy.deepcopy(self.policy)
+            old_policy.eval()
+            for p in old_policy.parameters():
+                p.requires_grad_(False)
+
         epoch_bar = tqdm(
             range(self.cfg.distill_epochs),
             desc=f"round {round_idx} fit" if round_idx is not None else "dagger fit",
@@ -317,7 +346,10 @@ class DAggerTrainer:
             running, nb = 0.0, 0
             for start in range(0, N, self.cfg.batch_size):
                 b = idx[start:start + self.cfg.batch_size]
-                running += self._train_step_mse(tr_o[b], tr_a[b])
+                running += self._train_step_mse(
+                    tr_o[b], tr_a[b],
+                    old_policy=old_policy, clip_eps=clip_eps,
+                )
                 nb += 1
             last_train = running / max(nb, 1)
             last_val = self._eval_mse(va_o, va_a)

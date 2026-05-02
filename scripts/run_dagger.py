@@ -93,6 +93,14 @@ def parse_args() -> argparse.Namespace:
                         "wiping m/v moments. Recommended with --ema-hard-sync (stale Adam "
                         "state after a hard-sync) and whenever the buffer shifts distribution "
                         "enough that stale momentum becomes a liability.")
+    p.add_argument("--clip-eps", type=float, default=None,
+                   help="Target-clipping trust region for the per-round MSE finetune: "
+                        "snapshot the policy at the start of finetune(), then clip every "
+                        "MPPI label `a` to [pi_old(o)-eps, pi_old(o)+eps] before the MSE "
+                        "loss. Bounds typical per-round policy displacement and damps the "
+                        "impact of high-variance MPPI relabels. 0/unset = disabled (default). "
+                        "Typical 0.05–0.3. NOT applied during --warmup (clipping a random-"
+                        "init policy to its own predictions blocks learning).")
     p.add_argument("--exp-name", default="run",
                    help="Human-readable experiment name (used in the run dir name).")
     p.add_argument("--exp-dir", default="checkpoints/dagger",
@@ -122,6 +130,8 @@ def main() -> None:
         cfg.ema_hard_sync = True
     if args.reset_optim_per_iter:
         cfg.reset_optim_per_iter = True
+    if args.clip_eps is not None:
+        cfg.clip_eps = args.clip_eps
 
     device = pick_device(args.device)
     print(f"policy device: {device}")

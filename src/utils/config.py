@@ -160,4 +160,14 @@ class DAggerConfig:
     ema_hard_sync: bool = False
     # Wipe Adam moments at end of each DAgger round; see GPSConfig.
     reset_optim_per_iter: bool = False
+    # Target-clipping trust region for the per-round MSE finetune. Snapshot
+    # the policy at the start of `finetune()`; clip every batch's MPPI label
+    # to [pi_old(o) - clip_eps, pi_old(o) + clip_eps] before the MSE loss.
+    # Bounds typical per-round policy displacement in action space and damps
+    # the impact of high-variance MPPI relabels (small λ, terminal states,
+    # etc). 0.0 = disabled (current behaviour). Typical 0.05–0.3; matches
+    # GPSConfig.clip_eps and the deterministic branch of mppi_gps_clip.py.
+    # NOT applied during `warmup()` — clipping a random-init policy to its
+    # own random predictions would prevent it from learning the labels.
+    clip_eps: float = 0.0
 
