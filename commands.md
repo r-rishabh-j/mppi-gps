@@ -131,7 +131,7 @@ python -m scripts.run_gps --env acrobot --exp-name warmstart \
 
 # hopper — terminating env, needs auto-reset so dataset size doesn't collapse on early iters
 python -m scripts.run_gps --env hopper --auto-reset \
-    --disable-kl --distill-loss mse --alpha 0.1 --nu 1.0 \
+    --distill-loss mse --alpha 0.1 \
     --gps-iters 30 --episode-length 500 --device auto
 ```
 
@@ -140,30 +140,28 @@ Outputs (inside the run dir):
 - `best.pt` — copy of the iteration with the lowest mean rollout cost.
 - `final.pt` — copy of the last iteration's weights.
 - `config.json` — CLI args, all dataclass configs, policy class, git sha, eval summary.
-- `curves.json` / `curves.png` — cost / KL / nu / distill-loss curves.
+- `curves.json` / `curves.png` — cost / distill-loss curves.
 - `<env>.mp4` — first eval-episode video of the trained policy.
 
-### Policy-prior-only GPS (no KL / no BADMM)
+### Common flags
 
-Bias MPPI with `-α·log π(u|s)`, then plain behavior-clone the resulting
-(state, action) pairs. No KL estimation, no dual variable updates — `ν`
-stays constant at `--nu` (default 1.0).
+GPS runs MPPI under a policy-augmented cost (`S = S_env + ... - α·log π(u|s)`)
+then BC-distills the resulting (obs, action) pairs. No KL constraint, no BADMM
+dual updates.
 
 ```bash
-python -m scripts.run_gps --env acrobot --disable-kl --distill-loss nll \
+python -m scripts.run_gps --env acrobot --distill-loss nll \
     --alpha 0.1 --device auto --gps-iters 20
 
 # quick smoke test
-python -m scripts.run_gps --env acrobot --disable-kl --distill-loss nll \
-    --alpha 0.1 --nu 1.0 --gps-iters 3 --num-conditions 2 --episode-length 80 \
+python -m scripts.run_gps --env acrobot --distill-loss nll \
+    --alpha 0.1 --gps-iters 3 --num-conditions 2 --episode-length 80 \
     --n-eval 2 --eval-len 80 --device cpu
 ```
 
 Flags:
-- `--disable-kl` — skip KL accumulation + BADMM; run policy-prior-only variant.
 - `--distill-loss {nll,mse}` — `mse` matches plain BC, `nll` uses weighted NLL (default).
 - `--alpha` — weight on `-log π` inside the MPPI cost (policy-prior strength).
-- `--nu` — constant multiplier on the prior; effective weight is `alpha * nu`.
 - `--init-ckpt PATH` — load a wrapped or raw state_dict into the policy before the GPS loop (warm-start from BC / DAgger / a previous GPS run).
 - `--auto-reset` — on env termination during the C-step, reset to a fresh random init and keep collecting until `episode_length` steps are taken. Recommended for hopper and any other env that can terminate early; without it, early iters produce tiny distillation datasets.
 - `--warm-start-policy` — (advanced) seed MPPI's nominal `U` from a policy rollout before each condition. Off by default — the `-α·log π` prior already biases MPPI toward the policy, and on terminating envs the zero-padding past `done` actively hurts.
@@ -172,7 +170,7 @@ Flags:
 - `--ema-hard-sync` — at end of each S-step, promote the EMA shadow to live weights (θ ← EMA). Next iter's MPPI prior + S-step start from the smoothed policy. No effect without `--ema-decay > 0`. Strongly recommended to pair with `--reset-optim-per-iter`.
 - `--reset-optim-per-iter` — rebuild the policy's Adam optimizer at end of each GPS iter, wiping m/v moments. Required for Adam-state consistency after a hard-sync; also useful on its own because each GPS iter is a new supervised task (shifting C-step data) and stale momentum can blow through the `--prev-iter-kl-coef` trust region.
 - `--prev-iter-kl-coef C` — trust-region KL penalty `C·E_obs[KL(π_θ‖π_prev)]` added to the S-step distill loss. Stabilises iter-to-iter drift when C-step data shifts. NLL mode only (silently ignored for `--distill-loss mse`).
-- `--dagger-relabel` — decouple executor from teacher in the C-step: run MPPI twice per timestep — once WITH the policy prior (executor, steers the env + feeds KL) and once WITHOUT (side-effect-free `dry_run`, its action is the training label). Breaks the self-reinforcing loop where the executed MPPI action is already tilted toward the current policy. No-op when `α·ν == 0`. Works under any `open_loop_steps`, but with `open_loop_steps > 1` the label call forces a full rollout every timestep (cached chunk actions are prior-biased, not valid labels) — you lose the open-loop wallclock speedup on the label side.
+- `--dagger-relabel` — decouple executor from teacher in the C-step: run MPPI twice per timestep — once WITH the policy prior (executor, steers the env) and once WITHOUT (side-effect-free `dry_run`, its action is the training label). Breaks the self-reinforcing loop where the executed MPPI action is already tilted toward the current policy. No-op when `α == 0`. Works under any `open_loop_steps`, but with `open_loop_steps > 1` the label call forces a full rollout every timestep (cached chunk actions are prior-biased, not valid labels) — you lose the open-loop wallclock speedup on the label side.
 - `--gps-iters`, `--num-conditions`, `--episode-length` — override `GPSConfig` defaults.
 - `--n-eval`, `--eval-len` — evaluation episode count / length.
 - `--exp-name`, `--exp-dir` — run-dir naming (parent defaults to `experiments/gps`).
@@ -231,4 +229,4 @@ python -m scripts.visualisation.plot_results --env acrobot
 ### Bookeeping for experiments
 
 #### Hopper MPPI GPS
-python -m scripts.run_gps --env hopper --auto-reset --disable-kl --distill-loss nll --alpha 0.5 --nu 1.0  --gps-iters 20 --episode-length 1000 --device auto --exp-name hopper_autoreset --num-conditions 2
+python -m scripts.run_gps --env hopper --auto-reset --distill-loss nll --alpha 0.5 --gps-iters 20 --episode-length 1000 --device auto --exp-name hopper_autoreset --num-conditions 2

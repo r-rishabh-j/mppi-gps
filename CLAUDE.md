@@ -26,12 +26,10 @@ python -m scripts.collect_bc_demos
 python -m scripts.test_sl
 
 # GPS training (distills MPPI into reactive policy)
+# MPPI runs under a policy-augmented cost (-α·log π) then BC distills the data.
 python -m scripts.run_gps --env acrobot --device auto
 python -m scripts.run_gps --env hopper --gps-iters 30 --device auto
-
-# Policy-prior-only GPS (no KL / no BADMM — MPPI biased by -α·log π, then plain BC)
-python -m scripts.run_gps --env acrobot --disable-kl --distill-loss mse \
-    --alpha 0.1 --nu 1.0 --device auto
+python -m scripts.run_gps --env acrobot --distill-loss mse --alpha 0.1 --device auto
 
 # DAgger (MPPI-in-the-loop BC; policy trains on GPU, MPPI stays on CPU)
 python -m scripts.run_dagger --env acrobot --dagger-iters 10 \
@@ -63,7 +61,7 @@ No unit test framework is configured. Validation is done via `scripts/test_sl.py
 - **`src/policy/gaussian_policy.py`** — Diagonal Gaussian MLP policy for behavior cloning and GPS distillation. Accepts `device=` (cpu/mps/cuda); `act_np()` / `log_prob_np()` bridge to numpy callers.
 - **`src/policy/deterministic_policy.py`** — `DeterministicPolicy`: single-head MLP that regresses actions directly (MSE target, no `log_prob`). Used by DAgger / BC when `--deterministic` is passed. Head shape differs from `GaussianPolicy` (`act_dim` vs `2*act_dim`), so the two are not load-compatible — the wrapped checkpoint records `policy_class` so `eval_checkpoint` can auto-pick.
 - **`src/policy/ema.py`** — parameter-only EMA tracker. Attached via `attach_ema(decay)`; `ema_swapped_in()` is a context manager that temporarily swaps live params with the EMA shadow (used at eval and when writing `best.pt` so the on-disk checkpoint matches the reported eval cost). Drives the `--ema-decay` / `--ema-hard-sync` / `--reset-optim-per-iter` triple in both `GPSConfig` and `DAggerConfig`.
-- **`src/gps/mppi_gps.py`** — Core GPS training loop (`MPPIGPS` class). Distills MPPI into the policy via BADMM-constrained optimization with policy-augmented MPPI cost and moment-matched or sample-based KL estimators. Set `GPSConfig.disable_kl_constraint=True` (or `--disable-kl`) for the policy-prior-only variant: MPPI biased by `α·nu·log π(u|s)` with `nu` held constant, followed by plain BC (NLL or MSE via `distill_loss`).
+- **`src/gps/mppi_gps.py`** — Core GPS training loop (`MPPIGPS` class). Policy-prior-only formulation: MPPI is biased by `-α·log π(u|s)` in the trajectory cost, then BC-distills the resulting (obs, action) pairs (NLL or MSE via `distill_loss`). No KL constraint, no BADMM dual updates.
 - **`src/gps/mppi_gps_clip.py`** — experimental MPPI-GPS variant (clip-based update); kept beside `mppi_gps.py`. New work should default to `mppi_gps.py` unless explicitly investigating the clipped variant.
 - **`src/gps/dagger.py`** — `DAggerTrainer`: roll out the current policy (with β-mixed MPPI execution), relabel every visited state via `MPPI.plan_step`, aggregate into a capped buffer, finetune the policy. MPPI stays on CPU; policy trains on the selected device.
 - **`src/gps/ilqr.py`** — GPS via iLQR (skeleton/in-progress).

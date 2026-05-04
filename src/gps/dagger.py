@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 
 from src.envs.base import BaseEnv
 from src.mppi.mppi import MPPI
+from src.policy.deterministic_policy import DeterministicPolicy
 from src.policy.gaussian_policy import GaussianPolicy
 from src.utils.config import DAggerConfig
 
@@ -246,6 +247,9 @@ class DAggerTrainer:
         N = len(obs_r)
         idx = np.arange(N)
         losses: list[float] = []
+        grad_clip_norm = float(getattr(self.cfg, "grad_clip_norm", 0.0))
+        # Warmup never runs the Gaussian PPO clip — random-init policy gives
+        # a meaningless ratio. Deterministic grad-norm clip is fine here.
         epoch_bar = tqdm(
             range(epochs),
             desc="warmup fit",
@@ -257,7 +261,9 @@ class DAggerTrainer:
             running, nb = 0.0, 0
             for start in range(0, N, self.cfg.batch_size):
                 b = idx[start:start + self.cfg.batch_size]
-                running += self._train_step_mse(obs_r[b], act_r[b])
+                running += self._train_step(
+                    obs_r[b], act_r[b], grad_clip_norm=grad_clip_norm,
+                )
                 nb += 1
             loss = running / max(nb, 1)
             losses.append(loss)
@@ -265,23 +271,88 @@ class DAggerTrainer:
         return losses
 
     # ---------- training ----------
-    def _train_step_mse(
+    def _train_step(
         self,
         obs: np.ndarray,
         act: np.ndarray,
+        grad_clip_norm: float = 0.0,
         old_policy: "GaussianPolicy | None" = None,
-        clip_eps: float = 0.0,
+        clip_ratio: float = 0.0,
     ) -> float:
-        """One MSE step. When ``old_policy`` and ``clip_eps > 0`` are given,
-        the targets are clipped to [pi_old(o) - eps, pi_old(o) + eps] before
-        the MSE loss — soft trust region on per-update displacement. See
-        DAggerConfig.clip_eps."""
-        if old_policy is not None and clip_eps > 0.0:
-            with torch.no_grad():
-                o_t = torch.as_tensor(obs, dtype=torch.float32, device=self.policy.device)
-                old_pred = old_policy.action(o_t).cpu().numpy()
-            act = np.clip(act, old_pred - clip_eps, old_pred + clip_eps)
+        """One distillation step. Two policy-class-specific paths:
+
+        * Deterministic: MSE on the policy mean. ``grad_clip_norm > 0``
+          activates an L2 gradient-norm clip inside ``DeterministicPolicy.
+          mse_step`` (between backward and the Adam step).
+        * Gaussian + ``old_policy`` + ``clip_ratio > 0``: PPO-style ratio
+          clip surrogate, mirroring ``mppi_gps_clip._train_step_clipped``.
+          With uniform "advantage" of 1 (DAgger has no MPPI weights at
+          training time), each row pulls its log-likelihood up to
+          ``ratio = 1 + clip_ratio`` per step, then saturates.
+        * Gaussian without those args: plain MSE-on-mean, the historical
+          DAgger default.
+        """
+        # Deterministic path -------------------------------------------------
+        if isinstance(self.policy, DeterministicPolicy):
+            if grad_clip_norm > 0.0:
+                return self.policy.mse_step(obs, act, grad_clip_norm=grad_clip_norm)
+            return self.policy.mse_step(obs, act)
+
+        # Gaussian + PPO clip ------------------------------------------------
+        if (
+            isinstance(self.policy, GaussianPolicy)
+            and old_policy is not None
+            and clip_ratio > 0.0
+        ):
+            return self._train_step_gaussian_ppo(obs, act, old_policy, clip_ratio)
+
+        # Gaussian default: plain MSE on mean --------------------------------
         return self.policy.mse_step(obs, act)
+
+    def _train_step_gaussian_ppo(
+        self,
+        obs: np.ndarray,
+        act: np.ndarray,
+        old_policy: GaussianPolicy,
+        clip_ratio: float,
+    ) -> float:
+        """PPO-style ratio-clipped surrogate for the Gaussian dagger fit.
+
+        ``L = - E[ min(r, clip(r, 1-eps, 1+eps)) ]`` where
+        ``r = pi_theta(a|o) / pi_old(a|o)``. Mirrors the Gaussian branch of
+        ``mppi_gps_clip._train_step_clipped`` but with constant advantage 1
+        (DAgger does not retain MPPI importance weights past collection).
+
+        Touches the same per-step machinery as ``GaussianPolicy.mse_step``:
+        normaliser update, optimizer.zero_grad/backward/step, EMA update.
+        """
+        device = self.policy.device
+        o_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
+        a_t = torch.as_tensor(act, dtype=torch.float32, device=device)
+
+        if self.policy.normalizer is not None:
+            self.policy.normalizer.update(o_t)
+
+        curr_log_prob = self.policy.log_prob(o_t, a_t)
+        with torch.no_grad():
+            old_log_prob = old_policy.log_prob(o_t, a_t)
+
+        ratio = torch.exp(curr_log_prob - old_log_prob)
+        # Uniform "advantage" = 1; min(...) caps boost at ratio = 1+clip_ratio.
+        surr1 = ratio
+        surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+        loss = -torch.min(surr1, surr2).mean()
+
+        self.policy.optimizer.zero_grad()
+        loss.backward()
+        self.policy.optimizer.step()
+        # EMA hook — `mse_step` does this; mirror so the EMA shadow stays
+        # in sync with the live policy across PPO updates too. (This is
+        # one consistency improvement over `mppi_gps_clip`'s Gaussian
+        # branch, which omits the EMA update.)
+        if self.policy.ema is not None:
+            self.policy.ema.update(self.policy)
+        return float(loss.item())
 
     @torch.no_grad()
     def _eval_mse(self, obs: np.ndarray, act: np.ndarray, batch: int = 16384) -> float:
@@ -322,14 +393,14 @@ class DAggerTrainer:
         N = len(tr_o)
         idx = np.arange(N)
         last_train = last_val = float("nan")
+        grad_clip_norm = float(getattr(self.cfg, "grad_clip_norm", 0.0))
+        clip_ratio = float(getattr(self.cfg, "clip_ratio", 0.0))
 
-        # Optional pre-finetune snapshot for target clipping. Frozen, eval
-        # mode, no_grad. Gated on `clip_eps > 0` so the deepcopy + per-batch
-        # forward only runs when actually in use. NOT applied in warmup
-        # (random-init policy + clip would block useful learning).
-        clip_eps = float(getattr(self.cfg, "clip_eps", 0.0))
+        # Pre-finetune snapshot for the Gaussian PPO clip. Frozen, eval mode,
+        # no grad. Skipped for deterministic policy or when clip_ratio == 0
+        # (avoid the deepcopy + per-batch forward when not in use).
         old_policy = None
-        if clip_eps > 0.0:
+        if isinstance(self.policy, GaussianPolicy) and clip_ratio > 0.0:
             old_policy = copy.deepcopy(self.policy)
             old_policy.eval()
             for p in old_policy.parameters():
@@ -346,9 +417,11 @@ class DAggerTrainer:
             running, nb = 0.0, 0
             for start in range(0, N, self.cfg.batch_size):
                 b = idx[start:start + self.cfg.batch_size]
-                running += self._train_step_mse(
+                running += self._train_step(
                     tr_o[b], tr_a[b],
-                    old_policy=old_policy, clip_eps=clip_eps,
+                    grad_clip_norm=grad_clip_norm,
+                    old_policy=old_policy,
+                    clip_ratio=clip_ratio,
                 )
                 nb += 1
             last_train = running / max(nb, 1)

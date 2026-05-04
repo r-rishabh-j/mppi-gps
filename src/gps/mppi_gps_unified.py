@@ -1,26 +1,31 @@
-"""MPPI-GPS for DeterministicPolicy.
+"""Unified MPPI-GPS for GaussianPolicy and DeterministicPolicy students.
 
-Variant of ``mppi_gps_clip.py`` for a non-stochastic student policy.
+Subsumes ``mppi_gps_clip.py`` (Gaussian, NLL distill, optional PPO clip) and
+``mppi_gps_det.py`` (Deterministic, MSE distill, grad-norm clip). The C-step
+rollout, replay buffer, sub-episode flush, EMA / hard-sync / Adam-reset
+stabilisers, dagger-relabel, warm-start, auto-reset, and eval window are all
+shared. Policy-class-specific branches:
 
-* Policy prior is a quadratic distance to the policy mean::
+* **Policy prior** (``GPSConfig.policy_prior_type``):
+    - ``"auto"`` (default) → resolves to ``"nll"`` for Gaussian,
+      ``"mean_distance"`` for Deterministic.
+    - ``"nll"``: ``prior(s, a) = -alpha * Σ_t log π(a_t | o_t)``.
+      Gaussian-only — needs ``log_prob``; raises for Deterministic.
+    - ``"mean_distance"``: ``prior(s, a) = alpha * Σ_t ‖a_t − π.action(o_t)‖²``.
+      Uses ``policy.action(...)`` which returns the mean for both classes.
 
-      prior(states, actions) = alpha * sum_t || a_t - pi(obs_t) ||^2          (K,)
-
-  Non-negative, in env-cost units. MPPI adds it to S_k directly
-  (``S = costs + is_corr + prior``); higher alpha pulls samples toward the
-  current policy.
-
-* Distillation is always MSE on (obs, action_label) pairs aggregated
-  across conditions / sub-episodes / (optionally) the cross-iter buffer.
-
-* Stabilisers retained: EMA shadow + hard-sync, Adam reset, replay buffer
-  (``distill_buffer_cap``), DAgger-style relabel (gated on ``alpha > 0``),
-  warm-start MPPI from the current policy, auto-reset on termination,
-  gradient-norm clipping inside the policy's mse_step.
+* **Distill loss** is implicit in the policy class:
+    - DeterministicPolicy → MSE always (``mse_step`` with optional
+      ``grad_clip_norm``). ``cfg.distill_loss`` is ignored.
+    - GaussianPolicy → weighted NLL (``train_weighted``) with optional
+      ``cfg.prev_iter_kl_coef`` trust region. When ``cfg.clip_ratio > 0``,
+      the per-batch surrogate switches to the PPO ratio-clipped form
+      (mirroring ``mppi_gps_clip._train_step_clipped``'s Gaussian branch).
 """
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Callable
 
@@ -32,59 +37,95 @@ from tqdm.auto import tqdm
 from src.envs.base import BaseEnv
 from src.mppi.mppi import MPPI
 from src.policy.deterministic_policy import DeterministicPolicy
+from src.policy.gaussian_policy import GaussianPolicy
 from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
 from src.utils.evaluation import evaluate_policy
 from src.utils.experiment import copy_as, save_checkpoint
 
 
 # ---------------------------------------------------------------------------
-# Policy prior for MPPI (squared distance to deterministic policy mean)
+# Policy priors
 # ---------------------------------------------------------------------------
 
-def make_policy_prior(
-    policy: DeterministicPolicy,
+def make_mean_distance_prior(
+    policy,
     env: BaseEnv,
     alpha: float,
 ) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
-    """Build a per-sample cost callable for ``MPPI.plan_step``.
+    """``prior(s, a) = alpha * Σ_t ‖a_t − π.action(o_t)‖²``.
 
-    Given (states, actions) of shapes ``(K, H, state_dim)`` and
-    ``(K, H, act_dim)``, returns::
-
-        C_k = alpha * sum_t || a_{k,t} - pi(obs(s_{k,t})) ||^2          (K,)
-
-    Non-negative; in the same units as env cost. MPPI adds this to ``S_k``
-    inside the softmin, so larger residuals → higher cost → lower weight,
-    which biases the samples toward the policy mean.
-
-    The policy's ``forward`` is called inside ``torch.no_grad()`` and the
-    caller is responsible for ensuring the policy is in ``eval()`` mode
-    (Dropout / LayerNorm in ``DeterministicPolicy`` would otherwise inject
-    noise into the cost).
+    Works for any policy that exposes ``action(obs_tensor) -> Tensor`` of
+    shape (B, act_dim). For GaussianPolicy this is the mean head (no σ, no
+    sampling — sampling adds variance without changing the expectation).
+    For DeterministicPolicy this is the regression output directly.
     """
     device = policy._device
 
-    def prior_cost(
-        states: np.ndarray,
-        actions: np.ndarray,
-    ) -> np.ndarray:
+    def prior_cost(states: np.ndarray, actions: np.ndarray) -> np.ndarray:
         states = np.asarray(states)
         actions = np.asarray(actions)
         K, H, act_dim = actions.shape
 
-        # Full physics state → policy observation.
-        obs = np.asarray(env.state_to_obs(states))  # (K, H, obs_dim)
+        obs = np.asarray(env.state_to_obs(states))      # (K, H, obs_dim)
         obs_flat = obs.reshape(K * H, -1)
-
         with torch.no_grad():
             obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=device)
-            mu_flat = policy.forward(obs_t).cpu().numpy()
-
+            mu_flat = policy.action(obs_t).cpu().numpy()
         mu = mu_flat.reshape(K, H, act_dim)
-        sq = ((actions - mu) ** 2).sum(axis=(1, 2))   # (K,)
+        sq = ((actions - mu) ** 2).sum(axis=(1, 2))     # (K,)
         return alpha * sq
 
     return prior_cost
+
+
+def make_nll_prior(
+    policy: GaussianPolicy,
+    env: BaseEnv,
+    alpha: float,
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """``prior(s, a) = -alpha * Σ_t log π(a_t | o_t)``. GaussianPolicy only.
+
+    Negative log-likelihood as a cost contribution. Sigma-aware — actions
+    near a low-σ mean carry more weight than the same residual at a high-σ
+    mean. Effective contribution to ``log w`` is ``+(alpha/lambda) * Σ log π``.
+    """
+    if not isinstance(policy, GaussianPolicy):
+        raise TypeError(
+            f"nll prior requires GaussianPolicy (got {type(policy).__name__})"
+        )
+
+    def prior_fn(states: np.ndarray, actions: np.ndarray) -> np.ndarray:
+        states = np.asarray(states)
+        actions = np.asarray(actions)
+        K, H, _ = states.shape
+
+        obs = np.asarray(env.state_to_obs(states))      # (K, H, obs_dim)
+        obs_flat = obs.reshape(K * H, -1)
+        act_flat = actions.reshape(K * H, -1)
+        lp = policy.log_prob_np(obs_flat, act_flat)     # (K*H,)
+        lp = lp.reshape(K, H).sum(axis=1)               # (K,)
+        return -alpha * lp
+
+    return prior_fn
+
+
+def make_policy_prior(
+    policy,
+    env: BaseEnv,
+    alpha: float,
+    prior_type: str,
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """Dispatch to the requested prior. Caller is responsible for resolving
+    ``"auto"`` to a concrete type (the trainer does this in ``__init__`` so
+    incompatible combinations raise eagerly)."""
+    if prior_type == "mean_distance":
+        return make_mean_distance_prior(policy, env, alpha)
+    if prior_type == "nll":
+        return make_nll_prior(policy, env, alpha)
+    raise ValueError(
+        f"unknown policy_prior_type: {prior_type!r} "
+        f"(expected 'nll' or 'mean_distance')"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +139,7 @@ class GPSHistory:
     iteration_eval_costs: list[float] = field(default_factory=list)
     distill_losses: list[float] = field(default_factory=list)
     iteration_ema_drift: list[float] = field(default_factory=list)
+    iteration_prev_iter_kl: list[float] = field(default_factory=list)
     best_iter: int = -1
     best_cost: float = float("inf")
 
@@ -106,8 +148,13 @@ class GPSHistory:
 # Main class
 # ---------------------------------------------------------------------------
 
-class MPPIGPSDet:
-    """MPPI-GPS with a DeterministicPolicy student. See module docstring."""
+class MPPIGPS:
+    """Unified MPPI-GPS trainer for both Gaussian and Deterministic policies.
+
+    Construct with ``deterministic=True`` to use a ``DeterministicPolicy``;
+    default is ``GaussianPolicy``. The prior shape and distill loss are
+    derived from the policy class plus ``GPSConfig.policy_prior_type``.
+    """
 
     def __init__(
         self,
@@ -116,24 +163,45 @@ class MPPIGPSDet:
         policy_cfg: PolicyConfig,
         gps_cfg: GPSConfig,
         device: torch.device | str | None = None,
+        deterministic: bool = False,
     ):
         self.env = env
         self.mppi_cfg = mppi_cfg
         self.policy_cfg = policy_cfg
         self.gps_cfg = gps_cfg
+        self._deterministic = deterministic
 
-        self.policy = DeterministicPolicy(
-            env.obs_dim,
-            env.action_dim,
-            policy_cfg,
-            device=device,
-            action_bounds=env.action_bounds,
-        )
+        # ---- Policy ----
+        if deterministic:
+            self.policy = DeterministicPolicy(
+                env.obs_dim, env.action_dim, policy_cfg,
+                device=device, action_bounds=env.action_bounds,
+            )
+        else:
+            self.policy = GaussianPolicy(
+                env.obs_dim, env.action_dim, policy_cfg,
+                device=device, action_bounds=env.action_bounds,
+            )
+
+        # ---- Resolve "auto" prior type and validate combo ----
+        prior_type = getattr(gps_cfg, "policy_prior_type", "auto")
+        if prior_type == "auto":
+            prior_type = "mean_distance" if deterministic else "nll"
+        if prior_type == "nll" and deterministic:
+            raise ValueError(
+                "policy_prior_type='nll' requires GaussianPolicy; "
+                "DeterministicPolicy has no log_prob."
+            )
+        if prior_type not in ("nll", "mean_distance"):
+            raise ValueError(
+                f"unknown policy_prior_type: {prior_type!r} "
+                f"(expected 'auto', 'nll', or 'mean_distance')"
+            )
+        self._prior_type = prior_type
 
         self.mppi = MPPI(env, mppi_cfg)
-
-        # Cross-iteration episode replay buffer (rows-capped, FIFO eviction by
-        # whole episodes). Empty when distill_buffer_cap == 0.
+        # Cross-iteration episode replay buffer (rows-capped, FIFO eviction
+        # by whole episodes). Empty when distill_buffer_cap == 0.
         self._episode_buffer: list[dict] = []
 
         # EMA shadow over trainable params. Eval and best.pt selection happen
@@ -155,41 +223,107 @@ class MPPIGPSDet:
         self,
         obs: np.ndarray,
         actions: np.ndarray,
-        weights: np.ndarray,  # accepted for parity; unused in MSE path
+        weights: np.ndarray,
+        prev_policy=None,
     ) -> float:
-        """MSE distillation with gradient-norm clipping.
+        """Mini-batch distillation. Loss type derived from policy class.
 
-        ``weights`` is currently uniform across rows (set to ones in the
-        C-step) and the deterministic policy has no weighted loss, so we
-        ignore it. Kept in the signature so the buffer flatten path doesn't
-        need a special case.
-
-        When ``cfg.grad_clip_norm > 0``, the per-batch parameter gradient
-        is L2-norm-clipped to that bound inside ``DeterministicPolicy.
-        mse_step`` (between backward and the Adam step). Bounds per-update
-        parameter movement directly — loss-agnostic, dimension-aware, no
-        biased estimator. Replaces the earlier action-target clip
-        (``cfg.clip_eps``), which censored noisy labels and created a
-        biased fixed point at ``pi_old(o) ± clip_eps``.
-
-        ``cfg.grad_clip_norm == 0`` falls through to plain ``mse_step``.
+        * Deterministic → MSE via ``policy.mse_step`` with optional
+          ``cfg.grad_clip_norm`` clipping the gradient L2 norm. ``weights``
+          and ``prev_policy`` are ignored.
+        * Gaussian → weighted NLL via ``policy.train_weighted`` with
+          optional ``cfg.prev_iter_kl_coef`` trust region against
+          ``prev_policy``. If ``cfg.clip_ratio > 0``, every batch goes
+          through the PPO ratio-clipped surrogate instead.
         """
-        del weights
         cfg = self.gps_cfg
         N = len(obs)
         indices = np.arange(N)
         last_loss = 0.0
-        grad_clip_norm = float(getattr(cfg, "grad_clip_norm", 0.0))
+
+        if self._deterministic:
+            grad_clip_norm = float(getattr(cfg, "grad_clip_norm", 0.0))
+            for _ in range(cfg.distill_epochs):
+                np.random.shuffle(indices)
+                for start in range(0, N, cfg.distill_batch_size):
+                    batch = indices[start : start + cfg.distill_batch_size]
+                    last_loss = self.policy.mse_step(
+                        obs[batch], actions[batch],
+                        grad_clip_norm=grad_clip_norm,
+                    )
+            return last_loss
+
+        # ---- Gaussian path ----
+        clip_ratio = float(getattr(cfg, "clip_ratio", 0.0))
+        use_prev_kl = (
+            prev_policy is not None
+            and cfg.prev_iter_kl_coef > 0.0
+        )
+
+        # Snapshot for PPO clip (frozen, eval, no-grad). Skipped when
+        # clip_ratio == 0 to avoid the deepcopy + per-batch forward.
+        old_policy = None
+        if clip_ratio > 0.0:
+            old_policy = copy.deepcopy(self.policy)
+            old_policy.eval()
+            for p in old_policy.parameters():
+                p.requires_grad_(False)
 
         for _ in range(cfg.distill_epochs):
             np.random.shuffle(indices)
             for start in range(0, N, cfg.distill_batch_size):
                 batch = indices[start : start + cfg.distill_batch_size]
-                last_loss = self.policy.mse_step(
-                    obs[batch], actions[batch],
-                    grad_clip_norm=grad_clip_norm,
-                )
+                if old_policy is not None:
+                    last_loss = self._train_step_ppo_clip(
+                        obs[batch], actions[batch], weights[batch],
+                        old_policy, clip_ratio,
+                    )
+                else:
+                    last_loss = self.policy.train_weighted(
+                        obs[batch], actions[batch], weights[batch],
+                        prev_policy=prev_policy if use_prev_kl else None,
+                        prev_kl_coef=cfg.prev_iter_kl_coef if use_prev_kl else 0.0,
+                    )
         return last_loss
+
+    def _train_step_ppo_clip(
+        self,
+        obs: np.ndarray,
+        actions: np.ndarray,
+        weights: np.ndarray,
+        old_policy: GaussianPolicy,
+        clip_ratio: float,
+    ) -> float:
+        """PPO ratio-clipped surrogate. Mirrors mppi_gps_clip's Gaussian branch.
+
+        ``L = - E_w[ min(r·w, clip(r, 1-eps, 1+eps)·w) ]`` where
+        ``r = π_θ(a|o) / π_old(a|o)``.
+        """
+        device = self.policy.device
+        o_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
+        a_t = torch.as_tensor(actions, dtype=torch.float32, device=device)
+        w_t = torch.as_tensor(weights, dtype=torch.float32, device=device)
+
+        if self.policy.normalizer is not None:
+            self.policy.normalizer.update(o_t)
+
+        curr_log_prob = self.policy.log_prob(o_t, a_t)
+        with torch.no_grad():
+            old_log_prob = old_policy.log_prob(o_t, a_t)
+
+        ratio = torch.exp(curr_log_prob - old_log_prob)
+        surr1 = ratio * w_t
+        surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * w_t
+        loss = -torch.min(surr1, surr2).sum() / w_t.sum().clamp(min=1e-8)
+
+        self.policy.optimizer.zero_grad()
+        loss.backward()
+        self.policy.optimizer.step()
+        # Mirror mse_step / train_weighted's EMA hook so the shadow stays
+        # in sync regardless of which loss path runs.
+        if self.policy.ema is not None:
+            self.policy.ema.update(self.policy)
+        return float(loss.item())
 
     def _warm_start_mppi(self, initial_state: np.ndarray):
         """Seed MPPI nominal U with a policy rollout from ``initial_state``."""
@@ -223,7 +357,7 @@ class MPPIGPSDet:
 
         initial_conditions = self._sample_initial_conditions(cfg.num_conditions)
 
-        outer_bar = tqdm(range(num_iterations), desc="GPS-det", unit="iter")
+        outer_bar = tqdm(range(num_iterations), desc="GPS", unit="iter")
         for iteration in outer_bar:
             alpha = cfg.policy_augmented_alpha
 
@@ -234,8 +368,8 @@ class MPPIGPSDet:
 
             # ========== C-STEP ==========
             # eval() so the prior_fn forward (which goes through Dropout +
-            # LayerNorm) is deterministic — Dropout active in train() mode
-            # would inject noise into MPPI's cost.
+            # LayerNorm in BOTH policy classes) is deterministic. Train
+            # mode would inject Dropout noise into MPPI's cost.
             self.policy.eval()
 
             c_step_total = cfg.num_conditions * cfg.episode_length
@@ -246,9 +380,11 @@ class MPPIGPSDet:
                 leave=False,
             )
             for ic_idx, ic_state in enumerate(initial_conditions):
-                # New prior closure each condition — captures current policy
-                # weights (for `policy.forward`) and current alpha.
-                prior_fn = make_policy_prior(self.policy, self.env, alpha)
+                # Fresh prior closure each condition — captures current
+                # policy weights and current alpha.
+                prior_fn = make_policy_prior(
+                    self.policy, self.env, alpha, self._prior_type,
+                )
 
                 if iteration > 0 and cfg.warm_start_policy:
                     self._warm_start_mppi(ic_state)
@@ -351,12 +487,43 @@ class MPPIGPSDet:
                 act_flat = np.concatenate(all_actions, axis=0)
                 w_flat = np.concatenate(all_weights, axis=0)
 
-            loss = self._distill_epoch(obs_flat, act_flat, w_flat)
+            # Snapshot of pre-S-step policy for the trust-region KL-to-prev
+            # penalty. Gaussian-only (deterministic has no distribution); we
+            # still tolerate the field being set with a det policy by simply
+            # skipping the snapshot.
+            prev_policy = None
+            if (
+                not self._deterministic
+                and cfg.prev_iter_kl_coef > 0.0
+            ):
+                prev_policy = copy.deepcopy(self.policy)
+                prev_policy.eval()
+                for p in prev_policy.parameters():
+                    p.requires_grad_(False)
+
+            loss = self._distill_epoch(obs_flat, act_flat, w_flat, prev_policy=prev_policy)
 
             # Diagnostic: post-distill EMA drift. Compute BEFORE any hard-sync
             # so the diagnostic reflects how far theta actually moved this
             # S-step (post-sync drift would always be 0).
-            ema_drift = self.policy.ema_l2_drift() if cfg.ema_decay > 0.0 else float("nan")
+            ema_drift = (
+                self.policy.ema_l2_drift() if cfg.ema_decay > 0.0 else float("nan")
+            )
+
+            # prev-iter KL diagnostic — Gaussian only, requires kl_to_np.
+            if (
+                prev_policy is not None
+                and not self._deterministic
+                and len(obs_flat) > 0
+                and hasattr(self.policy, "kl_to_np")
+            ):
+                diag_n = min(len(obs_flat), 4096)
+                diag_idx = np.random.choice(len(obs_flat), size=diag_n, replace=False)
+                prev_iter_kl_diag = self.policy.kl_to_np(
+                    obs_flat[diag_idx], prev_policy,
+                )
+            else:
+                prev_iter_kl_diag = float("nan")
 
             # End-of-S-step stabilisers: hard-sync first, then Adam reset.
             if cfg.ema_decay > 0.0 and cfg.ema_hard_sync:
@@ -369,6 +536,7 @@ class MPPIGPSDet:
             history.iteration_costs.append(mppi_cost)
             history.distill_losses.append(loss)
             history.iteration_ema_drift.append(ema_drift)
+            history.iteration_prev_iter_kl.append(prev_iter_kl_diag)
 
             # ========== Eval (drives best.pt) ==========
             eval_every = max(int(getattr(cfg, "eval_every", 1)), 1)
@@ -397,6 +565,7 @@ class MPPIGPSDet:
                         eval_cost=eval_cost,
                         distill_loss=loss,
                         ema_drift=ema_drift,
+                        prev_iter_kl=prev_iter_kl_diag,
                     )
                     if do_eval and eval_cost < history.best_cost:
                         history.best_cost = eval_cost
@@ -412,8 +581,9 @@ class MPPIGPSDet:
                 postfix["eval_cost"] = f"{eval_cost:.2f}"
             outer_bar.set_postfix(**postfix)
 
+            tag = "GPS-det" if self._deterministic else "GPS"
             base_line = (
-                f"[GPS-det iter {iteration:3d}]  "
+                f"[{tag} iter {iteration:3d}]  "
                 f"mppi_cost={mppi_cost:8.2f}  "
                 f"distill_loss={loss:.4f}"
             )
@@ -423,6 +593,8 @@ class MPPIGPSDet:
                 base_line += f"  buf={n_eps}eps/{n_rows}rows"
             if cfg.ema_decay > 0.0:
                 base_line += f"  ema_drift={ema_drift:.4f}"
+            if not self._deterministic and cfg.prev_iter_kl_coef > 0.0:
+                base_line += f"  prev_kl={prev_iter_kl_diag:.4f}"
             if do_eval:
                 base_line += f"  eval_cost={eval_cost:8.2f}"
             tqdm.write(base_line)

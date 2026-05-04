@@ -41,19 +41,19 @@ class GPSConfig:
     num_iterations: int = 50
     num_conditions: int = 5         # number of initial states
     episode_length: int = 500       # steps per episode during GPS training
-    kl_estimator: str = "moment_matched" # "moment_matched" (Eq 3): fits Gaussian to MPPI samples, closed-form KL — stable but unimodal
-    # "sample_based" (Eq 4): estimates KL directly from weighted particles variance
-    kl_target: float = 10.0          # target KL for BADMM dual update
-    badmm_init_nu: float = 1.0     # initial dual variable (penalizes KL between MPPI and policy)
-    badmm_step_size: float = 1.0
-    policy_augmented_alpha: float = 0.1 # weight on -log π(u|x) in MPPI cost (Eq 5)
+    policy_augmented_alpha: float = 0.1 # weight on the policy prior in MPPI cost
     distill_batch_size: int = 256   # mini-batch size for policy distillation
     distill_epochs: int = 30         # gradient epochs per GPS iteration
     warm_start_policy: bool = False  # warm-start MPPI nominal U from policy rollout
-    disable_kl_constraint: bool = False  # if True: skip KL/BADMM, keep nu fixed at badmm_init_nu,
-                                         # i.e. run MPPI with a policy prior of weight alpha*nu (const),
-                                         # then plain BC. This is the "policy-prior-only" GPS variant.
     distill_loss: str = "nll"       # "nll" (weighted NLL on policy log-prob) or "mse" (MSE on mean)
+    # Policy-prior shape used by the unified MPPIGPS trainer
+    # (`src/gps/mppi_gps_unified.py`). Choices:
+    #   * "auto" → "nll" for GaussianPolicy, "mean_distance" for DeterministicPolicy.
+    #   * "nll" → prior = -alpha * Σ_t log π(u|o). Gaussian-only; raises for det.
+    #   * "mean_distance" → prior = alpha * Σ_t ‖a − π.action(o)‖². Works for both.
+    # The legacy trainers (mppi_gps.py / mppi_gps_clip.py / mppi_gps_det.py) ignore
+    # this field — each hard-codes its own prior.
+    policy_prior_type: str = "auto"
     auto_reset: bool = False        # On env termination mid-episode during the C-step,
                                     # reset to a fresh random init and keep collecting until
                                     # episode_length steps are taken. Required for terminating
@@ -110,10 +110,10 @@ class GPSConfig:
     # (closed-form diag-Gaussian KL); silently a no-op for MSE since the
     # deterministic mean-only loss has no policy distribution to constrain.
     prev_iter_kl_coef: float = 0.1
-    # When True (and the effective policy prior α·ν > 0), the C-step runs TWO
+    # When True (and policy prior strength alpha > 0), the C-step runs TWO
     # MPPI calls per timestep: the first with the policy prior (executes the
-    # env, feeds KL), the second without (side-effect-free dry_run, its action
-    # is the training label). Decouples "steer where we visit" from "what the
+    # env), the second without (side-effect-free dry_run, its action is the
+    # training label). Decouples "steer where we visit" from "what the
     # teacher says" — fixes the self-reinforcing loop where the executed MPPI
     # action is already tilted toward the current policy. DAgger-style
     # relabeling inside the GPS loop. Default False preserves current conflated
@@ -122,17 +122,20 @@ class GPSConfig:
     # (cached chunk actions are prior-biased and can't serve as plain labels),
     # so you lose the open-loop speedup — effective cost becomes ~1 rollout/step.
     dagger_relabel: bool = False
-    # Target-clipping trust region for MSE distillation (deterministic policy
-    # only, used by `mppi_gps_det.MPPIGPSDet`). At the start of each S-step
-    # we snapshot the policy; for every mini-batch the MPPI label `a_label`
-    # is clipped to
-    #     [pi_old(o) - clip_eps,  pi_old(o) + clip_eps]
-    # before the MSE loss. This bounds per-iteration policy displacement in
-    # action space to ~clip_eps. 0.0 = disabled (raw MPPI labels). Typical
-    # range 0.05–0.3; 0.1 matches `mppi_gps_clip.py`'s deterministic branch.
-    # No effect on the Gaussian path (which has its own PPO-style ratio clip
-    # baked into `mppi_gps_clip._train_step_clipped`).
+    # Legacy: action-target clip used only by the MSE branch of
+    # `mppi_gps_clip._train_step_clipped` (clamps the label to
+    # [pi_old(o) ± clip_eps] before the MSE loss). Kept for that branch's
+    # back-compat; `mppi_gps_det.MPPIGPSDet` no longer uses it (was
+    # removed in favour of `grad_clip_norm` — loss-agnostic, no biased
+    # fixed point at the boundary).
     clip_eps: float = 0.1
+    # Gradient-norm clip applied between backward() and optimizer.step() in
+    # the deterministic policy's mse_step (used by `mppi_gps_det.MPPIGPSDet`).
+    # Bounds typical per-update parameter movement; loss-agnostic. 0.0 =
+    # disabled. 1.0 is a sensible default for normalized-action envs;
+    # sweep {0.5, 1.0, 5.0} if the policy learns too slowly or the loss
+    # spikes. No effect on the Gaussian path.
+    grad_clip_norm: float = 1.0
 
 
 @dataclass
@@ -160,14 +163,24 @@ class DAggerConfig:
     ema_hard_sync: bool = False
     # Wipe Adam moments at end of each DAgger round; see GPSConfig.
     reset_optim_per_iter: bool = False
-    # Target-clipping trust region for the per-round MSE finetune. Snapshot
-    # the policy at the start of `finetune()`; clip every batch's MPPI label
-    # to [pi_old(o) - clip_eps, pi_old(o) + clip_eps] before the MSE loss.
-    # Bounds typical per-round policy displacement in action space and damps
-    # the impact of high-variance MPPI relabels (small λ, terminal states,
-    # etc). 0.0 = disabled (current behaviour). Typical 0.05–0.3; matches
-    # GPSConfig.clip_eps and the deterministic branch of mppi_gps_clip.py.
-    # NOT applied during `warmup()` — clipping a random-init policy to its
-    # own random predictions would prevent it from learning the labels.
-    clip_eps: float = 0.0
+    # L2 gradient-norm clip applied inside the deterministic policy's
+    # mse_step (between backward and optimizer.step). Bounds per-update
+    # parameter movement; loss-agnostic, no biased estimator. Applied in
+    # both `warmup()` and `finetune()`. ONLY active when `self.policy` is
+    # a DeterministicPolicy — Gaussian dagger uses `clip_ratio` instead.
+    # 0.0 = disabled. Default 1.0 matches `GPSConfig.grad_clip_norm`.
+    grad_clip_norm: float = 1.0
+    # PPO-style probability ratio clip for the GAUSSIAN dagger finetune,
+    # mirroring `mppi_gps_clip._train_step_clipped`'s Gaussian branch.
+    # At the start of `finetune()` we snapshot the policy; per batch the
+    # surrogate
+    #     L = - E[ min(r, clip(r, 1-eps, 1+eps)) ],   r = pi_theta / pi_old
+    # is minimized — i.e. each (obs, expert_action) pair gets its log-
+    # likelihood boosted up to ratio = 1+eps per step, then saturates.
+    # Trust region in distribution space. ONLY active when `self.policy`
+    # is GaussianPolicy AND `clip_ratio > 0`. Otherwise Gaussian dagger
+    # falls through to plain MSE-on-mean. NOT applied during `warmup()`
+    # (random-init policy → meaningless ratio). 0.0 = disabled (default
+    # = plain MSE). Typical 0.1–0.3; standard PPO uses 0.2.
+    clip_ratio: float = 0.0
 

@@ -74,7 +74,18 @@ class DeterministicPolicy(nn.Module):
     def action(self, obs: torch.Tensor) -> torch.Tensor:
         return self.forward(obs)
 
-    def mse_step(self, obs: np.ndarray, actions: np.ndarray) -> float:
+    def mse_step(
+        self,
+        obs: np.ndarray,
+        actions: np.ndarray,
+        grad_clip_norm: float = 0.0,
+    ) -> float:
+        """One MSE update step. When ``grad_clip_norm > 0``, the parameter
+        gradient is L2-norm-clipped to that bound between ``backward()`` and
+        ``optimizer.step()`` — a soft trust region on per-update parameter
+        movement that is independent of the loss magnitude or the residual
+        distribution. Loss-agnostic, dimension-aware, no biased estimator
+        (unlike target-clipping the labels)."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
         if self.normalizer is not None:
@@ -83,6 +94,8 @@ class DeterministicPolicy(nn.Module):
         loss = ((pred - act_t) ** 2).mean()
         self.optimizer.zero_grad()
         loss.backward()
+        if grad_clip_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip_norm)
         self.optimizer.step()
         if self.ema is not None:
             self.ema.update(self)

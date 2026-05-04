@@ -1,17 +1,8 @@
-"""MPPI-based Guided Policy Search.
+"""MPPI-based Guided Policy Search (PPO/target-clip variant).
 
-Distills an MPPI controller into a reactive neural network policy via
-constrained optimization with BADMM dual updates on the KL divergence.
-
-The high-level loop (Algorithm 1 from the proposal) is:
-  1. For each initial condition, run MPPI with a policy-augmented cost
-     that biases trajectory samples toward actions the policy can represent.
-  2. Collect the executed (obs, action) pairs from each condition.
-  3. Distill those pairs into the policy via weighted maximum-likelihood
-     (supervised learning on the MPPI teacher's demonstrations).
-  4. Measure the KL divergence between the MPPI trajectory distribution
-     and the policy, then adjust the BADMM dual variable nu accordingly.
-  5. Optionally warm-start MPPI's nominal trajectory from the updated policy.
+Same outer loop as `mppi_gps.py` but with PPO-style ratio clipping (Gaussian)
+or action-target clipping (deterministic-MSE) inside the S-step. Pure
+policy-prior-only formulation — no BADMM/KL constraint.
 """
 
 import copy
@@ -28,21 +19,17 @@ from src.policy.gaussian_policy import GaussianPolicy
 from src.utils.config import MPPIConfig, PolicyConfig, GPSConfig
 from src.utils.evaluation import evaluate_policy
 from src.utils.experiment import copy_as, save_checkpoint
-from src.utils.math import weighted_mean_cov
 
 
 # ---------------------------------------------------------------------------
 # Policy prior for MPPI (Eq. 5 from the proposal)
 # ---------------------------------------------------------------------------
 
-def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float, nu: float):
+def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float):
     """Build a callable ``(states, actions) -> (K,)`` for MPPI's ``prior`` arg.
 
-    MPPI now folds the return into the trajectory cost directly
-    (``S = costs + is_corr + prior``, ``log w = -(S-rho)/lambda``), so we
-    return ``-alpha * nu * sum_t log pi(u|o)`` — a cost contribution that
-    rewards high-likelihood actions. See ``mppi_gps.make_policy_prior`` for
-    the full derivation.
+    Returns ``-alpha * sum_t log pi(u|o)`` as a cost contribution. See
+    ``mppi_gps.make_policy_prior`` for the full derivation.
     """
     def prior_fn(states, actions) -> np.ndarray:
         states = np.asarray(states)
@@ -55,88 +42,9 @@ def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float, nu: fl
         lp = policy.log_prob_np(obs_flat, act_flat)  # (K*H,)
         lp = lp.reshape(K, H).sum(axis=1)            # (K,) — sum over time
 
-        return -alpha * nu * lp
+        return -alpha * lp
 
     return prior_fn
-
-
-# ---------------------------------------------------------------------------
-# KL estimators
-# ---------------------------------------------------------------------------
-
-def _kl_diagonal_gaussian(mu_p, cov_p, mu_q, log_sigma_q):
-    """Closed-form KL(N(mu_p, cov_p) || N(mu_q, diag(sigma_q^2)))."""
-    D = mu_p.shape[0]
-    var_q = np.exp(2.0 * log_sigma_q)                # (D,)
-    inv_var_q = 1.0 / (var_q + 1e-8)                 # avoid division by zero
-
-    trace_term = np.sum(np.diag(cov_p) * inv_var_q)
-    diff = mu_q - mu_p
-    mahal = np.sum(diff ** 2 * inv_var_q)
-
-    log_det_q = 2.0 * np.sum(log_sigma_q)
-    sign, log_det_p = np.linalg.slogdet(cov_p + 1e-8 * np.eye(D))
-    log_det_ratio = log_det_q - log_det_p
-
-    kl = 0.5 * (trace_term + mahal - D + log_det_ratio)
-    return max(kl, 0.0)
-
-
-def compute_kl_moment_matched(
-    episode_mppi_actions: list[np.ndarray],
-    episode_mppi_weights: list[np.ndarray],
-    episode_obs: list[np.ndarray],
-    policy: GaussianPolicy,
-) -> tuple[float, dict]:
-    """Moment-matched KL divergence (Eq. 3 from the proposal)."""
-    kl_sum = 0.0
-    T = len(episode_obs)
-
-    for t in range(T):
-        actions_t = episode_mppi_actions[t]    # (K, act_dim)
-        weights_t = episode_mppi_weights[t]    # (K,)
-        obs_t = episode_obs[t]                 # (obs_dim,)
-
-        mu_mppi, cov_mppi = weighted_mean_cov(actions_t, weights_t)
-
-        device = getattr(policy, "_device", torch.device("cpu"))
-        obs_tensor = torch.as_tensor(obs_t, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            mu_pi, log_sigma_pi = policy(obs_tensor)
-        mu_pi = mu_pi.squeeze(0).cpu().numpy()
-        log_sigma_pi = log_sigma_pi.squeeze(0).cpu().numpy()
-
-        kl_sum += _kl_diagonal_gaussian(mu_mppi, cov_mppi, mu_pi, log_sigma_pi)
-
-    kl_avg = kl_sum / max(T, 1)
-    return kl_avg, {"kl_sum": kl_sum, "T": T}
-
-
-def compute_kl_sample_based(
-    episode_mppi_actions: list[np.ndarray],
-    episode_mppi_weights: list[np.ndarray],
-    episode_obs: list[np.ndarray],
-    policy: GaussianPolicy,
-) -> tuple[float, dict]:
-    """Sample-based KL estimate (Eq. 4 from the proposal)."""
-    kl_sum = 0.0
-    T = len(episode_obs)
-
-    for t in range(T):
-        actions_t = episode_mppi_actions[t]    # (K, act_dim)
-        weights_t = episode_mppi_weights[t]    # (K,)
-        obs_t = episode_obs[t]                 # (obs_dim,)
-
-        K = actions_t.shape[0]
-        obs_batch = np.broadcast_to(obs_t, (K, obs_t.shape[-1]))
-        log_pi = policy.log_prob_np(obs_batch, actions_t)  # (K,)
-
-        log_w = np.log(weights_t + 1e-10)  # +eps to avoid log(0)
-        kl_t = np.sum(weights_t * (log_w - log_pi))
-        kl_sum += max(kl_t, 0.0)
-
-    kl_avg = kl_sum / max(T, 1)
-    return kl_avg, {"kl_sum": kl_sum, "T": T}
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +56,6 @@ class GPSHistory:
     """Training metrics collected during GPS, one entry per iteration."""
     iteration_costs: list[float] = field(default_factory=list)
     iteration_eval_costs: list[float] = field(default_factory=list)
-    iteration_kl: list[float] = field(default_factory=list)
-    iteration_nu: list[float] = field(default_factory=list)
     distill_losses: list[float] = field(default_factory=list)
     best_iter: int = -1
     best_cost: float = float("inf")
@@ -177,7 +83,6 @@ class MPPIGPS:
             action_bounds=env.action_bounds,
         )
 
-        self.nu = gps_cfg.badmm_init_nu
         self.mppi = MPPI(env, mppi_cfg)
         self._episode_buffer: list[dict] = []
 
@@ -274,16 +179,6 @@ class MPPIGPS:
                 )
         return last_loss
 
-    def _update_badmm(self, kl_value: float):
-        """Adjust the BADMM dual variable nu based on the current KL."""
-        target = self.gps_cfg.kl_target
-        step = self.gps_cfg.badmm_step_size
-        if kl_value > target:
-            self.nu *= step      # tighten: increase the penalty
-        elif kl_value < target:
-            self.nu /= step      # relax: decrease the penalty
-        self.nu = np.clip(self.nu, 1e-4, 1e4)
-
     def _warm_start_mppi(self, initial_state: np.ndarray):
         """Warm-start MPPI's nominal action sequence from the current policy."""
         self.env.reset(state=initial_state)
@@ -316,7 +211,6 @@ class MPPIGPS:
             run_dir.mkdir(parents=True, exist_ok=True)
 
         initial_conditions = self._sample_initial_conditions(cfg.num_conditions)
-        skip_kl = cfg.disable_kl_constraint
 
         outer_bar = tqdm(range(num_iterations), desc="GPS", unit="iter")
         for iteration in outer_bar:
@@ -325,10 +219,6 @@ class MPPIGPS:
             all_obs: list[np.ndarray] = []
             all_actions: list[np.ndarray] = []
             all_weights: list[np.ndarray] = []
-
-            all_kl_actions: list[list[np.ndarray]] = []
-            all_kl_weights: list[list[np.ndarray]] = []
-            all_kl_obs: list[list[np.ndarray]] = []
 
             condition_costs: list[float] = []
 
@@ -340,9 +230,7 @@ class MPPIGPS:
                 leave=False,
             )
             for ic_idx, ic_state in enumerate(initial_conditions):
-                prior_fn = make_policy_prior(
-                    self.policy, self.env, alpha, self.nu,
-                )
+                prior_fn = make_policy_prior(self.policy, self.env, alpha)
 
                 if iteration > 0 and cfg.warm_start_policy:
                     self._warm_start_mppi(ic_state)
@@ -354,9 +242,6 @@ class MPPIGPS:
                 condition_sub_episodes: list[dict] = []
                 cur_obs: list[np.ndarray] = []
                 cur_actions: list[np.ndarray] = []
-                episode_kl_actions = []   
-                episode_kl_weights = []   
-                episode_obs_for_kl: list[np.ndarray] = []  
                 episode_cost = 0.0
 
                 def _flush_sub_episode():
@@ -377,15 +262,7 @@ class MPPIGPS:
                     action, info = self.mppi.plan_step(state, prior=prior_fn)
 
                     cur_obs.append(obs.copy())
-                    cur_actions.append(action.copy())  
-
-                    if not skip_kl:
-                        rollout_data = self.mppi.get_rollout_data()
-                        first_step_actions = np.array(rollout_data['actions'][:, 0, :])
-                        weights = np.array(rollout_data['weights'])
-                        episode_kl_actions.append(first_step_actions)
-                        episode_kl_weights.append(weights)
-                        episode_obs_for_kl.append(obs.copy())
+                    cur_actions.append(action.copy())
 
                     _, cost, done, _ = self.env.step(action)
                     episode_cost += cost
@@ -416,11 +293,6 @@ class MPPIGPS:
                         all_actions.append(sub_ep["actions"])
                         all_weights.append(sub_ep["weights"])
 
-                if not skip_kl:
-                    all_kl_actions.append(episode_kl_actions)
-                    all_kl_weights.append(episode_kl_weights)
-                    all_kl_obs.append(episode_obs_for_kl)
-
                 condition_costs.append(episode_cost)
                 c_bar.set_postfix(
                     ic=f"{ic_idx + 1}/{cfg.num_conditions}",
@@ -437,36 +309,15 @@ class MPPIGPS:
                 w_flat = np.concatenate(
                     [ep["weights"] for ep in self._episode_buffer], axis=0)
             else:
-                obs_flat = np.concatenate(all_obs, axis=0)     
-                act_flat = np.concatenate(all_actions, axis=0)  
-                w_flat = np.concatenate(all_weights, axis=0)    
+                obs_flat = np.concatenate(all_obs, axis=0)
+                act_flat = np.concatenate(all_actions, axis=0)
+                w_flat = np.concatenate(all_weights, axis=0)
 
             loss = self._distill_epoch(obs_flat, act_flat, w_flat)
-
-            # ========== KL computation (average across conditions) ==========
-            if skip_kl:
-                kl_mean = float("nan")
-            else:
-                kl_values = []
-                kl_fn = (compute_kl_moment_matched
-                         if cfg.kl_estimator == "moment_matched"
-                         else compute_kl_sample_based)
-                for ic_idx in range(cfg.num_conditions):
-                    kl_val, _ = kl_fn(
-                        all_kl_actions[ic_idx],
-                        all_kl_weights[ic_idx],
-                        all_kl_obs[ic_idx],
-                        self.policy,
-                    )
-                    kl_values.append(kl_val)
-                kl_mean = float(np.mean(kl_values))
-                self._update_badmm(kl_mean)
 
             # ========== Logging ==========
             mppi_cost = float(np.mean(condition_costs))
             history.iteration_costs.append(mppi_cost)
-            history.iteration_kl.append(kl_mean)
-            history.iteration_nu.append(self.nu)
             history.distill_losses.append(loss)
 
             # ========== Policy evaluation ==========
@@ -498,8 +349,6 @@ class MPPIGPS:
                     mppi_cost=mppi_cost,
                     eval_cost=eval_cost,
                     distill_loss=loss,
-                    kl=kl_mean,
-                    nu=self.nu,
                 )
                 if do_eval and eval_cost < history.best_cost:
                     history.best_cost = eval_cost
@@ -509,8 +358,6 @@ class MPPIGPS:
             postfix = {
                 "mppi_cost": f"{mppi_cost:.2f}",
                 "loss": f"{loss:.3f}",
-                "kl": f"{kl_mean:.3f}",
-                "nu": f"{self.nu:.3f}",
                 "best": history.best_iter if history.best_iter >= 0 else "-",
             }
             if do_eval:
@@ -520,9 +367,7 @@ class MPPIGPS:
             base_line = (
                 f"[GPS iter {iteration:3d}]  "
                 f"mppi_cost={mppi_cost:8.2f}  "
-                f"distill_loss={loss:.4f}  "
-                f"kl={kl_mean:.4f}  "
-                f"nu={self.nu:.4f}"
+                f"distill_loss={loss:.4f}"
             )
             if cfg.distill_buffer_cap > 0:
                 n_eps = len(self._episode_buffer)

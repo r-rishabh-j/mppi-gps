@@ -93,14 +93,22 @@ def parse_args() -> argparse.Namespace:
                         "wiping m/v moments. Recommended with --ema-hard-sync (stale Adam "
                         "state after a hard-sync) and whenever the buffer shifts distribution "
                         "enough that stale momentum becomes a liability.")
-    p.add_argument("--clip-eps", type=float, default=None,
-                   help="Target-clipping trust region for the per-round MSE finetune: "
-                        "snapshot the policy at the start of finetune(), then clip every "
-                        "MPPI label `a` to [pi_old(o)-eps, pi_old(o)+eps] before the MSE "
-                        "loss. Bounds typical per-round policy displacement and damps the "
-                        "impact of high-variance MPPI relabels. 0/unset = disabled (default). "
-                        "Typical 0.05–0.3. NOT applied during --warmup (clipping a random-"
-                        "init policy to its own predictions blocks learning).")
+    p.add_argument("--grad-clip-norm", type=float, default=None,
+                   help="L2 gradient-norm clip applied inside the deterministic "
+                        "policy's mse_step during DAgger warmup + finetune. Bounds "
+                        "per-update parameter movement; loss-agnostic, no biased "
+                        "estimator. 0 = disabled. Default 1.0 (see DAggerConfig). "
+                        "Only takes effect with --deterministic; Gaussian dagger "
+                        "ignores it.")
+    p.add_argument("--clip-ratio", type=float, default=None,
+                   help="PPO-style probability ratio clip for the Gaussian dagger "
+                        "finetune (mirrors mppi_gps_clip's Gaussian branch). "
+                        "Snapshots the policy at the start of each round; the "
+                        "per-batch surrogate caps how much each (obs, expert action) "
+                        "pair can boost its log-likelihood per step (saturates at "
+                        "ratio=1+eps). 0/unset = disabled (default = plain MSE-on-"
+                        "mean). Typical 0.1–0.3; standard PPO uses 0.2. NOT applied "
+                        "in --warmup. Only takes effect WITHOUT --deterministic.")
     p.add_argument("--exp-name", default="run",
                    help="Human-readable experiment name (used in the run dir name).")
     p.add_argument("--exp-dir", default="checkpoints/dagger",
@@ -130,8 +138,10 @@ def main() -> None:
         cfg.ema_hard_sync = True
     if args.reset_optim_per_iter:
         cfg.reset_optim_per_iter = True
-    if args.clip_eps is not None:
-        cfg.clip_eps = args.clip_eps
+    if args.grad_clip_norm is not None:
+        cfg.grad_clip_norm = args.grad_clip_norm
+    if args.clip_ratio is not None:
+        cfg.clip_ratio = args.clip_ratio
 
     device = pick_device(args.device)
     print(f"policy device: {device}")

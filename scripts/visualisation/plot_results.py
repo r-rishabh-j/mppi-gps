@@ -22,31 +22,19 @@ from pathlib import Path
 
 
 def plot_training_curves(curves_path: Path, save_dir: Path):
-    """Plot GPS training curves: cost, KL, and BADMM dual variable over iterations."""
+    """Plot GPS training curves: episode cost over iterations."""
     data = json.loads(curves_path.read_text())
     env_name = curves_path.stem.replace("gps_", "").replace("_curves", "")
 
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    # Accept both the new ("mppi_costs") and legacy ("costs") schema for
+    # back-compat with old curves.json files.
+    cost_key = "mppi_costs" if "mppi_costs" in data else "costs"
+    ax.plot(data[cost_key])
+    ax.set_xlabel("GPS iteration")
+    ax.set_ylabel("mean episode cost")
+    ax.set_title(f"GPS Training — {env_name}")
 
-    # Left: episode cost should decrease as the policy improves
-    axes[0].plot(data["costs"])
-    axes[0].set_xlabel("GPS iteration")
-    axes[0].set_ylabel("mean episode cost")
-    axes[0].set_title("Cost")
-
-    # Middle: KL between MPPI and policy — should hover around the target
-    axes[1].plot(data["kl"])
-    axes[1].set_xlabel("GPS iteration")
-    axes[1].set_ylabel("KL divergence")
-    axes[1].set_title("KL")
-
-    # Right: BADMM dual variable — adjusts to maintain the KL constraint
-    axes[2].plot(data["nu"])
-    axes[2].set_xlabel("GPS iteration")
-    axes[2].set_ylabel("nu (BADMM dual)")
-    axes[2].set_title("Dual variable")
-
-    plt.suptitle(f"GPS Training — {env_name}", fontsize=14)
     plt.tight_layout()
     out = save_dir / f"gps_{env_name}_training.png"
     plt.savefig(out, dpi=150)
@@ -131,7 +119,8 @@ def plot_comparison_bar(results_dir: Path, save_dir: Path, env_name: str):
     gps_curves = results_dir / f"gps_{env_name}_curves.json"
     if gps_curves.exists():
         d = json.loads(gps_curves.read_text())
-        methods["GPS"] = d["costs"][-1] if d["costs"] else None
+        cost_key = "mppi_costs" if "mppi_costs" in d else "costs"
+        methods["GPS"] = d[cost_key][-1] if d.get(cost_key) else None
 
     # MPPI — from the ablation file (uses the first alpha's MPPI eval)
     abl_path = results_dir / f"{env_name}_ablations.json"

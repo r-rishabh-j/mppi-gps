@@ -10,8 +10,9 @@ Creates a run dir `experiments/gps/<timestamp>_<env>_<name>/` containing:
 Usage:
     python -m scripts.run_gps --env acrobot --exp-name baseline
     python -m scripts.run_gps --env hopper --gps-iters 30 --alpha 0.05
-    python -m scripts.run_gps --env acrobot --disable-kl --distill-loss nll \
-        --alpha 0.1 --gps-iters 20 --exp-name prior_only
+    python -m scripts.run_gps --env acrobot --deterministic --alpha 0.05
+    python -m scripts.run_gps --env acrobot --policy-prior mean_distance \
+        --alpha 0.1 --gps-iters 20 --exp-name gauss_mean_dist
     python -m scripts.run_gps --env acrobot --exp-name warmstart \
         --init-ckpt checkpoints/dagger/<run>/best.pt
 """
@@ -27,8 +28,7 @@ import numpy as np
 import torch
 
 from src.envs import make_env
-from src.gps.mppi_gps_clip import MPPIGPS
-from src.gps.mppi_gps_det import MPPIGPSDet
+from src.gps.mppi_gps_unified import MPPIGPS
 from src.mppi.mppi import MPPI
 from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
 from src.utils.device import pick_device
@@ -59,12 +59,14 @@ def parse_args():
                    help="Steps per episode during GPS training")
     p.add_argument("--alpha", type=float, default=None,
                    help="Policy-augmented cost weight (0 = no augmentation)")
-    p.add_argument("--disable-kl", action="store_true", default=True,
-                   help="Drop KL/BADMM: run policy-prior-only GPS (BC on MPPI data)")
-    p.add_argument("--distill-loss", default=None, choices=["nll", "mse"],
-                   help="Distillation loss (default from GPSConfig: nll)")
-    p.add_argument("--nu", type=float, default=None,
-                   help="Constant nu for the policy prior when --disable-kl is set")
+    p.add_argument("--policy-prior", default=None,
+                   choices=["nll", "mean_distance"],
+                   help="Policy prior shape used in the MPPI cost. Unset = "
+                        "auto: nll for Gaussian, mean_distance for "
+                        "--deterministic. Explicit values: 'nll' for "
+                        "-alpha*Σ log π (Gaussian only), 'mean_distance' for "
+                        "alpha*Σ‖a−π.action(o)‖² (works for both classes; the "
+                        "only choice for --deterministic).")
     p.add_argument("--auto-reset", action="store_true",
                    help="On env termination during C-step rollout, reset to a fresh random "
                         "init and keep collecting until episode_length steps are taken for "
@@ -108,35 +110,34 @@ def parse_args():
     p.add_argument("--prev-iter-kl-coef", type=float, default=0,
     # p.add_argument("--prev-iter-kl-coef", type=float, default=0.05,
                    help="Trust-region-style KL penalty to the previous iteration's policy "
-                        "(Gaussian distill loss only). Adds "
-                        "`coef * E_obs[KL(π_θ || π_prev)]` to the S-step loss. 0/unset "
-                        "disables. Typical small values (e.g. 0.01-0.1). Ignored for "
-                        "--distill-loss mse.")
+                        "(Gaussian only — no policy distribution under --deterministic). "
+                        "Adds `coef * E_obs[KL(π_θ || π_prev)]` to the S-step loss. 0/unset "
+                        "disables. Typical small values (e.g. 0.01-0.1). Silently ignored "
+                        "with --deterministic.")
     p.add_argument("--dagger-relabel", action="store_true",
                    help="DAgger-style decoupled relabel: per C-step timestep, run MPPI once "
-                        "WITH the policy prior (executor, steers the env + feeds KL) and a "
-                        "second time WITHOUT the prior (side-effect-free dry_run, its action "
-                        "is the training label). Removes the self-reinforcing loop where the "
+                        "WITH the policy prior (executor, steers the env) and a second time "
+                        "WITHOUT the prior (side-effect-free dry_run, its action is the "
+                        "training label). Removes the self-reinforcing loop where the "
                         "executed MPPI action is already tilted toward the current policy. "
-                        "No-op when α·ν == 0. Note: under open_loop_steps > 1 the label call "
-                        "forces a full rollout every step (cached chunk actions are prior-"
-                        "biased, so can't serve as plain labels) — wallclock per step becomes "
-                        "~1 rollout instead of 1/N.")
+                        "No-op when alpha == 0. Note: under open_loop_steps > 1 the label "
+                        "call forces a full rollout every step (cached chunk actions are "
+                        "prior-biased, so can't serve as plain labels) — wallclock per step "
+                        "becomes ~1 rollout instead of 1/N.")
     p.add_argument("--deterministic", action="store_true",
-                   help="Use the DeterministicPolicy student via src.gps.mppi_gps_det. "
-                        "Switches the prior to a quadratic distance to the policy mean "
-                        "(alpha * sum_t ||a - pi(o)||^2), drops KL/BADMM/prev-iter-KL "
-                        "(no policy distribution), forces MSE distillation. The "
-                        "--distill-loss / --nu / --prev-iter-kl-coef / --disable-kl flags "
-                        "are ignored in this mode.")
-    p.add_argument("--clip-eps", type=float, default=0.1,
-                   help="Target-clipping trust region for MSE distillation in the "
-                        "deterministic GPS path: snapshot the policy at the start of "
-                        "each S-step, then clip each MPPI label `a` to "
-                        "[pi_old(o)-eps, pi_old(o)+eps] before the MSE loss. Bounds "
-                        "per-iteration policy displacement to ~eps. 0 = disabled "
-                        "(raw MPPI labels). Default 0.1 (matches the deterministic "
-                        "branch in mppi_gps_clip.py). Ignored without --deterministic.")
+                   help="Use a DeterministicPolicy student. Forces MSE distillation "
+                        "(no NLL — there's no policy distribution). The policy prior "
+                        "is locked to 'mean_distance' (alpha * Σ‖a − π.action(o)‖²); "
+                        "--policy-prior nll raises if combined with this flag. "
+                        "--prev-iter-kl-coef is silently ignored (no distribution).")
+    p.add_argument("--grad-clip-norm", type=float, default=None,
+                   help="L2 gradient-norm clip applied inside the deterministic "
+                        "policy's MSE step (used by --deterministic / mppi_gps_det). "
+                        "Bounds per-update parameter movement directly — loss-"
+                        "agnostic, no biased estimator. 0 = disabled. Default 1.0 "
+                        "(see GPSConfig.grad_clip_norm). Sweep {0.5, 1.0, 5.0} if "
+                        "learning is too slow or loss spikes. Ignored without "
+                        "--deterministic.")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint (wrapped or raw state_dict) "
                         "to load into gps.policy before the training loop")
@@ -165,12 +166,8 @@ def main():
         gps_cfg.episode_length = args.episode_length
     if args.alpha is not None:
         gps_cfg.policy_augmented_alpha = args.alpha
-    if args.disable_kl:
-        gps_cfg.disable_kl_constraint = True
-    if args.distill_loss is not None:
-        gps_cfg.distill_loss = args.distill_loss
-    if args.nu is not None:
-        gps_cfg.badmm_init_nu = args.nu
+    if args.policy_prior is not None:
+        gps_cfg.policy_prior_type = args.policy_prior
     if args.auto_reset:
         gps_cfg.auto_reset = True
     if args.warm_start_policy:
@@ -191,20 +188,25 @@ def main():
         gps_cfg.prev_iter_kl_coef = args.prev_iter_kl_coef
     if args.dagger_relabel:
         gps_cfg.dagger_relabel = True
-    if args.clip_eps is not None:
-        gps_cfg.clip_eps = args.clip_eps
+    if args.grad_clip_norm is not None:
+        gps_cfg.grad_clip_norm = args.grad_clip_norm
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
-    if gps_cfg.disable_kl_constraint:
-        print(f"KL constraint DISABLED — policy-prior-only GPS "
-              f"(alpha={gps_cfg.policy_augmented_alpha}, nu={gps_cfg.badmm_init_nu}, "
-              f"distill_loss={gps_cfg.distill_loss})")
+    policy_class = "Deterministic" if args.deterministic else "Gaussian"
+    print(
+        f"GPS: policy={policy_class}, "
+        f"alpha={gps_cfg.policy_augmented_alpha}, "
+        f"prior={gps_cfg.policy_prior_type}"
+    )
 
     # ---- Construct trainer (needed early so we can load --init-ckpt and
     #      record the actual policy class in config.json) ----
-    trainer_cls = MPPIGPSDet if args.deterministic else MPPIGPS
-    gps = trainer_cls(env, mppi_cfg, policy_cfg, gps_cfg, device=device)
+    gps = MPPIGPS(
+        env, mppi_cfg, policy_cfg, gps_cfg,
+        device=device,
+        deterministic=args.deterministic,
+    )
 
     if args.init_ckpt is not None:
         init_ckpt = Path(args.init_ckpt)
@@ -266,45 +268,31 @@ def main():
         )
 
     # ---- Save learning curves as JSON ----
+    # ema_drift / prev_iter_kl exist on some GPSHistory variants but not all;
+    # getattr lets a single curves.json schema cover all three trainer classes.
     curves_path = run_dir / "curves.json"
     curves_path.write_text(json.dumps({
         "mppi_costs": history.iteration_costs,
         "eval_costs": history.iteration_eval_costs,
-        "kl": history.iteration_kl,
-        "nu": history.iteration_nu,
         "distill_loss": history.distill_losses,
-        "ema_drift": history.iteration_ema_drift,
-        "prev_iter_kl": history.iteration_prev_iter_kl,
+        "ema_drift": getattr(history, "iteration_ema_drift", []),
+        "prev_iter_kl": getattr(history, "iteration_prev_iter_kl", []),
     }, indent=2))
     print(f"saved learning curves to {curves_path}")
 
     # ---- Plot learning curves ----
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
     iters = np.arange(len(history.iteration_costs))
-    axes[0].plot(iters, history.iteration_costs, label="MPPI C-step", alpha=0.6)
+    ax.plot(iters, history.iteration_costs, label="MPPI C-step", alpha=0.6)
     eval_arr = np.array(history.iteration_eval_costs, dtype=float)
     eval_mask = ~np.isnan(eval_arr)
     if eval_mask.any():
-        axes[0].plot(iters[eval_mask], eval_arr[eval_mask],
-                     marker="o", linewidth=2, label="policy eval (selects best)")
-    axes[0].set_xlabel("GPS iteration")
-    axes[0].set_ylabel("mean episode cost")
-    axes[0].set_title("Cost")
-    axes[0].legend()
-
-    axes[1].plot(history.iteration_kl)
-    axes[1].axhline(gps_cfg.kl_target, color="r", linestyle="--", label="target")
-    axes[1].set_xlabel("GPS iteration")
-    axes[1].set_ylabel("KL divergence")
-    axes[1].set_title("KL")
-    axes[1].legend()
-
-    axes[2].plot(history.iteration_nu)
-    axes[2].set_xlabel("GPS iteration")
-    axes[2].set_ylabel("nu (BADMM dual)")
-    axes[2].set_title("Dual variable")
-
+        ax.plot(iters[eval_mask], eval_arr[eval_mask],
+                marker="o", linewidth=2, label="policy eval (selects best)")
+    ax.set_xlabel("GPS iteration")
+    ax.set_ylabel("mean episode cost")
+    ax.set_title("Cost")
+    ax.legend()
     plt.tight_layout()
     plot_path = run_dir / "curves.png"
     plt.savefig(plot_path, dpi=120)
