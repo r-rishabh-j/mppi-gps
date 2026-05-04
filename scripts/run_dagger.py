@@ -46,19 +46,19 @@ from src.gps.dagger import DAggerTrainer
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--env", default="acrobot")
+    p.add_argument("--env", default="hopper")
     p.add_argument("--dagger-iters", type=int, default=20)
-    p.add_argument("--rollouts-per-iter", type=int, default=20)
-    p.add_argument("--episode-len", type=int, default=500)
-    p.add_argument("--beta-schedule", default="linear", choices=["linear", "constant_zero"])
-    p.add_argument("--distill-epochs", type=int, default=15)
+    p.add_argument("--rollouts-per-iter", type=int, default=10)
+    p.add_argument("--episode-len", type=int, default=600)
+    p.add_argument("--beta-schedule", default="constant_zero", choices=["linear", "constant_zero"])
+    p.add_argument("--distill-epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--buffer-cap", type=int, default=400_000)
     p.add_argument("--n-eval-eps", type=int, default=10)
-    p.add_argument("--eval-ep-len", type=int, default=500)
+    p.add_argument("--eval-ep-len", type=int, default=800)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
-    p.add_argument("--deterministic", action="store_true", default=True,
+    p.add_argument("--deterministic", action="store_true", default=False,
                    help="use DeterministicPolicy (direct action regression) instead of GaussianPolicy")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint to load before warmup / DAgger training")
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
                    help="path to existing BC h5 (e.g. data/acrobot_bc.h5) to warm-start the buffer")
     p.add_argument("--warmup-rollouts", type=int, default=30,
                    help="Pre-DAgger: collect this many pure-MPPI rollouts and BC-train the policy on them")
-    p.add_argument("--warmup-epochs", type=int, default=50,
+    p.add_argument("--warmup-epochs", type=int, default=100,
                    help="Epochs of BC pre-training on the warmup rollouts (ignored if --warmup-rollouts=0)")
     p.add_argument("--warmup-cache", default=None,
                    help="optional h5 path for warmup rollouts. If the file exists it's "
@@ -164,7 +164,7 @@ def main() -> None:
     else:
         policy = GaussianPolicy(obs_dim, act_dim, policy_cfg,
                                 device=device, action_bounds=bounds)
-        print("policy: GaussianPolicy (mu/sigma head, MSE on mu)")
+        print("policy: GaussianPolicy (mu/sigma head)")
 
     if args.init_ckpt is not None:
         init_ckpt = Path(args.init_ckpt)

@@ -5,6 +5,7 @@ from src.envs.base import BaseEnv
 
 _REGISTRY = {
     "acrobot": ("src.envs.acrobot", "Acrobot"),
+    "adroit_pen": ("src.envs.adroit_pen", "AdroitPen"),
     "half_cheetah": ("src.envs.half_cheetah", "HalfCheetah"),
     "hopper": ("src.envs.hopper", "Hopper"),
     "point_mass": ("src.envs.point_mass", "PointMass"),

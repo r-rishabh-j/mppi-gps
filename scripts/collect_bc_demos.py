@@ -34,7 +34,7 @@ from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
 
 
-_ENVS = ["acrobot", "half_cheetah", "point_mass", "hopper"]
+_ENVS = ["acrobot", "adroit_pen", "half_cheetah", "point_mass", "hopper"]
 
 
 def parse_args() -> argparse.Namespace:

@@ -130,7 +130,7 @@ class DAggerTrainer:
                 for _ in range(ep_len):
                     obs = self.env._get_obs()
                     state = self.env.get_state()
-                    expert_action, _ = self.mppi.plan_step(state, dry_run=True)
+                    expert_action, _ = self.mppi.plan_step(state, dry_run=False)
 
                     if self.rng.random() < beta:
                         exec_action = expert_action
@@ -277,7 +277,7 @@ class DAggerTrainer:
         act: np.ndarray,
         grad_clip_norm: float = 0.0,
         old_policy: "GaussianPolicy | None" = None,
-        clip_ratio: float = 0.0,
+        clip_ratio: float = 0.2,
     ) -> float:
         """One distillation step. Two policy-class-specific paths:
 

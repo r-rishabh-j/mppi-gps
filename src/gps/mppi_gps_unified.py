@@ -254,7 +254,7 @@ class MPPIGPS:
             return last_loss
 
         # ---- Gaussian path ----
-        clip_ratio = float(getattr(cfg, "clip_ratio", 0.0))
+        clip_ratio = float(getattr(cfg, "clip_ratio", 0.2))
         use_prev_kl = (
             prev_policy is not None
             and cfg.prev_iter_kl_coef > 0.0
