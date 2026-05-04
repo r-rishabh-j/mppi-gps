@@ -34,7 +34,7 @@ from jaxtyping import Array, Float
 
 from src.envs.mujoco_env import MuJoCoEnv
 
-_XML = str(Path(__file__).resolve().parents[2] / "assets" / "adroit_pen" / "adroit_pen.xml")
+_XML = str(Path(__file__).resolve().parents[2] / "assets" / "adroit" / "pen.xml")
 
 # Fixed target position (the eps_ball site). Target orientation is sampled
 # at every reset; only the position is constant.
@@ -261,3 +261,13 @@ class AdroitPen(MuJoCoEnv):
     def obs_dim(self) -> int:
         # 24 + 3 + 6 + 3 + 3 + 3 = 42
         return 42
+
+    @property
+    def noise_scale(self) -> np.ndarray:
+        """Per-dim half-range so cfg.noise_sigma reads as a fraction of each
+        actuator's range. The Adroit hand has heterogeneous ctrlranges
+        (wrist 0.7 vs finger flexion 1.6 vs thumb 2.0); a single scalar
+        sigma over-explores some dims and under-explores others.
+        """
+        low, high = self.action_bounds
+        return 0.5 * (high - low)

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Research codebase implementing **Model Predictive Path Integral (MPPI)** control with **Guided Policy Search (GPS)** for policy distillation. Uses MuJoCo for physics simulation across point-mass, half-cheetah, acrobot, and hopper environments.
+Research codebase implementing **Model Predictive Path Integral (MPPI)** control with **Guided Policy Search (GPS)** for policy distillation. Uses MuJoCo for physics simulation across point-mass, half-cheetah, acrobot, hopper, and Adroit Hand (pen reorientation, relocate) environments.
 
 ## Commands
 
@@ -17,6 +17,8 @@ python -m scripts.run_point_mass
 python -m scripts.run_acrobot
 python -m scripts.run_cheetah
 python -m scripts.run_hopper
+python -m scripts.run_adroit_pen        # 24-DoF Shadow Hand pen reorientation
+python -m scripts.run_adroit_relocate   # 30-DoF arm+hand pick-and-place
 python -m scripts.run_mppi
 
 # Collect behavioral cloning demonstrations from MPPI
@@ -57,7 +59,8 @@ No unit test framework is configured. Validation is done via `scripts/test_sl.py
 ## Architecture
 
 - **`src/mppi/mppi.py`** — Core MPPI controller (CPU/numpy). Samples K trajectory perturbations, computes importance-weighted updates to a nominal action sequence, and supports adaptive temperature (λ) to maintain effective sample size.
-- **`src/envs/`** — Environment implementations behind an abstract `BaseEnv` interface (`base.py`). `mujoco_env.py` wraps MuJoCo with multi-threaded batch rollout (CPU). `gym_wrapper.py` adapts Gymnasium envs. Concrete tasks: `point_mass.py`, `half_cheetah.py`, `acrobot.py`, `hopper.py`. Each env provides `state_to_obs()` for converting full physics state to policy observations. Factory: `src.envs.make_env(name)`.
+- **`src/envs/`** — Environment implementations behind an abstract `BaseEnv` interface (`base.py`). `mujoco_env.py` wraps MuJoCo with multi-threaded batch rollout (CPU). `gym_wrapper.py` adapts Gymnasium envs. Concrete tasks: `point_mass.py`, `half_cheetah.py`, `acrobot.py`, `hopper.py`, `adroit_pen.py` (24-DoF pen reorientation), `adroit_relocate.py` (30-DoF arm+hand pick-and-place). Each env provides `state_to_obs()` for converting full physics state to policy observations. Factory: `src.envs.make_env(name)`.
+- **`assets/adroit/`** — Shared XMLs (`adroit_model.xml`, `adroit_assets.xml`) + meshes/textures used by both `adroit_pen.py` (`pen.xml`) and `adroit_relocate.py` (`relocate.xml`). Both task XMLs add framepos sensors over the shared model so the vectorised MPPI cost can read object/palm positions without per-step kinematics.
 - **`src/policy/gaussian_policy.py`** — Diagonal Gaussian MLP policy for behavior cloning and GPS distillation. Accepts `device=` (cpu/mps/cuda); `act_np()` / `log_prob_np()` bridge to numpy callers.
 - **`src/policy/deterministic_policy.py`** — `DeterministicPolicy`: single-head MLP that regresses actions directly (MSE target, no `log_prob`). Used by DAgger / BC when `--deterministic` is passed. Head shape differs from `GaussianPolicy` (`act_dim` vs `2*act_dim`), so the two are not load-compatible — the wrapped checkpoint records `policy_class` so `eval_checkpoint` can auto-pick.
 - **`src/policy/ema.py`** — parameter-only EMA tracker. Attached via `attach_ema(decay)`; `ema_swapped_in()` is a context manager that temporarily swaps live params with the EMA shadow (used at eval and when writing `best.pt` so the on-disk checkpoint matches the reported eval cost). Drives the `--ema-decay` / `--ema-hard-sync` / `--reset-optim-per-iter` triple in both `GPSConfig` and `DAggerConfig`.

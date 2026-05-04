@@ -45,6 +45,22 @@ class BaseEnv(ABC):
     def action_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """Returns (low, high) arrays of shape (action_dim,)"""
 
+    @property
+    def noise_scale(self) -> np.ndarray:
+        """Per-dim multiplier on MPPI's exploration noise (shape (action_dim,)).
+
+        MPPI's effective sigma is ``cfg.noise_sigma * env.noise_scale`` —
+        i.e. cfg.noise_sigma keeps a unit-free meaning, and the env can opt in
+        to per-dim scaling when its actuators have heterogeneous ctrlranges.
+
+        Default is ``ones(action_dim)`` (backward compatible — sigma stays
+        absolute everywhere). Envs whose actuators span very different ranges
+        (e.g. Adroit's 6 arm joints + 24 hand joints, ratio ~10x) should
+        override to return ``(high - low) / 2`` so cfg.noise_sigma becomes
+        a uniform fraction of each dim's half-range.
+        """
+        return np.ones(self.action_dim)
+
     @abstractmethod
     def state_to_obs(self, states: np.ndarray) -> np.ndarray:
         """Convert full physics states to policy observations.

@@ -14,13 +14,24 @@ class MPPI:
         self.K = cfg.K
         self.H = cfg.H
         self.lam = cfg.lam
-        self.sigma = cfg.noise_sigma
         # open-loop chunk size: number of actions to execute per full replan.
         # Clamp to [1, H] so the chunk always fits inside the nominal trajectory.
         self.open_loop_steps = max(1, min(int(cfg.open_loop_steps), self.H))
 
         self.nu = env.action_dim
         self.act_low, self.act_high = env.action_bounds
+
+        # Per-dim exploration sigma. cfg.noise_sigma stays a scalar in configs;
+        # envs with heterogeneous ctrlranges (e.g. Adroit) opt into per-dim
+        # scaling via env.noise_scale (default ones, so legacy envs are
+        # unchanged). Final shape: (nu,) — broadcasts cleanly with eps.
+        self.sigma = np.asarray(
+            cfg.noise_sigma * env.noise_scale, dtype=np.float64
+        )
+        assert self.sigma.shape == (self.nu,), (
+            f"noise_sigma * env.noise_scale must be (action_dim={self.nu},), "
+            f"got {self.sigma.shape}"
+        )
 
         self.reset()
 
@@ -183,8 +194,14 @@ class MPPI:
         self.U[-shift:] = self.U[-shift - 1]
     
     def _is_correction(self, eps: np.ndarray, lam: float) -> np.ndarray:
-        """γ · Σ_t u_t^T Σ^{-1} ε_{k,t} with γ=λ, Σ=σ²I → (K,)."""
-        return lam * np.sum(self.U[None, :, :] * eps, axis=(1, 2)) / (self.sigma ** 2)
+        """γ · Σ_t u_t^T Σ^{-1} ε_{k,t} with γ=λ, Σ=diag(σ²) → (K,).
+
+        Σ is diagonal with per-dim variance σ_u², so Σ^{-1} ε_{k,t} divides
+        each action dim by its own σ_u². ``self.sigma`` has shape (nu,) which
+        broadcasts over the (K, H, nu) eps tensor.
+        """
+        weighted = self.U[None, :, :] * eps / (self.sigma ** 2)   # (K, H, nu)
+        return lam * weighted.sum(axis=(1, 2))                    # (K,)
 
     def _softmin_weights(self, S: np.ndarray, lam: float) -> tuple[np.ndarray, float]:
         """Paper's weight formula with min-baseline stabilization."""
