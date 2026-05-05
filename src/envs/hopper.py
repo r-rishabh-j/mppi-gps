@@ -230,7 +230,11 @@ class Hopper(MuJoCoEnv):
             np.clip(self.data.qvel, -10.0, 10.0),
         ])
 
-    def state_to_obs(self, states: np.ndarray) -> np.ndarray:
+    def state_to_obs(
+        self,
+        states: np.ndarray,
+        sensordata: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Convert batched full physics states to policy observations.
 
         Mirrors _get_obs() but works on (..., nstate) arrays from batch_rollout.

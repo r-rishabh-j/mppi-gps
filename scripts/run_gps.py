@@ -139,7 +139,7 @@ def parse_args():
                         "(see GPSConfig.grad_clip_norm). Sweep {0.5, 1.0, 5.0} if "
                         "learning is too slow or loss spikes. Ignored without "
                         "--deterministic.")
-    p.add_argument("--clip-eps", type=float, default=None,
+    p.add_argument("--clip-eps", type=float, default=0.3,
                    help="Action-space trust region for the deterministic S-step "
                         "(--deterministic). At the start of each S-step the "
                         "trainer snapshots the policy as π_old; per batch the "

@@ -62,9 +62,24 @@ class BaseEnv(ABC):
         return np.ones(self.action_dim)
 
     @abstractmethod
-    def state_to_obs(self, states: np.ndarray) -> np.ndarray:
+    def state_to_obs(
+        self,
+        states: np.ndarray,
+        sensordata: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Convert full physics states to policy observations.
-        states: (..., nstate) → (..., obs_dim)"""
+
+        states: (..., nstate) → (..., obs_dim)
+
+        ``sensordata`` (optional, shape ``(..., nsensor)``) is the matching
+        sensor output from ``batch_rollout``. Most envs ignore it — they
+        derive obs purely from qpos/qvel. Envs whose obs depends on
+        kinematic outputs only available via ``mj_forward`` (e.g.
+        ``adroit_relocate`` in DAPG mode, which needs palm site position)
+        use it to avoid running per-state forward kinematics in the MPPI
+        K×H hot loop. Callers in the MPPI prior path pass it; callers in
+        eval / relabel paths don't and accept the slower fallback.
+        """
 
     @abstractmethod
     def batch_rollout(

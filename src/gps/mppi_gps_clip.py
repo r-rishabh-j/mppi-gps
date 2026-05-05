@@ -31,12 +31,12 @@ def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float):
     Returns ``-alpha * sum_t log pi(u|o)`` as a cost contribution. See
     ``mppi_gps.make_policy_prior`` for the full derivation.
     """
-    def prior_fn(states, actions) -> np.ndarray:
+    def prior_fn(states, actions, sensordata=None) -> np.ndarray:
         states = np.asarray(states)
         actions = np.asarray(actions)
         K, H, _ = states.shape
 
-        obs = np.asarray(env.state_to_obs(states))  # (K, H, obs_dim)
+        obs = np.asarray(env.state_to_obs(states, sensordata))  # (K, H, obs_dim)
         obs_flat = obs.reshape(K * H, -1)
         act_flat = actions.reshape(K * H, -1)
         lp = policy.log_prob_np(obs_flat, act_flat)  # (K*H,)

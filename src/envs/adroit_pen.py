@@ -252,7 +252,11 @@ class AdroitPen(MuJoCoEnv):
     def _get_obs(self) -> np.ndarray:
         return self._build_obs(self.data.qpos.copy(), self.data.qvel.copy())
 
-    def state_to_obs(self, states: np.ndarray) -> np.ndarray:
+    def state_to_obs(
+        self,
+        states: np.ndarray,
+        sensordata: np.ndarray | None = None,
+    ) -> np.ndarray:
         qpos = self.state_qpos(states)
         qvel = self.state_qvel(states)
         return self._build_obs(qpos, qvel)

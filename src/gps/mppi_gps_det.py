@@ -67,13 +67,14 @@ def make_policy_prior(
     def prior_cost(
         states: np.ndarray,
         actions: np.ndarray,
+        sensordata: np.ndarray | None = None,
     ) -> np.ndarray:
         states = np.asarray(states)
         actions = np.asarray(actions)
         K, H, act_dim = actions.shape
 
         # Full physics state → policy observation.
-        obs = np.asarray(env.state_to_obs(states))  # (K, H, obs_dim)
+        obs = np.asarray(env.state_to_obs(states, sensordata))  # (K, H, obs_dim)
         obs_flat = obs.reshape(K * H, -1)
 
         with torch.no_grad():

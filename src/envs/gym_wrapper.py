@@ -86,7 +86,7 @@ class GymEnv(BaseEnv):
     def _get_obs(self):
         return self.gym_env.unwrapped._get_obs()
 
-    def state_to_obs(self, states):
+    def state_to_obs(self, states, sensordata=None):
         return states
 
     @property

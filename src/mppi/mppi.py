@@ -121,7 +121,14 @@ class MPPI:
         lam = self.lam
         is_corr = self._is_correction(eps, lam)
         # track = None
-        track = prior(states, U_clipped) if prior is not None else None
+        # Pass sensordata so priors that compute env.state_to_obs(...) can
+        # reuse the rollout's already-produced sensor outputs (e.g. adroit
+        # relocate in DAPG-obs mode needs palm site position, which lives
+        # in sensordata — without this it would re-run mj_kinematics K*H
+        # times per plan step).
+        track = (
+            prior(states, U_clipped, sensordata) if prior is not None else None
+        )
         if track is not None:
             # Same defense for the policy prior. NLL prior can blow up when
             # log_sigma collapses, mean_distance prior gets NaN if the

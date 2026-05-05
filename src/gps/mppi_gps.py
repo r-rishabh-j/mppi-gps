@@ -51,15 +51,17 @@ def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float):
         env:    Environment instance — needed for state_to_obs conversion.
         alpha:  Base weight on the policy augmentation term (from GPSConfig).
     """
-    def prior_fn(states, actions) -> np.ndarray:
-        # states:  (K, H, nstate) — full physics states from batch_rollout
-        # actions: (K, H, act_dim) — clipped perturbed action sequences
+    def prior_fn(states, actions, sensordata=None) -> np.ndarray:
+        # states:     (K, H, nstate) — full physics states from batch_rollout
+        # actions:    (K, H, act_dim) — clipped perturbed action sequences
+        # sensordata: (K, H, nsensor) — sensor outputs paired with `states`
+        #             (passed by mppi.plan_step; envs that don't need it ignore)
         states = np.asarray(states)
         actions = np.asarray(actions)
         K, H, _ = states.shape
 
         # Convert full physics states to policy-sized observations.
-        obs = np.asarray(env.state_to_obs(states))  # (K, H, obs_dim)
+        obs = np.asarray(env.state_to_obs(states, sensordata))  # (K, H, obs_dim)
 
         # Evaluate log pi(u | obs) over the (K, H) grid in one batched call.
         obs_flat = obs.reshape(K * H, -1)

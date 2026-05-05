@@ -61,12 +61,16 @@ def make_mean_distance_prior(
     """
     device = policy._device
 
-    def prior_cost(states: np.ndarray, actions: np.ndarray) -> np.ndarray:
+    def prior_cost(
+        states: np.ndarray,
+        actions: np.ndarray,
+        sensordata: np.ndarray | None = None,
+    ) -> np.ndarray:
         states = np.asarray(states)
         actions = np.asarray(actions)
         K, H, act_dim = actions.shape
 
-        obs = np.asarray(env.state_to_obs(states))      # (K, H, obs_dim)
+        obs = np.asarray(env.state_to_obs(states, sensordata))  # (K, H, obs_dim)
         obs_flat = obs.reshape(K * H, -1)
         with torch.no_grad():
             obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=device)
@@ -94,12 +98,16 @@ def make_nll_prior(
             f"nll prior requires GaussianPolicy (got {type(policy).__name__})"
         )
 
-    def prior_fn(states: np.ndarray, actions: np.ndarray) -> np.ndarray:
+    def prior_fn(
+        states: np.ndarray,
+        actions: np.ndarray,
+        sensordata: np.ndarray | None = None,
+    ) -> np.ndarray:
         states = np.asarray(states)
         actions = np.asarray(actions)
         K, H, _ = states.shape
 
-        obs = np.asarray(env.state_to_obs(states))      # (K, H, obs_dim)
+        obs = np.asarray(env.state_to_obs(states, sensordata))  # (K, H, obs_dim)
         obs_flat = obs.reshape(K * H, -1)
         act_flat = actions.reshape(K * H, -1)
         lp = policy.log_prob_np(obs_flat, act_flat)     # (K*H,)

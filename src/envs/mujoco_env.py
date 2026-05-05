@@ -107,8 +107,16 @@ class MuJoCoEnv(BaseEnv):
         """ can be overrided in the sub class if you need to change the obs space"""
         return self.get_state()
 
-    def state_to_obs(self, states: np.ndarray) -> np.ndarray:
-        """Default: return full state. Override in subclasses that have reduced obs."""
+    def state_to_obs(
+        self,
+        states: np.ndarray,
+        sensordata: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Default: return full state. Override in subclasses that have reduced obs.
+
+        ``sensordata`` is accepted for signature compatibility with envs
+        that need it (see ``BaseEnv.state_to_obs``); ignored here.
+        """
         return states
 
     @property

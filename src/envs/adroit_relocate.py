@@ -214,6 +214,12 @@ class AdroitRelocate(MuJoCoEnv):
 
         self._obj_pos_slice = self._sensor_slice("object_pos")
         self._palm_pos_slice = self._sensor_slice("palm_pos")
+        # The palm_pos sensor is a framepos of the S_grasp site. Cached so
+        # the DAPG-obs fallback path (mj_kinematics + read site_xpos) can
+        # bypass mj_name2id and the framepos sensor pipeline per state.
+        self._palm_site_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_SITE, "S_grasp"
+        )
         # Virtual reach target offset above the palm surface (palm-side,
         # the direction curled fingers reach toward) — see S_reach in
         # adroit_model.xml. The reach reward pulls THIS point to the
@@ -491,43 +497,54 @@ class AdroitRelocate(MuJoCoEnv):
             self.data.qpos.copy(), self.data.qvel.copy(), palm_pos=palm
         )
 
-    def state_to_obs(self, states: np.ndarray) -> np.ndarray:
+    def state_to_obs(
+        self,
+        states: np.ndarray,
+        sensordata: np.ndarray | None = None,
+    ) -> np.ndarray:
         qpos = self.state_qpos(states)
         qvel = self.state_qvel(states)
-        palm = self._batched_palm_pos(qpos, qvel) if USE_DAPG_OBS else None
+        palm = None
+        if USE_DAPG_OBS:
+            if sensordata is not None:
+                # Hot path (MPPI prior): palm already lives in the
+                # sensordata produced by batch_rollout. O(1) slice over
+                # the leading dims, no kinematics.
+                palm = np.asarray(sensordata)[..., self._palm_pos_slice]
+            else:
+                # Cold path (eval, DAgger relabel, anywhere without a
+                # paired sensordata): per-state mj_kinematics fallback.
+                palm = self._batched_palm_pos(qpos)
         return self._build_obs(qpos, qvel, palm_pos=palm)
 
-    def _batched_palm_pos(
-        self,
-        qpos: np.ndarray,
-        qvel: np.ndarray,
-    ) -> np.ndarray:
-        """World-frame palm position for each state in ``qpos``.
+    def _batched_palm_pos(self, qpos: np.ndarray) -> np.ndarray:
+        """World-frame palm (S_grasp site) position for each state in qpos.
 
-        Used only by ``state_to_obs`` when ``USE_DAPG_OBS=True``. Runs
-        ``mj_forward`` per state on a single ``MjData`` (no JIT/vmap in
-        MuJoCo). Cost is O(N) ``mj_forward`` calls — fine for the
-        relabel / eval path where N is at most a buffer's worth, not a
-        K×H rollout batch.
+        Fallback for ``state_to_obs`` when no ``sensordata`` is supplied
+        (i.e. callers outside the MPPI prior path). Uses ``mj_kinematics``
+        — much cheaper than ``mj_forward`` (skips dynamics, actuation,
+        and the sensor pipeline) — and reads ``site_xpos`` directly to
+        bypass framepos sensor evaluation entirely. Site positions
+        depend only on ``qpos``, so qvel is irrelevant.
+
+        Still O(N) Python-level calls; acceptable for N ≲ a buffer's
+        worth of states in the relabel / eval path, NOT for K×H MPPI
+        inner-loop calls (those go through the sensordata fast path).
         """
         leading = qpos.shape[:-1]
         flat_q = qpos.reshape(-1, qpos.shape[-1])
-        flat_v = qvel.reshape(-1, qvel.shape[-1])
         out = np.empty((flat_q.shape[0], 3), dtype=np.float64)
-        # Snapshot data state so we don't clobber the live env on a stray
-        # call from outside a rollout.
+        # Snapshot qpos so we don't clobber the live env on a stray call
+        # from outside a rollout.
         saved_q = self.data.qpos.copy()
-        saved_v = self.data.qvel.copy()
         try:
             for i in range(flat_q.shape[0]):
                 self.data.qpos[:] = flat_q[i]
-                self.data.qvel[:] = flat_v[i]
-                mujoco.mj_forward(self.model, self.data)
-                out[i] = self.data.sensordata[self._palm_pos_slice]
+                mujoco.mj_kinematics(self.model, self.data)
+                out[i] = self.data.site_xpos[self._palm_site_id]
         finally:
             self.data.qpos[:] = saved_q
-            self.data.qvel[:] = saved_v
-            mujoco.mj_forward(self.model, self.data)
+            mujoco.mj_kinematics(self.model, self.data)
         return out.reshape(*leading, 3)
 
     @property
