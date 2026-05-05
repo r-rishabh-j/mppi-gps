@@ -25,6 +25,12 @@
         <camera name="fixed" pos="0 -0.7 0.7" quat="0.92388 0.382683 0 0" />
         <!-- Camera for the VIL paper -->
         <camera name="vil_camera" pos="0 -1.2 1.2" quat="0.92388 0.382683 0 0" />
+        <!-- Multi-angle cameras for the recording path. mode="targetbody"
+             auto-orients the camera toward the Object body, so they
+             always frame the ball as it moves. -->
+        <camera name="cam_top"  pos="0  -0.2 0.9"  mode="targetbody" target="Object"/>
+        <camera name="cam_side" pos="0.7 -0.2 0.25" mode="targetbody" target="Object"/>
+        <camera name="cam_iso"  pos="0.5 -0.7 0.5"  mode="targetbody" target="Object"/>
 
         <!-- ======= TABLE ======= -->
         <body name="table">
@@ -99,6 +105,9 @@
     <sensor>
         <framepos name="object_pos" objtype="site" objname="object_origin"/>
         <framepos name="palm_pos"   objtype="site" objname="S_grasp"/>
+        <!-- Virtual reach target ~5cm above the palm surface (palm-side,
+             where curled fingers reach); see S_reach in adroit_model.xml. -->
+        <framepos name="reach_pos"  objtype="site" objname="S_reach"/>
         <!-- Fingertip world positions: used by the cost to per-finger gate
              the touch-based grip bonus by proximity to the ball, so
              fingertips touching the table earn nothing. -->

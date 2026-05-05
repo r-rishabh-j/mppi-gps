@@ -38,7 +38,8 @@ fingers-on-table) is achieved structurally: the per-finger proximity gate
 on the grip bonus + the lift_gate on lift / milestone rewards make every
 non-grasp strategy strictly dominated::
 
-    reward = -1.0 * ||palm - obj||                   # reach
+    reward = -10 * ||reach_pos - obj||               # reach (S_reach site,
+                                                     # offset forward of palm)
     if USE_GRASP_SHAPING:
         prox_i     = exp(-||fingertip_i - obj||² / GRIP_PROX_SCALE²)
         grip_score = Σ_i prox_i · touch_i
@@ -96,7 +97,7 @@ _GOAL_TIGHT = 0.05
 USE_GRASP_SHAPING = True
 
 _GRIP_BONUS = 4.0         # weight on tanh(grip_score / GRIP_TOUCH_SCALE)
-_GRIP_TOUCH_SCALE = 1.0   # establishment tanh — saturates fast (~grip_score=2)
+_GRIP_TOUCH_SCALE = 1  # establishment tanh — saturates fast (~grip_score=2)
                           # so MPPI gets a steep gradient establishing contact.
 # Tighter-grip reward: a second tanh with a much larger scale stays
 # unsaturated well past the "barely touching" regime, so MPPI keeps being
@@ -105,11 +106,37 @@ _GRIP_TOUCH_SCALE = 1.0   # establishment tanh — saturates fast (~grip_score=2
 # which slips under any perturbation. Saturates around grip_score=15 to
 # prevent infinite-force pumping.
 _TIGHT_GRIP_BONUS = 2.0
-_TIGHT_GRIP_SCALE = 5.0
+_TIGHT_GRIP_SCALE = 3.0
 # Per-finger proximity gate σ (m). exp(-d²/σ²) — finger contributes ≈ 1 when
 # touching the ball (ball radius 0.035), ≈ 0 when touching the table or air
 # with the ball elsewhere. Stops the "fingers flat on table" cheat.
 _GRIP_PROXIMITY_SCALE = 0.05
+# Per-finger weights into grip_score. Order is (ff, mf, rf, lf, th) — same
+# as the touch / fingertip-pos sensor slices. The thumb is upweighted: an
+# opposable grasp NEEDS the thumb specifically, but with uniform weights
+# the thumb's signal is averaged 1/5 with the four fingers, so MPPI can
+# satisfy ~80% of grip_score with the four fingers alone and leaves the
+# thumb folded against the palm. Boosting the thumb makes "no thumb
+# contact" cost more than a small loss on the other fingers, pushing
+# MPPI toward true opposition grasps.
+_FINGER_GRIP_WEIGHTS = np.array([1.0, 1.0, 1.0, 1.0, 1.0])
+
+# Thumb-specific proximity pull, independent of contact. The grip tanh
+# saturates fast (at grip_score≈2 for the basic establishment term), so
+# once the four fingers wrap the marginal reward for the thumb closing
+# the last few cm is dwarfed by sampling noise — MPPI sees no gradient
+# pulling the thumb in. The contact-gated proximity factor doesn't help
+# either: at the thumb's folded rest pose it's already > 7cm from the
+# ball, where exp(-d²/0.05²) is ≈ 0 with no usable gradient.
+#
+# A Gaussian bonus on thumb-tip → ball distance with a wider σ extends
+# the gradient into the open-hand pose so MPPI gets a smooth pull from
+# the moment the palm starts approaching. Bounded (saturates near 1 on
+# contact) so it can't dominate the reach term, additive to the grip
+# bonus (so a wrapped-but-no-thumb pose is strictly worse than a
+# wrapped-with-thumb pose at the same palm position).
+_THUMB_PROXIMITY_BONUS = 2.0
+_THUMB_PROXIMITY_SCALE = 0.10  # σ in metres; ~2× the grip proximity gate
 
 # ---- Smoothness / "human-like" motion ----
 # Per-DoF velocity² penalty on the controlled joints. Split so the arm
@@ -127,7 +154,7 @@ _GRIP_PROXIMITY_SCALE = 0.05
 # Set both to 0.0 to disable. Tune up arm penalty if reaches still look
 # jerky; tune up finger penalty only if fingers visibly twitch.
 _ARM_VEL_PENALTY = 0.02      # qvel[:6]   — ARTx/y/z, ARRx/y/z
-_FINGER_VEL_PENALTY = 0.001  # qvel[6:30] — 24 hand joints
+_FINGER_VEL_PENALTY = 0.005  # qvel[6:30] — 24 hand joints
 
 # ---- Control-magnitude penalty (arm only) ----
 # Penalises Σ action[:6]² — the 6 arm actuators (A_ARTx/y/z, A_ARRx/y/z).
@@ -155,6 +182,12 @@ class AdroitRelocate(MuJoCoEnv):
 
         self._obj_pos_slice = self._sensor_slice("object_pos")
         self._palm_pos_slice = self._sensor_slice("palm_pos")
+        # Virtual reach target offset above the palm surface (palm-side,
+        # the direction curled fingers reach toward) — see S_reach in
+        # adroit_model.xml. The reach reward pulls THIS point to the
+        # ball, so the palm sits *below* the ball and fingers can wrap
+        # from the palm side without the palm crashing into the table.
+        self._reach_pos_slice = self._sensor_slice("reach_pos")
         # Cached unconditionally — the cost path only reads this when
         # USE_GRASP_SHAPING is True, but caching is cheap and lets the toggle
         # flip at runtime without re-doing name lookups.
@@ -168,6 +201,13 @@ class AdroitRelocate(MuJoCoEnv):
         # Per-episode constants (refreshed on every reset).
         self._obj_body_init_pos = self.model.body_pos[self._obj_body_id].copy()
         self._target_pos = self.model.site_pos[self._target_site_id].copy()
+        # Stiffen finger PD so commanded position translates to more contact
+        # force. Default gain=1 gives marginal grip; gain=3 holds a 0.18kg ball
+        # through normal lift acceleration.
+        GAIN = 3.0
+        finger_idx = slice(8, 30)   # A_FFJ3 .. A_THJ0 (24 hand actuators)
+        self.model.actuator_gainprm[finger_idx, 0] = GAIN
+        self.model.actuator_biasprm[finger_idx, 1] = -GAIN
 
     def _sensor_slice(self, name: str) -> slice:
         sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, name)
@@ -265,8 +305,12 @@ class AdroitRelocate(MuJoCoEnv):
         target = self._target_pos
         obj_z = obj[..., 2]
 
-        # Reach: pull hand toward object.
-        reward = -1.0 * np.linalg.norm(palm - obj, axis=-1) * 10
+        # Reach: pull the *virtual reach target* (offset above the palm
+        # surface, palm-side) to the ball, not the palm itself. This puts
+        # the palm just below the ball with curled fingers wrapping from
+        # the palm side — no need for the palm to dive into the table.
+        reach_pos = sensordata[..., self._reach_pos_slice]
+        reward = -1.0 * np.linalg.norm(reach_pos - obj, axis=-1) * 10
 
         # Touch-sensor based grasp shaping. Anti-cheat:
         #   - palm-balancing: penalise palm contact directly
@@ -280,15 +324,20 @@ class AdroitRelocate(MuJoCoEnv):
             ftpos = ftpos.reshape(*ftpos.shape[:-1], 5, 3)                   # (..., 5, 3)
             d2 = ((ftpos - obj[..., None, :]) ** 2).sum(axis=-1)             # (..., 5)
             proximity = np.exp(-d2 / (_GRIP_PROXIMITY_SCALE ** 2))           # (..., 5)
-            grip_score = (ftouch * proximity).sum(axis=-1)                   # (...)
+            grip_score = (ftouch * proximity * _FINGER_GRIP_WEIGHTS).sum(axis=-1)  # (...)
             grasp = np.tanh(grip_score / _GRIP_TOUCH_SCALE)                  # 0..1
             tight = np.tanh(grip_score / _TIGHT_GRIP_SCALE)                  # 0..1, slow
+            # Wider Gaussian on thumb-tip → ball distance so MPPI has a
+            # gradient pulling the thumb in even before contact. d2[..., 4]
+            # is the squared distance from the thumb tip (last finger).
+            thumb_proximity = np.exp(-d2[..., 4] / (_THUMB_PROXIMITY_SCALE ** 2))
             reward = (
                 reward
-                + _GRIP_BONUS * grasp           # establishment (saturates fast)
-                + _TIGHT_GRIP_BONUS * tight     # firmness (keeps growing)
+                + _GRIP_BONUS * grasp                       # establishment (saturates fast)
+                + _TIGHT_GRIP_BONUS * tight                 # firmness (keeps growing)
+                + _THUMB_PROXIMITY_BONUS * thumb_proximity  # contact-independent pull
             )
-            lift_gate = grasp
+            lift_gate = grasp * tight
         else:
             lift_gate = 1.0
 
@@ -391,6 +440,15 @@ class AdroitRelocate(MuJoCoEnv):
         and finger ranges (1.6-2.0) span 10x; without this, a single scalar
         sigma either slams the arm against its limits every step or leaves
         the fingers under-explored.
+
+        Thumb actuators (last 5: A_THJ4..A_THJ0 at indices 25-29) get an
+        extra boost. The thumb's rest position is folded against the palm,
+        and the most proximal joint (THJ4) needs to swing ~1 rad to reach
+        opposition. With baseline per-dim noise that's ~10 sigma — almost
+        never sampled. Doubling lets MPPI actually discover opposable
+        grasps without touching the cost.
         """
         low, high = self.action_bounds
-        return 0.5 * (high - low)
+        scale = 0.5 * (high - low)
+        # scale[25:30] *= 2.0   # thumb dims: A_THJ4..A_THJ0
+        return scale

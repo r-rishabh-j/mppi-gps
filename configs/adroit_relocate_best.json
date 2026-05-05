@@ -1,7 +1,7 @@
 {
   "K": 1024,
-  "H": 64,
-  "lam": 0.06,
+  "H": 32,
+  "lam": 0.08,
   "noise_sigma": 0.25,
   "adaptive_lam": false,
   "n_eff_threshold": 256,

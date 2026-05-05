@@ -3,6 +3,7 @@ import time
 
 import mujoco
 import mujoco.viewer
+import numpy as np
 
 from src.envs.adroit_relocate import AdroitRelocate
 from src.mppi.mppi import MPPI
@@ -10,6 +11,23 @@ from src.utils.config import MPPIConfig
 from src.utils.seeding import add_seed_arg, seed_everything
 
 T = 200
+
+# Cameras to tile in the recorded video (2x2 grid). Order = top-left,
+# top-right, bottom-left, bottom-right.
+_CAMERAS = ("vil_camera", "cam_iso", "cam_side", "cam_top")
+# Per-camera tile size. Final frame is (2 * _TILE_H, 2 * _TILE_W, 3).
+_TILE_H, _TILE_W = 240, 320
+
+
+def render_tiled(renderer: mujoco.Renderer, data: mujoco.MjData) -> np.ndarray:
+    """Render every camera in _CAMERAS and stitch into a 2x2 grid."""
+    imgs = []
+    for cam in _CAMERAS:
+        renderer.update_scene(data, camera=cam)
+        imgs.append(renderer.render().copy())
+    top = np.hstack([imgs[0], imgs[1]])
+    bot = np.hstack([imgs[2], imgs[3]])
+    return np.vstack([top, bot])
 
 
 def main():
@@ -33,7 +51,8 @@ def main():
     if args.live:
         viewer = mujoco.viewer.launch_passive(env.model, env.data)
     else:
-        renderer = mujoco.Renderer(env.model, height=480, width=640)
+        # One renderer reused across cameras; size matches a single tile.
+        renderer = mujoco.Renderer(env.model, height=_TILE_H, width=_TILE_W)
 
     for ep in range(1):
         env.reset()
@@ -48,10 +67,9 @@ def main():
 
             if viewer is not None:
                 viewer.sync()
-                time.sleep(dt)
+                # time.sleep(dt)
             elif renderer is not None:
-                renderer.update_scene(env.data, camera="vil_camera")
-                frames.append(renderer.render().copy())
+                frames.append(render_tiled(renderer, env.data))
 
             if t % 20 == 0:
                 print(f"ep={ep} step={t:4d}  cost_min={info['cost_min']:.2f}  "
