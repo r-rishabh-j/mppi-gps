@@ -9,7 +9,7 @@ from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
 from src.utils.seeding import add_seed_arg, seed_everything
 
-T = 250
+T = 200
 
 
 def main():

@@ -33,29 +33,29 @@ batched path) does see the true palm.
 Cost
 ----
 Dense, smooth, based on the canonical DAPG / hand_dapg formula plus a
-touch-sensor shaping layer that prevents the palm-balancing reward hack
-(MPPI sliding the open palm under the ball instead of grasping)::
+touch-sensor shaping layer. Anti-cheat (palm-balancing, fling-for-luck,
+fingers-on-table) is achieved structurally: the per-finger proximity gate
+on the grip bonus + the lift_gate on lift / milestone rewards make every
+non-grasp strategy strictly dominated::
 
     reward = -1.0 * ||palm - obj||                   # reach
-    if USE_GRASP_SHAPING:                            # anti-cheat layer
+    if USE_GRASP_SHAPING:
         prox_i     = exp(-||fingertip_i - obj||² / GRIP_PROX_SCALE²)
         grip_score = Σ_i prox_i · touch_i
         grasp      = tanh(grip_score / GRIP_TOUCH_SCALE)   # establishment
         tight      = tanh(grip_score / TIGHT_GRIP_SCALE)   # firmness, slow sat
-        reward += GRIP_BONUS       * grasp
-        reward += TIGHT_GRIP_BONUS * tight
-        if PALM_PENALTY > 0:                              # off by default
-            palm_near = exp(-||palm - obj||² / GRIP_PROX_SCALE²)
-            reward -= PALM_PENALTY * tanh(palm_touch/PALM_TOUCH_SCALE) * palm_near
-        lift_gate = grasp                                # gate uses establishment
+        reward    += GRIP_BONUS       * grasp
+        reward    += TIGHT_GRIP_BONUS * tight
+        lift_gate  = grasp                                # gate uses establishment
     else:
         lift_gate = 1.0
     if obj_z > 0.04:                                 # lifted
         reward += lift_gate * 2 * (1 - 0.5*||palm-tgt|| - 0.5*||obj-tgt||)
     if ||obj - target|| < 0.1:  reward += lift_gate * 10
     if ||obj - target|| < 0.05: reward += lift_gate * 20
-    reward -= ARM_VEL_PENALTY    * Σ qvel[:6]²        # smoothness (arm)
-    reward -= FINGER_VEL_PENALTY * Σ qvel[6:30]²      # smoothness (fingers)
+    reward -= ARM_VEL_PENALTY    * Σ qvel[:6]²        # smoothness (arm vel)
+    reward -= FINGER_VEL_PENALTY * Σ qvel[6:30]²      # smoothness (finger vel)
+    reward -= ARM_CTRL_PENALTY   * Σ action[:6]²      # arm control magnitude
     cost = -reward
 
 Set ``USE_GRASP_SHAPING = False`` (module constant) to revert to the plain
@@ -90,22 +90,12 @@ _LIFT_Z = 0.04
 _GOAL_LOOSE = 0.1
 _GOAL_TIGHT = 0.05
 
-# ---- Anti-cheat / grasp-shaping (touch-sensor based) ----
 # Set to False to revert to the plain dense reward (palm-balancing reward hack
 # returns). When True, MPPI is rewarded for fingertip contact, penalised for
 # palm contact, and the lift bonus is gated on grasp strength.
 USE_GRASP_SHAPING = True
-# Palm contact penalty — off by default. The per-finger proximity gate on
-# the grip bonus + lift_gate already make pure palm-balancing strictly
-# worse than grasping (no fingertip contact → no grip → no lift → no
-# milestone). Penalising palm contact additionally forces fingertip-only
-# "pinch" grasps and pushes the palm high above the ball, which makes
-# fingertips collide with the table on approach. Palmar grasps (palm +
-# fingers both on ball) are actually a stable, human-like configuration.
-# Re-enable (set > 0) only if you see palm-balancing return.
-_PALM_PENALTY = 0.0
+
 _GRIP_BONUS = 4.0         # weight on tanh(grip_score / GRIP_TOUCH_SCALE)
-_PALM_TOUCH_SCALE = 0.5   # tanh saturation for palm touch (used iff PENALTY > 0)
 _GRIP_TOUCH_SCALE = 1.0   # establishment tanh — saturates fast (~grip_score=2)
                           # so MPPI gets a steep gradient establishing contact.
 # Tighter-grip reward: a second tanh with a much larger scale stays
@@ -139,6 +129,17 @@ _GRIP_PROXIMITY_SCALE = 0.05
 _ARM_VEL_PENALTY = 0.02      # qvel[:6]   — ARTx/y/z, ARRx/y/z
 _FINGER_VEL_PENALTY = 0.001  # qvel[6:30] — 24 hand joints
 
+# ---- Control-magnitude penalty (arm only) ----
+# Penalises Σ action[:6]² — the 6 arm actuators (A_ARTx/y/z, A_ARRx/y/z).
+# These are position-controlled, so this pulls commanded positions toward
+# the arm's rest pose. The rest pose is far from the ball workspace, so
+# this term mildly opposes the task; keep it small (regularization, not
+# constraint). Mostly useful as a tie-breaker against MPPI sampling noise
+# that briefly slams the arm to its joint limits. Set to 0.0 to disable.
+# Hand controls intentionally excluded — finger commands need to span
+# their range freely to grasp.
+_ARM_CTRL_PENALTY = 0.02
+
 
 class AdroitRelocate(MuJoCoEnv):
     def __init__(self, frame_skip: int = 5, **kwargs) -> None:
@@ -154,10 +155,9 @@ class AdroitRelocate(MuJoCoEnv):
 
         self._obj_pos_slice = self._sensor_slice("object_pos")
         self._palm_pos_slice = self._sensor_slice("palm_pos")
-        # Cached unconditionally — the cost path only reads these when
+        # Cached unconditionally — the cost path only reads this when
         # USE_GRASP_SHAPING is True, but caching is cheap and lets the toggle
         # flip at runtime without re-doing name lookups.
-        self._palm_touch_slice = self._sensor_slice("ST_Tch_palm")
         self._fingertip_touch_slice = self._fingertip_slice()
         # Fingertip world positions, contiguous: 5 sensors × 3 dims = 15
         # floats laid out as [ff, mf, rf, lf, th]. Same finger order as
@@ -288,12 +288,6 @@ class AdroitRelocate(MuJoCoEnv):
                 + _GRIP_BONUS * grasp           # establishment (saturates fast)
                 + _TIGHT_GRIP_BONUS * tight     # firmness (keeps growing)
             )
-            if _PALM_PENALTY > 0.0:
-                palm_t = sensordata[..., self._palm_touch_slice].sum(axis=-1)
-                palm_d2 = ((palm - obj) ** 2).sum(axis=-1)
-                palm_near = np.exp(-palm_d2 / (_GRIP_PROXIMITY_SCALE ** 2))
-                palm_s = np.tanh(palm_t / _PALM_TOUCH_SCALE) * palm_near
-                reward = reward - _PALM_PENALTY * palm_s
             lift_gate = grasp
         else:
             lift_gate = 1.0
@@ -302,9 +296,9 @@ class AdroitRelocate(MuJoCoEnv):
         lifted = obj_z > _LIFT_Z
         lift_bonus = (
             1.0
-            # - 0.5 * np.linalg.norm(palm - target, axis=-1)
+            - 0.5 * np.linalg.norm(palm - target, axis=-1)
             - 0.5 * np.linalg.norm(obj - target, axis=-1)
-        ) * 4.0
+        ) * 4
         reward = reward + np.where(lifted, lift_bonus * lift_gate, 0.0)
 
         # Milestone bonuses for object near target — gated on grasp so a
@@ -324,10 +318,15 @@ class AdroitRelocate(MuJoCoEnv):
         qvel = self.state_qvel(states)
         arm_v2 = (qvel[..., :6] ** 2).sum(axis=-1)
         finger_v2 = (qvel[..., 6:30] ** 2).sum(axis=-1)
+        # Arm-only control magnitude penalty — pulls commanded arm positions
+        # toward the rest pose. Hand controls excluded so fingers can fully
+        # close during grasp.
+        arm_u2 = (actions[..., :6] ** 2).sum(axis=-1)
         reward = (
             reward
-            - _ARM_VEL_PENALTY * arm_v2
-            - _FINGER_VEL_PENALTY * finger_v2
+            - ( _ARM_VEL_PENALTY * arm_v2
+            + _FINGER_VEL_PENALTY * finger_v2
+            + _ARM_CTRL_PENALTY * arm_u2 )
         )
 
         return -reward
