@@ -176,8 +176,11 @@ class AdroitRelocate(MuJoCoEnv):
         self._obj_body_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_BODY, "Object"
         )
-        self._target_site_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_SITE, "target"
+        # Target's authoritative position is now body_pos[target_body]
+        # (so the recording cameras can targetbody it). The site under
+        # this body is purely visual at body-local origin.
+        self._target_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "target_body"
         )
 
         self._obj_pos_slice = self._sensor_slice("object_pos")
@@ -200,7 +203,7 @@ class AdroitRelocate(MuJoCoEnv):
 
         # Per-episode constants (refreshed on every reset).
         self._obj_body_init_pos = self.model.body_pos[self._obj_body_id].copy()
-        self._target_pos = self.model.site_pos[self._target_site_id].copy()
+        self._target_pos = self.model.body_pos[self._target_body_id].copy()
         # Stiffen finger PD so commanded position translates to more contact
         # force. Default gain=1 gives marginal grip; gain=3 holds a 0.18kg ball
         # through normal lift acceleration.
@@ -264,11 +267,14 @@ class AdroitRelocate(MuJoCoEnv):
         self.model.body_pos[self._obj_body_id, 1] = np.random.uniform(*_OBJ_Y_RANGE)
         self._obj_body_init_pos = self.model.body_pos[self._obj_body_id].copy()
 
-        # Randomise target site position (x,y,z).
-        self.model.site_pos[self._target_site_id, 0] = np.random.uniform(*_TARGET_X_RANGE)
-        self.model.site_pos[self._target_site_id, 1] = np.random.uniform(*_TARGET_Y_RANGE)
-        self.model.site_pos[self._target_site_id, 2] = np.random.uniform(*_TARGET_Z_RANGE)
-        self._target_pos = self.model.site_pos[self._target_site_id].copy()
+        # Randomise target body position (x,y,z). The site sits at body
+        # origin so it follows automatically; mocap-style writes to body_pos
+        # work for this welded body because mj_forward below propagates the
+        # change into the kinematic tree.
+        self.model.body_pos[self._target_body_id, 0] = np.random.uniform(*_TARGET_X_RANGE)
+        self.model.body_pos[self._target_body_id, 1] = np.random.uniform(*_TARGET_Y_RANGE)
+        self.model.body_pos[self._target_body_id, 2] = np.random.uniform(*_TARGET_Z_RANGE)
+        self._target_pos = self.model.body_pos[self._target_body_id].copy()
 
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs()

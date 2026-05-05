@@ -26,11 +26,13 @@
         <!-- Camera for the VIL paper -->
         <camera name="vil_camera" pos="0 -1.2 1.2" quat="0.92388 0.382683 0 0" />
         <!-- Multi-angle cameras for the recording path. mode="targetbody"
-             auto-orients the camera toward the Object body, so they
-             always frame the ball as it moves. -->
-        <camera name="cam_top"  pos="0  -0.2 0.9"  mode="targetbody" target="Object"/>
-        <camera name="cam_side" pos="0.7 -0.2 0.25" mode="targetbody" target="Object"/>
-        <camera name="cam_iso"  pos="0.5 -0.7 0.5"  mode="targetbody" target="Object"/>
+             auto-orients the camera toward the target_body, so the
+             green destination stays centred. Targeting the Object
+             instead jitters the view as the ball is grasped/lifted —
+             stable framing is more useful for inspecting behaviour. -->
+        <camera name="cam_top"  pos="0  -0.2 0.9"  mode="targetbody" target="target_body"/>
+        <camera name="cam_side" pos="0.7 -0.2 0.25" mode="targetbody" target="target_body"/>
+        <camera name="cam_iso"  pos="0.5 -0.7 0.5"  mode="targetbody" target="target_body"/>
 
         <!-- ======= TABLE ======= -->
         <body name="table">
@@ -64,7 +66,15 @@
         </body>
 
         <!-- ======= DESTINATION ======= -->
-        <site name="target" pos="-0.007 0.0 0.2" size="0.07" rgba="0 1 0 0.125" />
+        <!-- Wrap the target site in a body so the recording cameras can
+             use mode="targetbody" target="target_body" — that mode only
+             supports bodies, not sites. The body's pos is randomised at
+             reset (env writes model.body_pos); the site sits at body-
+             local origin and is purely visual. -->
+        <body name="target_body" pos="-0.007 0.0 0.2">
+            <inertial pos="0 0 0" mass="0.001" diaginertia="1e-9 1e-9 1e-9" />
+            <site name="target" pos="0 0 0" size="0.07" rgba="0 1 0 0.125" />
+        </body>
 
         <!-- ======= OBJECT ======= -->
         <body name="Object" pos="-0.00 0.0 0.035" user="1001 0 2003 27 0 0 0.06 0 0">
