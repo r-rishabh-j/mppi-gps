@@ -155,7 +155,7 @@ def main():
     env = make_env(args.env)
 
     mppi_cfg = MPPIConfig.load(args.env)
-    policy_cfg = PolicyConfig()
+    policy_cfg = PolicyConfig.for_env(args.env)
     gps_cfg = GPSConfig()
 
     if args.gps_iters is not None:

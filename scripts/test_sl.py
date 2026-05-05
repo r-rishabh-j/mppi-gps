@@ -57,7 +57,14 @@ from src.utils.experiment import (
 )
 
 
-_ENVS = ["acrobot", "half_cheetah", "point_mass", "hopper"]
+_ENVS = [
+    "acrobot",
+    "adroit_pen",
+    "adroit_relocate",
+    "half_cheetah",
+    "point_mass",
+    "hopper",
+]
 
 # Camera per env — must match <camera name="..."> in the MuJoCo XML.
 _CAMERA = {
@@ -65,6 +72,8 @@ _CAMERA = {
     "half_cheetah": "track",
     "acrobot": "fixed",
     "point_mass": "fixed",
+    "adroit_pen": "vil_camera",
+    "adroit_relocate": "vil_camera",
 }
 
 
@@ -179,7 +188,7 @@ def main() -> None:
             f"python -m scripts.collect_bc_demos --env {args.env} --force"
         )
 
-    policy_cfg = PolicyConfig()
+    policy_cfg = PolicyConfig.for_env(args.env)
     PolicyCls = DeterministicPolicy if args.deterministic else GaussianPolicy
     policy = PolicyCls(obs_dim, act_dim, policy_cfg,
                        device=device, action_bounds=env.action_bounds)

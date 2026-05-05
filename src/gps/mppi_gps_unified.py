@@ -318,6 +318,10 @@ class MPPIGPS:
 
         self.policy.optimizer.zero_grad()
         loss.backward()
+        # NaN-loss guard: same rationale as in GaussianPolicy.train_weighted.
+        if not torch.isfinite(loss):
+            self.policy.optimizer.zero_grad()
+            return float("nan")
         self.policy.optimizer.step()
         # Mirror mse_step / train_weighted's EMA hook so the shadow stays
         # in sync regardless of which loss path runs.

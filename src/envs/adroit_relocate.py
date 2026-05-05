@@ -15,13 +15,19 @@ State / action layout
 
 Observations
 ------------
-39-D, derivable from ``(qpos, qvel)`` + per-episode object/target attrs so
+72-D, derivable from ``(qpos, qvel)`` + per-episode object/target attrs so
 the same composition works in both ``_get_obs`` and ``state_to_obs``:
 
-  [0:30)   ``qpos[:30]``  (arm + hand joints)
-  [30:33)  ``obj_pos`` world (init body pos + slide qpos)
-  [33:36)  ``target_pos`` world (constant within an episode)
-  [36:39)  ``obj_pos - target_pos``
+  [0:30)    ``qpos[:30]``         arm + hand joint angles
+  [30:60)   ``qvel[:30]``         arm + hand joint velocities
+  [60:63)   ``obj_pos`` world     init body pos + slide qpos
+  [63:66)   ``obj_vel`` world     ball linear velocity (``qvel[30:33]``)
+  [66:69)   ``target_pos`` world  constant within an episode
+  [69:72)   ``obj_pos - target_pos``
+
+Velocities are critical for any dynamic manipulation: without them the
+policy can't distinguish "ball rising" from "ball at apex" from "ball
+falling", and BC plateaus far below the MPPI teacher.
 
 We deliberately drop the ``palm-obj`` / ``palm-target`` vectors that
 upstream's 39-D obs uses — those require forward kinematics on the hand
@@ -207,10 +213,10 @@ class AdroitRelocate(MuJoCoEnv):
         # Stiffen finger PD so commanded position translates to more contact
         # force. Default gain=1 gives marginal grip; gain=3 holds a 0.18kg ball
         # through normal lift acceleration.
-        GAIN = 3.0
-        finger_idx = slice(8, 30)   # A_FFJ3 .. A_THJ0 (24 hand actuators)
-        self.model.actuator_gainprm[finger_idx, 0] = GAIN
-        self.model.actuator_biasprm[finger_idx, 1] = -GAIN
+        # GAIN = 3.0
+        # finger_idx = slice(8, 30)   # A_FFJ3 .. A_THJ0 (24 hand actuators)
+        # self.model.actuator_gainprm[finger_idx, 0] = GAIN
+        # self.model.actuator_biasprm[finger_idx, 1] = -GAIN
 
     def _sensor_slice(self, name: str) -> slice:
         sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, name)
@@ -415,13 +421,18 @@ class AdroitRelocate(MuJoCoEnv):
         # Object body has identity orientation, so OBJTx/y/z are world-aligned:
         #   obj_world = body_init_pos + qpos[30:33]
         obj_world = self._obj_body_init_pos + qpos[..., 30:33]
+        # Ball linear velocity comes straight from the slide DoFs (identity
+        # body orientation again) — no rotation needed.
+        obj_vel = qvel[..., 30:33]
         target = np.broadcast_to(self._target_pos, obj_world.shape)
         return np.concatenate(
             [
-                qpos[..., :30],
-                obj_world,
-                target,
-                obj_world - target,
+                qpos[..., :30],         # 30  arm + hand joint angles
+                qvel[..., :30],         # 30  arm + hand joint velocities
+                obj_world,              # 3   ball world position
+                obj_vel,                # 3   ball linear velocity
+                target,                 # 3   target position (const per-episode)
+                obj_world - target,     # 3   useful shaped feature
             ],
             axis=-1,
         )
@@ -436,8 +447,8 @@ class AdroitRelocate(MuJoCoEnv):
 
     @property
     def obs_dim(self) -> int:
-        # 30 + 3 + 3 + 3 = 39
-        return 39
+        # 30 (qpos) + 30 (qvel) + 3 (obj_pos) + 3 (obj_vel) + 3 (target) + 3 (delta)
+        return 72
 
     @property
     def noise_scale(self) -> np.ndarray:

@@ -57,12 +57,15 @@ def evaluate_policy(
 
         ep_cost = 0.0
         for t in range(episode_len):
-            # Get the current observation and convert to a batched tensor
-            device = getattr(policy, "_device", torch.device("cpu"))
-            obs_t = torch.as_tensor(env._get_obs(), dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                act_t = policy.action(obs_t)
-            action = act_t.squeeze(0).cpu().numpy()
+            # IMPORTANT: act_np (NOT policy.action) — act_np clips to the
+            # env's actuator ctrlrange before returning. policy.action returns
+            # the raw network mean which can sit well outside [low, high]
+            # early in training. Writing those raw values into data.ctrl
+            # used to trip MuJoCo's "huge value in CTRL" stability watchdog
+            # on every eval step (in run_gps's per-iter eval especially)
+            # and produced misleading eval costs that didn't reflect what
+            # MPPI/DAgger see at execution time (both of which DO clip).
+            action = policy.act_np(env._get_obs())
             _, cost, done, _ = env.step(action)
             ep_cost += cost
 

@@ -105,6 +105,16 @@ class MPPI:
 
         # rollout
         states, costs, sensordata = self.env.batch_rollout(state, U_clipped)
+        # Sanitise diverged-sample costs. A single sample whose batched
+        # rollout produces NaN/Inf states (contact spike, near-singular pose)
+        # would otherwise poison the WHOLE batch: NaN in costs → NaN in S →
+        # NaN weights → NaN U_updated → NaN action → MuJoCo writes NaN to
+        # data.ctrl on the next env.step and emits the "huge value in CTRL"
+        # warning every step from then on. Replacing with a large finite
+        # cost makes that sample's weight ≈ 0 (MPPI ignores it) without
+        # destabilising the rest of the batch. 1e12 << float32 max so
+        # exp(-S/λ) underflows cleanly to 0 instead of overflowing.
+        costs = np.nan_to_num(costs, nan=1e12, posinf=1e12, neginf=1e12)
 
         # assemble S_k components (paper's Algorithm 2, γ=λ, Σ=σ²I):
         #    S_k = S_env + λ · Σ_t u_t · ε_{k,t}/σ² + (optional) λ_track · Σ_t ‖a-π‖²
@@ -112,6 +122,12 @@ class MPPI:
         is_corr = self._is_correction(eps, lam)
         # track = None
         track = prior(states, U_clipped) if prior is not None else None
+        if track is not None:
+            # Same defense for the policy prior. NLL prior can blow up when
+            # log_sigma collapses, mean_distance prior gets NaN if the
+            # diverged states feed NaN obs → NaN policy mean. Either way,
+            # one bad sample shouldn't poison the batch.
+            track = np.nan_to_num(track, nan=1e12, posinf=1e12, neginf=1e12)
         S = costs + is_corr + (track if track is not None else 0.0)
 
         # paper weights: ρ = min_k S_k, w_k = exp(-(S_k - ρ)/λ) / η

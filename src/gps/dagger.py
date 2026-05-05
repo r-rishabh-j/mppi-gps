@@ -143,13 +143,17 @@ class DAggerTrainer:
                     _, _, done, _ = self.env.step(exec_action)
                     pbar.update(1)
                     if done:
-                        self.env.reset()
-                        self.mppi.reset()
-                        # if auto_reset:
-                        #     self.env.reset()
-                        #     self.mppi.reset()
-                        # else:
-                        #     break
+                        # auto_reset → keep collecting until ep_len so the
+                        # progress bar / per-episode budget aren't wasted on
+                        # an early termination (matters for terminating envs
+                        # like hopper). Otherwise break — terminating mid-
+                        # episode produces a shorter trajectory which is the
+                        # honest signal for non-auto-reset envs.
+                        if auto_reset:
+                            self.env.reset()
+                            self.mppi.reset()
+                        else:
+                            break
 
         obs_arr = np.stack(obs_rows, axis=0)
         act_arr = np.stack(act_rows, axis=0)
@@ -345,6 +349,10 @@ class DAggerTrainer:
 
         self.policy.optimizer.zero_grad()
         loss.backward()
+        # NaN-loss guard: same rationale as in GaussianPolicy.train_weighted.
+        if not torch.isfinite(loss):
+            self.policy.optimizer.zero_grad()
+            return float("nan")
         self.policy.optimizer.step()
         # EMA hook — `mse_step` does this; mirror so the EMA shadow stays
         # in sync with the live policy across PPO updates too. (This is

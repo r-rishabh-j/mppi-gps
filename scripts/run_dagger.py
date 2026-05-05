@@ -155,7 +155,7 @@ def main() -> None:
 
     obs_dim = env.obs_dim
     act_dim = env.action_dim
-    policy_cfg = PolicyConfig()
+    policy_cfg = PolicyConfig.for_env(args.env)
     bounds = env.action_bounds
     if args.deterministic:
         policy = DeterministicPolicy(obs_dim, act_dim, policy_cfg,

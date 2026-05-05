@@ -94,6 +94,12 @@ class DeterministicPolicy(nn.Module):
         loss = ((pred - act_t) ** 2).mean()
         self.optimizer.zero_grad()
         loss.backward()
+        # NaN-loss guard: see GaussianPolicy.train_weighted. A single bad
+        # batch (NaN action target from a divergent MPPI rollout) would
+        # otherwise overwrite every parameter with NaN in one step.
+        if not torch.isfinite(loss):
+            self.optimizer.zero_grad()
+            return float("nan")
         if grad_clip_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip_norm)
         self.optimizer.step()

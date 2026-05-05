@@ -189,6 +189,14 @@ class GaussianPolicy(nn.Module):
 
         self.optimizer.zero_grad()
         loss.backward()
+        # NaN-loss guard: a single batch containing NaN actions/obs
+        # (e.g., from a divergent MPPI rollout in GPS C-step) would
+        # otherwise produce NaN gradients on every parameter and
+        # permanently corrupt the policy in one optimizer step. Skip
+        # the step instead and surface NaN to the caller for logging.
+        if not torch.isfinite(loss):
+            self.optimizer.zero_grad()
+            return float("nan")
         self.optimizer.step()
         if self.ema is not None:
             self.ema.update(self)
@@ -209,6 +217,11 @@ class GaussianPolicy(nn.Module):
         loss = ((mu - act_t) ** 2).mean()
         self.optimizer.zero_grad()
         loss.backward()
+        # See train_weighted: skip the step on a NaN/Inf loss so a single
+        # bad batch can't corrupt every parameter via NaN gradients.
+        if not torch.isfinite(loss):
+            self.optimizer.zero_grad()
+            return float("nan")
         self.optimizer.step()
         if self.ema is not None:
             self.ema.update(self)

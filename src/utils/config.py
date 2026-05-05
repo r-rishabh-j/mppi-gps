@@ -36,6 +36,27 @@ class PolicyConfig:
     log_sigma_min: float = -5.0
     log_sigma_max: float = 2.0
 
+    @classmethod
+    def for_env(cls, env_name: str) -> "PolicyConfig":
+        """Per-env defaults so the small/2D envs and the 30-DoF Adroit hand
+        don't have to share one capacity setting.
+
+        The fields are a strict superset for both ``GaussianPolicy`` and
+        ``DeterministicPolicy``: ``hidden_dims``, ``lr``, ``activation``,
+        ``obs_norm`` are read by both; ``log_sigma_*`` is Gaussian-only and
+        silently ignored by the deterministic head. So a single per-env
+        instance works for either policy class.
+
+        Adroit-specific bumps:
+        * ``hidden_dims=(512, 512, 512)`` — 30-DoF action with 70+-D obs
+          needs more capacity than the (256, 256) default that's tuned for
+          acrobot/cheetah.
+        * ``lr=3e-4`` — slightly safer with the deeper net.
+        """
+        if env_name.startswith("adroit"):
+            return cls(hidden_dims=(512, 512, 512), lr=3e-4)
+        return cls()
+
 @dataclass
 class GPSConfig:
     num_iterations: int = 50
