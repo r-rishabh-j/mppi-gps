@@ -65,7 +65,35 @@ def evaluate_policy(
             # on every eval step (in run_gps's per-iter eval especially)
             # and produced misleading eval costs that didn't reflect what
             # MPPI/DAgger see at execution time (both of which DO clip).
-            action = policy.act_np(env._get_obs())
+            obs = env._get_obs()
+            action = policy.act_np(obs)
+            if np.isnan(action).any():
+                # Diagnostic: figure out which input went bad.
+                obs_nan = bool(np.isnan(obs).any())
+                bad_params = [
+                    k for k, v in policy.state_dict().items()
+                    if not torch.isfinite(v).all()
+                ]
+                norm_bad = False
+                if getattr(policy, "normalizer", None) is not None:
+                    n = policy.normalizer
+                    norm_bad = (
+                        not torch.isfinite(n.mean).all()
+                        or not torch.isfinite(n.var).all()
+                    )
+                print(f"[NaN action] ep={ep} t={t}  "
+                      f"obs_has_nan={obs_nan}  "
+                      f"normalizer_bad={norm_bad}  "
+                      f"params_with_nan={bad_params[:3]}{'...' if len(bad_params) > 3 else ''}  "
+                      f"(total {len(bad_params)} bad params)")
+                # First-step diagnostic only — break out so we don't spam.
+                if t == 0 and ep == 0:
+                    raise RuntimeError(
+                        "NaN action on the very first eval step. See diagnostic above. "
+                        "If params_with_nan is non-empty, the checkpoint is dead; "
+                        "if obs_has_nan is True, the env is in a NaN state already; "
+                        "if both are False, run forward manually to find which layer NaNs."
+                    )
             _, cost, done, _ = env.step(action)
             ep_cost += cost
 

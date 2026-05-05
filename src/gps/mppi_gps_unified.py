@@ -229,8 +229,11 @@ class MPPIGPS:
         """Mini-batch distillation. Loss type derived from policy class.
 
         * Deterministic → MSE via ``policy.mse_step`` with optional
-          ``cfg.grad_clip_norm`` clipping the gradient L2 norm. ``weights``
-          and ``prev_policy`` are ignored.
+          ``cfg.grad_clip_norm`` clipping the gradient L2 norm. When
+          ``cfg.clip_eps > 0``, the per-batch MPPI label is also clamped
+          to ``[old_policy.action(o) ± clip_eps]`` before the MSE loss
+          (action-space trust region; mirrors ``mppi_gps_clip``'s MSE
+          branch). ``weights`` and ``prev_policy`` are ignored either way.
         * Gaussian → weighted NLL via ``policy.train_weighted`` with
           optional ``cfg.prev_iter_kl_coef`` trust region against
           ``prev_policy``. If ``cfg.clip_ratio > 0``, every batch goes
@@ -243,12 +246,42 @@ class MPPIGPS:
 
         if self._deterministic:
             grad_clip_norm = float(getattr(cfg, "grad_clip_norm", 0.0))
+            clip_eps = float(getattr(cfg, "clip_eps", 0.0))
+
+            # Snapshot for action-target clip (frozen, eval, no-grad).
+            # Skipped when clip_eps == 0 to avoid the deepcopy cost when
+            # the trust region is disabled. Same skip-if-zero pattern
+            # as the Gaussian PPO branch below.
+            old_policy = None
+            if clip_eps > 0.0:
+                old_policy = copy.deepcopy(self.policy)
+                old_policy.eval()
+                for p in old_policy.parameters():
+                    p.requires_grad_(False)
+
+            device = self.policy.device
+
             for _ in range(cfg.distill_epochs):
                 np.random.shuffle(indices)
                 for start in range(0, N, cfg.distill_batch_size):
                     batch = indices[start : start + cfg.distill_batch_size]
+                    obs_b = obs[batch]
+                    act_b = actions[batch]
+                    if old_policy is not None:
+                        # Clamp the label to ±clip_eps around the old
+                        # policy's prediction. Per-element np.clip with
+                        # array bounds (NOT a single scalar) so each
+                        # action dim is independently trust-regioned.
+                        with torch.no_grad():
+                            o_t = torch.as_tensor(
+                                obs_b, dtype=torch.float32, device=device,
+                            )
+                            old_pred = old_policy.action(o_t).cpu().numpy()
+                        act_b = np.clip(
+                            act_b, old_pred - clip_eps, old_pred + clip_eps,
+                        )
                     last_loss = self.policy.mse_step(
-                        obs[batch], actions[batch],
+                        obs_b, act_b,
                         grad_clip_norm=grad_clip_norm,
                     )
             return last_loss
@@ -311,7 +344,18 @@ class MPPIGPS:
         with torch.no_grad():
             old_log_prob = old_policy.log_prob(o_t, a_t)
 
-        ratio = torch.exp(curr_log_prob - old_log_prob)
+        # Clamp the log-ratio so exp() can't overflow to +inf. When σ
+        # collapses (log_sigma near log_sigma_min), per-row log-prob
+        # magnitudes grow into the millions and inter-batch differences
+        # easily exceed 88 (= log of float32 max for exp). An overflowed
+        # ratio creates a 0·∞ in the autograd chain (torch.min picks the
+        # finite surr2, giving the surr1 branch outer-grad 0; but ratio's
+        # local grad d_exp/d_x = exp(x) = inf, so 0 · inf = NaN).
+        # 20 caps ratio at exp(20) ≈ 5e8 — well below any clip threshold,
+        # so behaviour is unchanged in the regime where PPO actually
+        # matters (ratio ≈ 1±eps).
+        log_ratio = torch.clamp(curr_log_prob - old_log_prob, min=-20.0, max=20.0)
+        ratio = torch.exp(log_ratio)
         surr1 = ratio * w_t
         surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * w_t
         loss = -torch.min(surr1, surr2).sum() / w_t.sum().clamp(min=1e-8)

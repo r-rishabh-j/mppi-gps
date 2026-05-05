@@ -341,7 +341,11 @@ class DAggerTrainer:
         with torch.no_grad():
             old_log_prob = old_policy.log_prob(o_t, a_t)
 
-        ratio = torch.exp(curr_log_prob - old_log_prob)
+        # Clamp log-ratio to prevent exp() overflow → 0·∞ NaN gradients
+        # via the torch.min autograd chain. See mppi_gps_unified for the
+        # full explanation; same pathology applies here.
+        log_ratio = torch.clamp(curr_log_prob - old_log_prob, min=-20.0, max=20.0)
+        ratio = torch.exp(log_ratio)
         # Uniform "advantage" = 1; min(...) caps boost at ratio = 1+clip_ratio.
         surr1 = ratio
         surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)

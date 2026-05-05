@@ -143,13 +143,21 @@ class GPSConfig:
     # (cached chunk actions are prior-biased and can't serve as plain labels),
     # so you lose the open-loop speedup — effective cost becomes ~1 rollout/step.
     dagger_relabel: bool = False
-    # Legacy: action-target clip used only by the MSE branch of
-    # `mppi_gps_clip._train_step_clipped` (clamps the label to
-    # [pi_old(o) ± clip_eps] before the MSE loss). Kept for that branch's
-    # back-compat; `mppi_gps_det.MPPIGPSDet` no longer uses it (was
-    # removed in favour of `grad_clip_norm` — loss-agnostic, no biased
-    # fixed point at the boundary).
-    clip_eps: float = 0.1
+    # Action-target clip used by the deterministic / MSE S-step in
+    # `mppi_gps_unified._distill_epoch` (and the legacy
+    # `mppi_gps_clip._train_step_clipped`). At the start of each S-step
+    # the trainer snapshots the policy as `old_policy`; per batch the
+    # MPPI-supplied label is clamped to `[old_policy.action(o) ± clip_eps]`
+    # before the MSE loss. This is a trust region on per-update label
+    # movement — bounds how far each gradient step can pull the policy
+    # mean. 0.0 = disabled (default; plain MSE on the raw MPPI label).
+    # Typical 0.05–0.2 if you want to use it. NOTE: opt-in default is
+    # deliberate — the previous 0.1 default silently activated the clip
+    # for every deterministic GPS run, which can bias the fixed point
+    # of the regression. `grad_clip_norm` is loss-agnostic and a less
+    # biased alternative; prefer that unless you specifically want the
+    # action-space trust region semantics.
+    clip_eps: float = 0.0
     # Gradient-norm clip applied between backward() and optimizer.step() in
     # the deterministic policy's mse_step (used by `mppi_gps_det.MPPIGPSDet`).
     # Bounds typical per-update parameter movement; loss-agnostic. 0.0 =
@@ -157,6 +165,19 @@ class GPSConfig:
     # sweep {0.5, 1.0, 5.0} if the policy learns too slowly or the loss
     # spikes. No effect on the Gaussian path.
     grad_clip_norm: float = 1.0
+    # PPO-style probability ratio clip for the Gaussian S-step surrogate
+    # in `mppi_gps_unified._train_step_ppo_clip`. 0.0 = disabled (default;
+    # falls through to plain NLL via `train_weighted`, which is what most
+    # users expect). When > 0, snapshots the policy at the start of each
+    # S-step and uses `L = -E[ min(r·w, clip(r, 1-eps, 1+eps)·w) ]` per
+    # batch, where r = π_θ / π_old. Typical 0.1–0.3; standard PPO uses 0.2.
+    # IMPORTANT: must default to 0.0 — `getattr(cfg, "clip_ratio", 0.2)`
+    # in the trainer used to silently activate PPO when this field was
+    # missing, and that path has a 0·∞ NaN-gradient bug when σ collapses
+    # (extreme log-ratios overflow exp() to inf, the torch.min picks the
+    # finite branch with gradient 0, and 0 · inf in the chain rule
+    # produces NaN gradients that nuke every parameter in one step).
+    clip_ratio: float = 0.0
 
 
 @dataclass

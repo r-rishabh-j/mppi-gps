@@ -138,6 +138,16 @@ def parse_args():
                         "(see GPSConfig.grad_clip_norm). Sweep {0.5, 1.0, 5.0} if "
                         "learning is too slow or loss spikes. Ignored without "
                         "--deterministic.")
+    p.add_argument("--clip-eps", type=float, default=None,
+                   help="Action-space trust region for the deterministic S-step "
+                        "(--deterministic). At the start of each S-step the "
+                        "trainer snapshots the policy as π_old; per batch the "
+                        "MPPI label is clamped to [π_old.action(o) ± clip_eps] "
+                        "before the MSE loss. 0/unset = disabled (default). "
+                        "Typical 0.05–0.2. Mirrors mppi_gps_clip's MSE branch. "
+                        "Ignored without --deterministic. Prefer --grad-clip-norm "
+                        "unless you specifically want action-space (vs parameter-"
+                        "space) trust-region semantics.")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint (wrapped or raw state_dict) "
                         "to load into gps.policy before the training loop")
@@ -190,6 +200,8 @@ def main():
         gps_cfg.dagger_relabel = True
     if args.grad_clip_norm is not None:
         gps_cfg.grad_clip_norm = args.grad_clip_norm
+    if args.clip_eps is not None:
+        gps_cfg.clip_eps = args.clip_eps
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
