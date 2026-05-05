@@ -38,6 +38,7 @@ from src.utils.experiment import (
     copy_as,
     git_sha,
     load_checkpoint,
+    load_state_dict_into,
     make_run_dir,
     save_checkpoint,
     update_config,
@@ -225,15 +226,11 @@ def main():
         if not init_ckpt.exists():
             raise FileNotFoundError(f"--init-ckpt not found: {init_ckpt}")
         blob = load_checkpoint(init_ckpt, map_location=device)
-        try:
-            gps.policy.load_state_dict(blob["state_dict"])
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"failed to load --init-ckpt {init_ckpt} into "
-                f"{type(gps.policy).__name__} — shapes / policy class mismatch?"
-            ) from exc
-        print(f"loaded initial policy weights from {init_ckpt}"
-              + (f"  (policy_class={blob['policy_class']})" if 'policy_class' in blob else ""))
+        # Auto-handles GaussianPolicy → DeterministicPolicy by slicing the
+        # mu head off the (mu | log_sigma) concatenated head. Other class
+        # transitions raise a clear error.
+        report = load_state_dict_into(gps.policy, blob)
+        print(f"loaded initial policy weights from {init_ckpt}: {report['msg']}")
 
     # ---- Run dir + config dump ----
     run_dir = make_run_dir(args.exp_dir, args.env, args.exp_name)

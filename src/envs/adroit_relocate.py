@@ -15,8 +15,11 @@ State / action layout
 
 Observations
 ------------
-72-D, derivable from ``(qpos, qvel)`` + per-episode object/target attrs so
-the same composition works in both ``_get_obs`` and ``state_to_obs``:
+Two layouts, switched by the ``USE_DAPG_OBS`` module constant.
+
+**``USE_DAPG_OBS = False`` (default) — 72-D**, derivable from
+``(qpos, qvel)`` + per-episode object/target attrs so the same composition
+works in both ``_get_obs`` and ``state_to_obs`` with no extra kinematics:
 
   [0:30)    ``qpos[:30]``         arm + hand joint angles
   [30:60)   ``qvel[:30]``         arm + hand joint velocities
@@ -29,12 +32,22 @@ Velocities are critical for any dynamic manipulation: without them the
 policy can't distinguish "ball rising" from "ball at apex" from "ball
 falling", and BC plateaus far below the MPPI teacher.
 
-We deliberately drop the ``palm-obj`` / ``palm-target`` vectors that
-upstream's 39-D obs uses — those require forward kinematics on the hand
-which can't be done in vectorised ``state_to_obs`` without an extra
-``mj_forward`` per state. The policy can reconstruct an approximate palm
-pose from the 6 arm joints; the cost (which has full sensordata in the
-batched path) does see the true palm.
+**``USE_DAPG_OBS = True`` — 39-D**, the canonical D4RL/DAPG relocate
+observation:
+
+  [0:30)    ``qpos[:30]``                 arm + hand joint angles
+  [30:33)   ``palm_pos - obj_pos``        hand-to-ball delta
+  [33:36)   ``palm_pos - target_pos``     hand-to-target delta
+  [36:39)   ``obj_pos - target_pos``      ball-to-target delta
+
+Translation-invariant by construction (the policy sees displacements, not
+world coordinates), and matches the D4RL ``relocate-*`` datasets so D4RL
+checkpoints can be loaded directly. No qvel — DAPG deliberately omits it
+and the public datasets reflect that. Requires palm position, so
+``state_to_obs`` falls back to a per-state ``mj_forward`` loop. Acceptable
+because ``state_to_obs`` is only called in the relabel / eval path, never
+inside the MPPI inner loop (where the batched ``running_cost`` reads the
+true palm directly from ``sensordata``).
 
 Cost
 ----
@@ -101,6 +114,16 @@ _GOAL_TIGHT = 0.05
 # returns). When True, MPPI is rewarded for fingertip contact, penalised for
 # palm contact, and the lift bonus is gated on grasp strength.
 USE_GRASP_SHAPING = True
+
+# Switch the observation layout. False (default) → 72-D obs with qpos+qvel +
+# absolute object/target positions + obj-target delta; cheap to compute in
+# both _get_obs and the batched state_to_obs path. True → 39-D D4RL/DAPG obs
+# (qpos[:30] + palm-obj + palm-target + obj-target deltas, no qvel); requires
+# palm position so state_to_obs runs an mj_forward per state. Flip when you
+# want to ingest D4RL relocate datasets or test translation-invariant
+# representations on small data; keep False for self-collected MPPI data
+# where qvel actually helps the policy. See module docstring for the layout.
+USE_DAPG_OBS = True
 
 _GRIP_BONUS = 4.0         # weight on tanh(grip_score / GRIP_TOUCH_SCALE)
 _GRIP_TOUCH_SCALE = 1  # establishment tanh — saturates fast (~grip_score=2)
@@ -417,14 +440,35 @@ class AdroitRelocate(MuJoCoEnv):
         self,
         qpos: np.ndarray,
         qvel: np.ndarray,
+        palm_pos: np.ndarray | None = None,
     ) -> np.ndarray:
         # Object body has identity orientation, so OBJTx/y/z are world-aligned:
         #   obj_world = body_init_pos + qpos[30:33]
         obj_world = self._obj_body_init_pos + qpos[..., 30:33]
-        # Ball linear velocity comes straight from the slide DoFs (identity
-        # body orientation again) — no rotation needed.
-        obj_vel = qvel[..., 30:33]
         target = np.broadcast_to(self._target_pos, obj_world.shape)
+
+        if USE_DAPG_OBS:
+            # 39-D D4RL/DAPG layout. Caller is responsible for supplying
+            # palm_pos (from sensordata in the live path, or via mj_forward
+            # in state_to_obs) — this method has no access to data.
+            if palm_pos is None:
+                raise ValueError(
+                    "USE_DAPG_OBS=True requires palm_pos; "
+                    "callers must populate it from sensordata or mj_forward."
+                )
+            return np.concatenate(
+                [
+                    qpos[..., :30],          # 30  arm + hand joint angles
+                    palm_pos - obj_world,    # 3   hand → ball
+                    palm_pos - target,       # 3   hand → target
+                    obj_world - target,      # 3   ball → target
+                ],
+                axis=-1,
+            )
+
+        # 72-D layout (default). Ball linear velocity comes straight from the
+        # slide DoFs (identity body orientation again) — no rotation needed.
+        obj_vel = qvel[..., 30:33]
         return np.concatenate(
             [
                 qpos[..., :30],         # 30  arm + hand joint angles
@@ -438,15 +482,59 @@ class AdroitRelocate(MuJoCoEnv):
         )
 
     def _get_obs(self) -> np.ndarray:
-        return self._build_obs(self.data.qpos.copy(), self.data.qvel.copy())
+        palm = (
+            self.data.sensordata[self._palm_pos_slice].copy()
+            if USE_DAPG_OBS
+            else None
+        )
+        return self._build_obs(
+            self.data.qpos.copy(), self.data.qvel.copy(), palm_pos=palm
+        )
 
     def state_to_obs(self, states: np.ndarray) -> np.ndarray:
         qpos = self.state_qpos(states)
         qvel = self.state_qvel(states)
-        return self._build_obs(qpos, qvel)
+        palm = self._batched_palm_pos(qpos, qvel) if USE_DAPG_OBS else None
+        return self._build_obs(qpos, qvel, palm_pos=palm)
+
+    def _batched_palm_pos(
+        self,
+        qpos: np.ndarray,
+        qvel: np.ndarray,
+    ) -> np.ndarray:
+        """World-frame palm position for each state in ``qpos``.
+
+        Used only by ``state_to_obs`` when ``USE_DAPG_OBS=True``. Runs
+        ``mj_forward`` per state on a single ``MjData`` (no JIT/vmap in
+        MuJoCo). Cost is O(N) ``mj_forward`` calls — fine for the
+        relabel / eval path where N is at most a buffer's worth, not a
+        K×H rollout batch.
+        """
+        leading = qpos.shape[:-1]
+        flat_q = qpos.reshape(-1, qpos.shape[-1])
+        flat_v = qvel.reshape(-1, qvel.shape[-1])
+        out = np.empty((flat_q.shape[0], 3), dtype=np.float64)
+        # Snapshot data state so we don't clobber the live env on a stray
+        # call from outside a rollout.
+        saved_q = self.data.qpos.copy()
+        saved_v = self.data.qvel.copy()
+        try:
+            for i in range(flat_q.shape[0]):
+                self.data.qpos[:] = flat_q[i]
+                self.data.qvel[:] = flat_v[i]
+                mujoco.mj_forward(self.model, self.data)
+                out[i] = self.data.sensordata[self._palm_pos_slice]
+        finally:
+            self.data.qpos[:] = saved_q
+            self.data.qvel[:] = saved_v
+            mujoco.mj_forward(self.model, self.data)
+        return out.reshape(*leading, 3)
 
     @property
     def obs_dim(self) -> int:
+        if USE_DAPG_OBS:
+            # 30 (qpos) + 3 (palm-obj) + 3 (palm-target) + 3 (obj-target)
+            return 39
         # 30 (qpos) + 30 (qvel) + 3 (obj_pos) + 3 (obj_vel) + 3 (target) + 3 (delta)
         return 72
 

@@ -50,6 +50,7 @@ from src.utils.experiment import (
     copy_as,
     git_sha,
     load_checkpoint,
+    load_state_dict_into,
     make_run_dir,
     save_checkpoint,
     update_config,
@@ -90,20 +91,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init-ckpt", default=None,
                    help="warm-start: load a wrapped or raw state_dict into the policy "
                         "before training. Must match --deterministic.")
-    p.add_argument("--num-epochs", type=int, default=50)
-    p.add_argument("--batch-size", type=int, default=4096)
-    p.add_argument("--val-frac", type=float, default=0.2,
+    p.add_argument("--num-epochs", type=int, default=500)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--val-frac", type=float, default=0,
                    help="fraction of trajectories (not transitions) held out for val")
-    p.add_argument("--eval-every", type=int, default=5,
+    p.add_argument("--eval-every", type=int, default=5000,
                    help="run env eval every N epochs (0 disables mid-training eval)")
-    p.add_argument("--ckpt-every", type=int, default=5,
+    p.add_argument("--ckpt-every", type=int, default=100,
                    help="save iter_<epoch>.pt every N epochs (best.pt/final.pt always saved)")
     p.add_argument("--n-eval-eps", type=int, default=10)
-    p.add_argument("--eval-ep-len", type=int, default=500)
+    p.add_argument("--eval-ep-len", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--exp-name", default="run",
                    help="human-readable experiment name (goes in the run dir name)")
-    p.add_argument("--exp-dir", default="experiments/bc",
+    p.add_argument("--exp-dir", default="checkpoints/bc",
                    help="parent dir under which <timestamp>_<env>_<name>/ is created")
     return p.parse_args()
 
@@ -199,15 +200,10 @@ def main() -> None:
         if not init_ckpt.exists():
             raise FileNotFoundError(f"--init-ckpt not found: {init_ckpt}")
         blob = load_checkpoint(init_ckpt, map_location=device)
-        try:
-            policy.load_state_dict(blob["state_dict"])
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"failed to load --init-ckpt {init_ckpt}; make sure it matches "
-                f"--deterministic={args.deterministic}"
-            ) from exc
-        print(f"loaded initial policy weights from {init_ckpt}"
-              + (f"  (policy_class={blob['policy_class']})" if 'policy_class' in blob else ""))
+        # Auto-handles GaussianPolicy → DeterministicPolicy head conversion
+        # so a Gaussian BC pretrain can warm-start a --deterministic re-fit.
+        report = load_state_dict_into(policy, blob)
+        print(f"loaded initial policy weights from {init_ckpt}: {report['msg']}")
 
     # -------- Run dir --------
     run_dir = make_run_dir(args.exp_dir, args.env, args.exp_name)

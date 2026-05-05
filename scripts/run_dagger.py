@@ -36,6 +36,7 @@ from src.utils.experiment import (
     copy_as,
     git_sha,
     load_checkpoint,
+    load_state_dict_into,
     make_run_dir,
     save_checkpoint,
     update_config,
@@ -171,15 +172,10 @@ def main() -> None:
         if not init_ckpt.exists():
             raise FileNotFoundError(f"--init-ckpt not found: {init_ckpt}")
         blob = load_checkpoint(init_ckpt, map_location=device)
-        try:
-            policy.load_state_dict(blob["state_dict"])
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"failed to load --init-ckpt {init_ckpt}; make sure the checkpoint "
-                f"matches --deterministic={args.deterministic}"
-            ) from exc
-        print(f"loaded initial policy weights from {init_ckpt}"
-              + (f"  (policy_class={blob['policy_class']})" if 'policy_class' in blob else ""))
+        # Auto-handles GaussianPolicy → DeterministicPolicy head conversion
+        # so a Gaussian BC pretrain can warm-start a deterministic DAgger run.
+        report = load_state_dict_into(policy, blob)
+        print(f"loaded initial policy weights from {init_ckpt}: {report['msg']}")
 
     trainer = DAggerTrainer(env, mppi, policy, cfg, rng=rng)
     if args.seed_from is not None:
