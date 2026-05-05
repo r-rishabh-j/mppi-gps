@@ -1,7 +1,14 @@
 """Collect (obs, expert action) trajectories from MPPI for pure SL/BC.
 
 Writes an h5 dataset compatible with `test_sl.py` and DAgger's `--seed-from`:
-    keys:   states (M, T, obs_dim), actions (M, T, act_dim), costs (M, T)
+    keys:   states     (M, T, obs_dim)
+            actions    (M, T, act_dim)
+            costs      (M, T)
+            sensordata (M, T, nsensor)   — only when env produces non-empty
+                                          sensordata (MuJoCo envs); absent
+                                          for gym-wrapped envs and others
+                                          where ``env.data.sensordata`` is
+                                          missing or zero-sized.
     attrs:  env, M, T, obs_dim, act_dim, mppi_cfg (json)
 
 Caching:
@@ -37,6 +44,23 @@ from src.utils.config import MPPIConfig
 _ENVS = ["acrobot", "adroit_pen", "adroit_relocate", "half_cheetah", "point_mass", "hopper"]
 
 
+def _try_capture_sensordata(env) -> np.ndarray | None:
+    """Snapshot ``env.data.sensordata`` if the env exposes a non-empty one.
+
+    Returns ``None`` for envs without MuJoCo-style sensor outputs (e.g.
+    ``gym_wrapper``) or whose sensor list is empty. Used both as a probe
+    at startup (to decide whether to allocate the per-step buffer) and
+    inside the rollout loop (per-step capture).
+    """
+    data = getattr(env, "data", None)
+    if data is None:
+        return None
+    sd = getattr(data, "sensordata", None)
+    if sd is None or sd.size == 0:
+        return None
+    return sd.copy()
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--env", default="acrobot", choices=_ENVS)
@@ -67,30 +91,45 @@ def _describe_cached(path: Path) -> None:
         T = f.attrs.get("T", f["states"].shape[1])
         env_name = f.attrs.get("env", "?")
         mean_cost = float(f["costs"][:].sum(axis=1).mean()) if "costs" in f else float("nan")
+        sd_info = (
+            f"  sensordata: {f['sensordata'].shape}" if "sensordata" in f else ""
+        )
     print(f"cache hit: {path}")
     print(f"  env={env_name}  M={M}  T={T}  mean_total_cost={mean_cost:.2f}")
+    if sd_info:
+        print(sd_info)
     print("  pass --force to re-collect, or --append -M N to add N more.")
 
 
 def _load_existing(path: Path) -> dict:
     """Read a full BC dataset into memory for appending."""
     with h5py.File(path, "r") as f:
-        return {
+        out: dict = {
             "states": f["states"][:],
             "actions": f["actions"][:],
             "costs": f["costs"][:],
             "attrs": {k: f.attrs[k] for k in f.attrs.keys()},
         }
+        # Optional — only present in datasets collected after sensordata
+        # capture was added. Absent for legacy files; appending against a
+        # legacy file forces sensordata to be dropped (see validator).
+        if "sensordata" in f:
+            out["sensordata"] = f["sensordata"][:]
+        return out
 
 
-def _validate_append_compat(existing_attrs: dict, args, env, mppi_cfg) -> None:
-    """Raise if `existing_attrs` is incompatible for append; warn on soft mismatches.
+def _validate_append_compat(
+    existing: dict, args, env, mppi_cfg, new_nsensor: int
+) -> None:
+    """Raise if `existing` is incompatible for append; warn on soft mismatches.
 
     Hard-reject on any dimension/semantics change that would corrupt downstream
-    consumers (env switch, T change, auto_reset change, obs/act dim change).
-    mppi_cfg differences are soft — the user may intentionally be collecting
-    with a retuned controller, and the dataset format is agnostic to it.
+    consumers (env switch, T change, auto_reset change, obs/act dim change,
+    sensordata presence/dim change). mppi_cfg differences are soft — the user
+    may intentionally be collecting with a retuned controller, and the dataset
+    format is agnostic to it.
     """
+    existing_attrs = existing["attrs"]
     ex_env = existing_attrs.get("env", "?")
     if isinstance(ex_env, bytes):
         ex_env = ex_env.decode()
@@ -111,6 +150,23 @@ def _validate_append_compat(existing_attrs: dict, args, env, mppi_cfg) -> None:
     if ex_ar != args.auto_reset:
         mismatches.append(
             f"auto_reset: cached={ex_ar} vs current={args.auto_reset}")
+
+    # Sensordata: presence and per-step dim must agree. Adding sensordata
+    # to a legacy (no-sd) dataset (or vice versa) would leave half the rows
+    # without it, which downstream consumers can't slice cleanly — easier
+    # to refuse and tell the user to re-collect with --force.
+    ex_has_sd = "sensordata" in existing
+    new_has_sd = new_nsensor > 0
+    if ex_has_sd != new_has_sd:
+        mismatches.append(
+            f"sensordata presence: cached={ex_has_sd} vs current={new_has_sd}"
+        )
+    elif ex_has_sd:
+        ex_nsensor = int(existing["sensordata"].shape[-1])
+        if ex_nsensor != new_nsensor:
+            mismatches.append(
+                f"nsensor: cached={ex_nsensor} vs current={new_nsensor}"
+            )
 
     if mismatches:
         raise ValueError(
@@ -155,10 +211,19 @@ def main() -> None:
     env = make_env(args.env)
     mppi_cfg = MPPIConfig.load(args.env)
 
-    # Validate append compatibility now that env + mppi_cfg are constructed.
+    # Probe sensordata presence once on the freshly-reset env. If non-empty,
+    # we'll allocate a per-step buffer and capture each step's sensordata
+    # alongside obs/action/cost. Envs without it (gym_wrapper, anything
+    # without a MuJoCo model) just skip the buffer entirely.
+    env.reset()
+    sample_sd = _try_capture_sensordata(env)
+    nsensor = sample_sd.size if sample_sd is not None else 0
+
+    # Validate append compatibility now that env + mppi_cfg + sensordata
+    # presence are all known.
     existing_M = 0
     if existing is not None:
-        _validate_append_compat(existing["attrs"], args, env, mppi_cfg)
+        _validate_append_compat(existing, args, env, mppi_cfg, nsensor)
         existing_M = int(existing["attrs"].get("M", existing["states"].shape[0]))
 
     controller = MPPI(env, cfg=mppi_cfg)
@@ -173,13 +238,19 @@ def main() -> None:
     states = np.zeros((M, T, obs_dim), dtype=np.float32)
     actions = np.zeros((M, T, act_dim), dtype=np.float32)
     costs = np.zeros((M, T), dtype=np.float32)
+    sensordatas = (
+        np.zeros((M, T, nsensor), dtype=np.float32) if nsensor > 0 else None
+    )
 
+    sd_msg = f", nsensor={nsensor}" if sensordatas is not None else ""
     if existing is not None:
         print(f"appending {M} rollouts to existing {existing_M} on {args.env}  "
-              f"(obs_dim={obs_dim}, act_dim={act_dim}, auto_reset={args.auto_reset})")
+              f"(obs_dim={obs_dim}, act_dim={act_dim}, "
+              f"auto_reset={args.auto_reset}{sd_msg})")
     else:
         print(f"collecting {M} rollouts x {T} steps on {args.env}  "
-              f"(obs_dim={obs_dim}, act_dim={act_dim}, auto_reset={args.auto_reset})")
+              f"(obs_dim={obs_dim}, act_dim={act_dim}, "
+              f"auto_reset={args.auto_reset}{sd_msg})")
     print(f"→ {out_path}")
 
     outer = tqdm(range(M), desc="rollouts", unit="traj")
@@ -194,6 +265,13 @@ def main() -> None:
         for t in range(T):
             obs = env._get_obs()
             state = env.get_state()
+            # Capture sensordata BEFORE plan_step / step so it pairs with
+            # the (obs, state) at time t (i.e. pre-action). plan_step does
+            # batched rollouts that mutate scratch buffers but not the
+            # live env.data; step() advances to t+1, which is the wrong
+            # alignment for the saved row.
+            if sensordatas is not None:
+                sensordatas[i, t] = env.data.sensordata
             action, info = controller.plan_step(state)
             _, cost, done, _ = env.step(action)
 
@@ -223,9 +301,18 @@ def main() -> None:
         states_out = np.concatenate([existing["states"], states], axis=0)
         actions_out = np.concatenate([existing["actions"], actions], axis=0)
         costs_out = np.concatenate([existing["costs"], costs], axis=0)
+        # Validator already enforced that sensordata presence matches
+        # between cached + current, so either both have it or neither.
+        if sensordatas is not None:
+            sensordatas_out = np.concatenate(
+                [existing["sensordata"], sensordatas], axis=0
+            )
+        else:
+            sensordatas_out = None
         total_M = existing_M + M
     else:
         states_out, actions_out, costs_out = states, actions, costs
+        sensordatas_out = sensordatas
         total_M = M
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +320,8 @@ def main() -> None:
         f.create_dataset("states", data=states_out)
         f.create_dataset("actions", data=actions_out)
         f.create_dataset("costs", data=costs_out)
+        if sensordatas_out is not None:
+            f.create_dataset("sensordata", data=sensordatas_out)
         f.attrs["env"] = args.env
         f.attrs["M"] = total_M
         f.attrs["T"] = T

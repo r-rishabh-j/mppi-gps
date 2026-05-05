@@ -109,13 +109,25 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_demos(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """(M, T, obs_dim), (M, T, act_dim) — trajectory-preserving so we can
-    split train/val by trajectory before flattening."""
+def load_demos(
+    path: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Returns ``(states, actions, sensordata)``.
+
+    Shapes: ``states (M, T, obs_dim)``, ``actions (M, T, act_dim)``,
+    ``sensordata (M, T, nsensor)`` or ``None`` for legacy datasets that
+    pre-date sensordata capture.
+
+    Trajectory-preserving so we can split train/val by trajectory before
+    flattening.
+    """
     with h5py.File(path, "r") as f:
         states = f["states"][:].astype(np.float32)
         actions = f["actions"][:].astype(np.float32)
-    return states, actions
+        sensordata = (
+            f["sensordata"][:].astype(np.float32) if "sensordata" in f else None
+        )
+    return states, actions, sensordata
 
 
 def split_and_flatten(
@@ -123,7 +135,19 @@ def split_and_flatten(
     actions: np.ndarray,
     val_frac: float,
     rng: np.random.Generator,
-) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray], int, int]:
+    sensordata: np.ndarray | None = None,
+) -> tuple[
+    tuple[np.ndarray, np.ndarray, np.ndarray | None],
+    tuple[np.ndarray, np.ndarray, np.ndarray | None],
+    int,
+    int,
+]:
+    """Split-by-trajectory then flatten to (N, *) per side.
+
+    If ``sensordata`` is provided, it's split + flattened on the same
+    trajectory permutation so each row stays aligned with its (state,
+    action). Returned as ``None`` per side when not provided.
+    """
     M = states.shape[0]
     perm = rng.permutation(M)
     n_val = max(1, int(M * val_frac))
@@ -132,7 +156,12 @@ def split_and_flatten(
     def flatten(idx):
         s = states[idx].reshape(-1, states.shape[-1])
         a = actions[idx].reshape(-1, actions.shape[-1])
-        return s, a
+        sd = (
+            sensordata[idx].reshape(-1, sensordata.shape[-1])
+            if sensordata is not None
+            else None
+        )
+        return s, a, sd
 
     return flatten(train_idx), flatten(val_idx), len(train_idx), len(val_idx)
 
@@ -164,15 +193,24 @@ def main() -> None:
             f"{demo_path} not found. Collect first:\n"
             f"    python -m scripts.collect_bc_demos --env {args.env}"
         )
-    states, actions = load_demos(demo_path)
+    states, actions, sensordata = load_demos(demo_path)
     M, T, obs_dim = states.shape
     act_dim = actions.shape[-1]
-    print(f"loaded {M} trajectories of length {T} from {demo_path}  "
-          f"(obs_dim={obs_dim}, act_dim={act_dim})")
-
-    (tr_s, tr_a), (va_s, va_a), n_tr, n_va = split_and_flatten(
-        states, actions, args.val_frac, rng,
+    sd_msg = (
+        f", sensordata={sensordata.shape}" if sensordata is not None else ""
     )
+    print(f"loaded {M} trajectories of length {T} from {demo_path}  "
+          f"(obs_dim={obs_dim}, act_dim={act_dim}{sd_msg})")
+
+    (tr_s, tr_a, tr_sd), (va_s, va_a, va_sd), n_tr, n_va = split_and_flatten(
+        states, actions, args.val_frac, rng, sensordata=sensordata,
+    )
+    # ``tr_sd`` / ``va_sd`` are loaded and split alongside (states, actions)
+    # so callers downstream of this can use them, but the BC training path
+    # below trains on (obs, action) only — sensordata is deliberately kept
+    # available for future obs-recompute hooks rather than wired into the
+    # current loss.
+    _ = (tr_sd, va_sd)
     print(f"train trajs: {n_tr}  val trajs: {n_va}")
     print(f"train samples: {len(tr_s):,}   val samples: {len(va_s):,}")
 
