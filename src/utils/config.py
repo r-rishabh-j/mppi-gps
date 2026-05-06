@@ -53,8 +53,8 @@ class PolicyConfig:
           acrobot/cheetah.
         * ``lr=3e-4`` — slightly safer with the deeper net.
         """
-        if env_name.startswith("adroit"):
-            return cls(hidden_dims=(512, 512, 512), lr=3e-4)
+        # if env_name.startswith("adroit"):
+        #     return cls(hidden_dims=(512, 512, 512), lr=3e-4)
         return cls()
 
 @dataclass
@@ -62,8 +62,13 @@ class GPSConfig:
     num_iterations: int = 50
     num_conditions: int = 5         # number of initial states
     episode_length: int = 500       # steps per episode during GPS training
-    policy_augmented_alpha: float = 0.1 # weight on the policy prior in MPPI cost
-    distill_batch_size: int = 256   # mini-batch size for policy distillation
+    # Target weight on the policy prior in MPPI cost. With the default
+    # `alpha_schedule="constant"` this is the per-iter alpha verbatim.
+    # When a schedule is set (linear / smoothstep / cosine), this is the
+    # *plateau* value reached after `alpha_warmup_iters` iterations —
+    # see the schedule fields below and `mppi_gps_unified.schedule_alpha`.
+    policy_augmented_alpha: float = 0.1
+    distill_batch_size: int = 1024   # mini-batch size for policy distillation
     distill_epochs: int = 30         # gradient epochs per GPS iteration
     warm_start_policy: bool = False  # warm-start MPPI nominal U from policy rollout
     distill_loss: str = "nll"       # "nll" (weighted NLL on policy log-prob) or "mse" (MSE on mean)
@@ -157,7 +162,7 @@ class GPSConfig:
     # of the regression. `grad_clip_norm` is loss-agnostic and a less
     # biased alternative; prefer that unless you specifically want the
     # action-space trust region semantics.
-    clip_eps: float = 0.0
+    clip_eps: float = 0.3
     # Gradient-norm clip applied between backward() and optimizer.step() in
     # the deterministic policy's mse_step (used by `mppi_gps_det.MPPIGPSDet`).
     # Bounds typical per-update parameter movement; loss-agnostic. 0.0 =
@@ -165,6 +170,27 @@ class GPSConfig:
     # sweep {0.5, 1.0, 5.0} if the policy learns too slowly or the loss
     # spikes. No effect on the Gaussian path.
     grad_clip_norm: float = 1.0
+    # ---- Alpha schedule for the policy-prior weight -----------------------
+    # When `alpha_schedule == "constant"` (default) or `alpha_warmup_iters
+    # <= 0`, behavior is byte-identical to the previous fixed-α path:
+    # every iter uses `policy_augmented_alpha`. Otherwise, alpha ramps
+    # from `alpha_start` (default 0.0) to `policy_augmented_alpha` over
+    # the first `alpha_warmup_iters` iterations and stays constant
+    # thereafter.
+    #
+    # Why: at iter 0 the policy is untrained, so the prior pulls MPPI
+    # toward random behavior — poisoning the C-step dataset for several
+    # iters until it FIFO-evicts. Starting α at 0 lets MPPI explore
+    # freely while the policy bootstraps; ramping the prior in later
+    # gives the on-policy state coverage a stable α provides.
+    #
+    # Choices: "constant" | "linear" | "smoothstep" | "cosine".
+    # `smoothstep` (cubic, x²(3−2x)) is the default ramp shape: derivative
+    # 0 at both endpoints, so α stays near 0 longer at the start and
+    # plateaus into α_max smoothly with no jump-discontinuity.
+    alpha_schedule: str = "constant"
+    alpha_warmup_iters: int = 0     # ramp duration (in GPS iters); 0 disables
+    alpha_start: float = 0.0        # starting α (typically 0.0)
     # PPO-style probability ratio clip for the Gaussian S-step surrogate
     # in `mppi_gps_unified._train_step_ppo_clip`. 0.0 = disabled (default;
     # falls through to plain NLL via `train_weighted`, which is what most
@@ -177,7 +203,7 @@ class GPSConfig:
     # (extreme log-ratios overflow exp() to inf, the torch.min picks the
     # finite branch with gradient 0, and 0 · inf in the chain rule
     # produces NaN gradients that nuke every parameter in one step).
-    clip_ratio: float = 0.0
+    clip_ratio: float = 0.2
 
 
 @dataclass

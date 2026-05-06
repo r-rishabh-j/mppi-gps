@@ -26,6 +26,7 @@ shared. Policy-class-specific branches:
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 from typing import Callable
 
@@ -41,6 +42,44 @@ from src.policy.gaussian_policy import GaussianPolicy
 from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
 from src.utils.evaluation import evaluate_policy
 from src.utils.experiment import copy_as, save_checkpoint
+
+
+# ---------------------------------------------------------------------------
+# Alpha schedule
+# ---------------------------------------------------------------------------
+
+def schedule_alpha(iteration: int, cfg: GPSConfig) -> float:
+    """Per-iteration α value for the policy-prior weight.
+
+    Returns ``cfg.policy_augmented_alpha`` (constant) when the schedule
+    is "constant" or warmup is disabled — preserves legacy behavior.
+    Otherwise interpolates from ``cfg.alpha_start`` at iter 0 to
+    ``cfg.policy_augmented_alpha`` at iter ``cfg.alpha_warmup_iters``,
+    holding constant thereafter.
+
+    Schedule shapes (x = iteration / alpha_warmup_iters, clipped to [0, 1]):
+      * ``"linear"``     — ``x``
+      * ``"smoothstep"`` — ``x²(3 − 2x)``    (default ramp; deriv 0 at endpoints)
+      * ``"cosine"``     — ``0.5(1 − cos πx)`` (visually similar to smoothstep)
+    """
+    if cfg.alpha_schedule == "constant" or cfg.alpha_warmup_iters <= 0:
+        return cfg.policy_augmented_alpha
+    if iteration >= cfg.alpha_warmup_iters:
+        return cfg.policy_augmented_alpha
+
+    x = iteration / cfg.alpha_warmup_iters
+    if cfg.alpha_schedule == "linear":
+        ramp = x
+    elif cfg.alpha_schedule == "smoothstep":
+        ramp = x * x * (3.0 - 2.0 * x)
+    elif cfg.alpha_schedule == "cosine":
+        ramp = 0.5 * (1.0 - math.cos(math.pi * x))
+    else:
+        raise ValueError(
+            f"unknown alpha_schedule={cfg.alpha_schedule!r}; "
+            f"expected one of: constant | linear | smoothstep | cosine"
+        )
+    return cfg.alpha_start + (cfg.policy_augmented_alpha - cfg.alpha_start) * ramp
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +209,7 @@ class GPSHistory:
     distill_losses: list[float] = field(default_factory=list)
     iteration_ema_drift: list[float] = field(default_factory=list)
     iteration_prev_iter_kl: list[float] = field(default_factory=list)
+    iteration_alpha: list[float] = field(default_factory=list)
     best_iter: int = -1
     best_cost: float = float("inf")
 
@@ -437,7 +477,10 @@ class MPPIGPS:
 
         outer_bar = tqdm(range(num_iterations), desc="GPS", unit="iter")
         for iteration in outer_bar:
-            alpha = cfg.policy_augmented_alpha
+            # Per-iter α (constant by default; ramps from alpha_start to
+            # policy_augmented_alpha over alpha_warmup_iters when a
+            # schedule is configured). See `schedule_alpha` docstring.
+            alpha = schedule_alpha(iteration, cfg)
 
             all_obs: list[np.ndarray] = []
             all_actions: list[np.ndarray] = []
@@ -615,6 +658,7 @@ class MPPIGPS:
             history.distill_losses.append(loss)
             history.iteration_ema_drift.append(ema_drift)
             history.iteration_prev_iter_kl.append(prev_iter_kl_diag)
+            history.iteration_alpha.append(float(alpha))
 
             # ========== Eval (drives best.pt) ==========
             eval_every = max(int(getattr(cfg, "eval_every", 1)), 1)
@@ -655,6 +699,8 @@ class MPPIGPS:
                 "loss": f"{loss:.3f}",
                 "best": history.best_iter if history.best_iter >= 0 else "-",
             }
+            if cfg.alpha_schedule != "constant" and cfg.alpha_warmup_iters > 0:
+                postfix["alpha"] = f"{alpha:.3f}"
             if do_eval:
                 postfix["eval_cost"] = f"{eval_cost:.2f}"
             outer_bar.set_postfix(**postfix)
@@ -662,6 +708,7 @@ class MPPIGPS:
             tag = "GPS-det" if self._deterministic else "GPS"
             base_line = (
                 f"[{tag} iter {iteration:3d}]  "
+                f"alpha={alpha:.4f}  "
                 f"mppi_cost={mppi_cost:8.2f}  "
                 f"distill_loss={loss:.4f}"
             )

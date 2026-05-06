@@ -389,7 +389,11 @@ class AdroitRelocate(MuJoCoEnv):
             - 0.5 * np.linalg.norm(palm - target, axis=-1)
             - 0.5 * np.linalg.norm(obj - target, axis=-1)
         ) * 4
-        reward = reward + np.where(lifted, lift_bonus * lift_gate, 0.0)
+        # reward = reward + np.where(lifted, lift_bonus * lift_gate, 0.0)
+        # Replace the gated lift_bonus block with something like:
+        ball_height = obj_z - 0.035   # ball radius — z at rest
+        reward += 5.0 * np.tanh(ball_height / 0.1) * grasp     # ungated by tight; only needs ANY grasp
+        reward += np.where(lifted, lift_bonus * lift_gate, 0.0)  # keep the existing tight-gated bonus
 
         # Milestone bonuses for object near target — gated on grasp so a
         # fling that happens to bounce through the target zone earns nothing.

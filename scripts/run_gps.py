@@ -58,8 +58,28 @@ def parse_args():
                    help="Number of initial conditions to train across")
     p.add_argument("--episode-length", type=int, default=None,
                    help="Steps per episode during GPS training")
-    p.add_argument("--alpha", type=float, default=None,
-                   help="Policy-augmented cost weight (0 = no augmentation)")
+    p.add_argument("--alpha", type=float, default=0.1,
+                   help="Policy-augmented cost weight (0 = no augmentation). "
+                        "When --alpha-schedule is set, this is the *plateau* "
+                        "value reached after --alpha-warmup-iters; otherwise "
+                        "the per-iter constant.")
+    p.add_argument("--alpha-schedule", default='smoothstep',
+                   choices=["constant", "linear", "smoothstep", "cosine"],
+                   help="Per-iter α schedule. 'constant' (default) uses --alpha "
+                        "verbatim every iter. 'smoothstep' / 'cosine' / 'linear' "
+                        "ramp from --alpha-start to --alpha over the first "
+                        "--alpha-warmup-iters iterations and stay constant "
+                        "thereafter. Useful at iter 0 when the policy is "
+                        "untrained: starting α at 0 lets MPPI explore freely "
+                        "while the policy bootstraps, ramping the prior in "
+                        "later for on-policy state coverage.")
+    p.add_argument("--alpha-warmup-iters", type=int, default=None,
+                   help="GPS iterations to ramp α from --alpha-start to "
+                        "--alpha (default 0 = schedule disabled). Ignored "
+                        "when --alpha-schedule is 'constant'.")
+    p.add_argument("--alpha-start", type=float, default=0,
+                   help="Starting α value for the ramp (default 0.0). "
+                        "Ignored when --alpha-schedule is 'constant'.")
     p.add_argument("--policy-prior", default=None,
                    choices=["nll", "mean_distance"],
                    help="Policy prior shape used in the MPPI cost. Unset = "
@@ -177,6 +197,12 @@ def main():
         gps_cfg.episode_length = args.episode_length
     if args.alpha is not None:
         gps_cfg.policy_augmented_alpha = args.alpha
+    if args.alpha_schedule is not None:
+        gps_cfg.alpha_schedule = args.alpha_schedule
+    if args.alpha_warmup_iters is not None:
+        gps_cfg.alpha_warmup_iters = args.alpha_warmup_iters
+    if args.alpha_start is not None:
+        gps_cfg.alpha_start = args.alpha_start
     if args.policy_prior is not None:
         gps_cfg.policy_prior_type = args.policy_prior
     if args.auto_reset:
@@ -207,9 +233,17 @@ def main():
     device = pick_device(args.device)
     print(f"policy device: {device}")
     policy_class = "Deterministic" if args.deterministic else "Gaussian"
+    if gps_cfg.alpha_schedule != "constant" and gps_cfg.alpha_warmup_iters > 0:
+        alpha_desc = (
+            f"alpha={gps_cfg.alpha_start}→{gps_cfg.policy_augmented_alpha} "
+            f"({gps_cfg.alpha_schedule} ramp over "
+            f"{gps_cfg.alpha_warmup_iters} iters)"
+        )
+    else:
+        alpha_desc = f"alpha={gps_cfg.policy_augmented_alpha}"
     print(
         f"GPS: policy={policy_class}, "
-        f"alpha={gps_cfg.policy_augmented_alpha}, "
+        f"{alpha_desc}, "
         f"prior={gps_cfg.policy_prior_type}"
     )
 
