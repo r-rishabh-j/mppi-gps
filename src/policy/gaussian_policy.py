@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.policy import USE_ACT_NORM
 from src.policy.ema import EMA
 from src.utils.config import PolicyConfig
 
@@ -85,12 +86,29 @@ class GaussianPolicy(nn.Module):
         # Init log_sigma head bias to 0 → sigma ≈ 1 at start.
         nn.init.zeros_(self.net[-1].bias[act_dim:])
 
-        # Bounds are used only to clip at execution time (act_np). Network
-        # output is unconstrained; the env (MuJoCo ctrl) also clamps ctrl.
+        # Bounds are used to clip at execution time (act_np). When the
+        # action-norm toggle is on, we additionally register a per-dim
+        # affine (_act_scale, _act_bias) so the network learns/predicts in
+        # normalized action space (~[-1, 1] per dim) and we denormalize at
+        # the boundary. See `src/policy/__init__.py` for the full rationale.
+        # `_has_act_norm` is the run-time check used by `_to_phys` /
+        # `_to_norm` — set only when both the toggle is on AND we have
+        # bounds to derive the affine from.
+        self._has_act_norm = False
         if action_bounds is not None:
             low, high = action_bounds
             self.register_buffer("_act_low", torch.as_tensor(low, dtype=torch.float32))
             self.register_buffer("_act_high", torch.as_tensor(high, dtype=torch.float32))
+            if USE_ACT_NORM:
+                scale = (high - low) / 2.0
+                bias = (high + low) / 2.0
+                self.register_buffer(
+                    "_act_scale", torch.as_tensor(scale, dtype=torch.float32)
+                )
+                self.register_buffer(
+                    "_act_bias", torch.as_tensor(bias, dtype=torch.float32)
+                )
+                self._has_act_norm = True
         else:
             self._act_low = None
             self._act_high = None
@@ -115,8 +133,29 @@ class GaussianPolicy(nn.Module):
         self._device = next(self.parameters()).device
         return out
 
+    # ------------------------------------------------------------------
+    # Action-space (de)normalization helpers
+    # ------------------------------------------------------------------
+    # When the action-norm toggle is on, the network operates in the
+    # normalized action space (~[-1, 1] per dim) and these convert at
+    # the boundary. Both are no-ops when `_has_act_norm` is False, so
+    # the toggle off path is byte-identical to the pre-norm code.
+
+    def _to_phys(self, normalized: torch.Tensor) -> torch.Tensor:
+        """Map normalized network output to physical action space."""
+        if not self._has_act_norm:
+            return normalized
+        return normalized * self._act_scale + self._act_bias
+
+    def _to_norm(self, physical: torch.Tensor) -> torch.Tensor:
+        """Map physical action to normalized action space."""
+        if not self._has_act_norm:
+            return physical
+        return (physical - self._act_bias) / self._act_scale
+
     def _head(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply normalizer + MLP, return (mu, log_sigma)."""
+        """Apply normalizer + MLP, return (mu, log_sigma) in NORMALIZED action
+        space when the toggle is on, otherwise in physical space (legacy)."""
         x = self.normalizer(obs) if self.normalizer is not None else obs
         out = self.net(x)
         mu, log_sigma = out[..., :self.act_dim], out[..., self.act_dim:]
@@ -124,20 +163,38 @@ class GaussianPolicy(nn.Module):
         return mu, log_sigma
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """obs: (B, obs_dim) → mu: (B, act_dim), log_sigma: (B, act_dim)."""
+        """obs: (B, obs_dim) → mu: (B, act_dim), log_sigma: (B, act_dim).
+
+        Returns the network-internal head — same as `_head`. Callers that
+        need the *physical* mean should use `action()` instead, which
+        passes through `_to_phys`.
+        """
         return self._head(obs)
 
     def log_prob(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """log π(actions | obs), shape (B,). Plain diagonal Gaussian."""
+        """log π(actions | obs), shape (B,). Plain diagonal Gaussian.
+
+        ``actions`` is taken in PHYSICAL space (matches the rest of the
+        policy's external API and the action arrays MPPI hands in). When
+        the action-norm toggle is on, we normalize the actions before
+        evaluating the density against the network's normalized head; the
+        Jacobian of the affine ``a = scale·n + bias`` is a constant per
+        dim that cancels in any softmin / KL / gradient computation, so
+        we omit it. Absolute log-prob values across runs with different
+        toggle settings differ by `Σ log scale_i` — irrelevant for any
+        downstream use here (MPPI prior, KL drift, NLL loss).
+        """
+        actions = self._to_norm(actions)
         mu, log_sigma = self._head(obs)
         sigma = log_sigma.exp()
         lp = -0.5 * (((actions - mu) / sigma) ** 2 + 2 * log_sigma + np.log(2 * np.pi))
         return lp.sum(dim=-1)
 
     def sample(self, obs: torch.Tensor) -> torch.Tensor:
-        """Reparameterized sample of an action."""
+        """Reparameterized sample of an action, in PHYSICAL space."""
         mu, log_sigma = self._head(obs)
-        return mu + log_sigma.exp() * torch.randn_like(mu)
+        n = mu + log_sigma.exp() * torch.randn_like(mu)
+        return self._to_phys(n)
 
     def train_weighted(
         self,
@@ -166,6 +223,10 @@ class GaussianPolicy(nn.Module):
         """
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
+        # Labels arrive in physical action space (MPPI's executed actions).
+        # Move them into the network's space so the loss compares like to
+        # like. No-op when the toggle is off.
+        act_t = self._to_norm(act_t)
         w_t = torch.as_tensor(weights, dtype=torch.float32, device=self._device)
 
         if self.normalizer is not None:
@@ -203,14 +264,22 @@ class GaussianPolicy(nn.Module):
         return loss.item()
 
     def action(self, obs: torch.Tensor) -> torch.Tensor:
-        """Deterministic action tensor (policy mean). For MSE training / eval."""
+        """Deterministic action tensor (policy mean) in PHYSICAL space.
+
+        For MSE training / eval / mean-distance prior. Always returns a
+        physical-space mean — this is the user-facing boundary, so the
+        action-norm toggle is invisible to callers.
+        """
         mu, _ = self.forward(obs)
-        return mu
+        return self._to_phys(mu)
 
     def mse_step(self, obs: np.ndarray, actions: np.ndarray) -> float:
         """One gradient step of MSE on the mean. log_sigma is not supervised."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
+        # Same normalization as `train_weighted`: labels into the network's
+        # space before the squared error, so per-dim contributions are equal.
+        act_t = self._to_norm(act_t)
         if self.normalizer is not None:
             self.normalizer.update(obs_t)
         mu, _ = self.forward(obs_t)
@@ -334,12 +403,20 @@ class GaussianPolicy(nn.Module):
 
     @torch.no_grad()
     def act_np(self, obs: np.ndarray) -> np.ndarray:
-        """Mean action from numpy obs, clipped to action bounds if known."""
+        """Mean action from numpy obs, clipped to action bounds if known.
+
+        Returns a physical-space action. Order: forward → denormalize →
+        clip. The clip is still useful as a safety net even when the
+        network was trained to output in [-1, 1] — the head is
+        unconstrained (no tanh) so it can over/undershoot, and a clip
+        keeps the env's `data.ctrl` in range.
+        """
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         squeeze = obs_t.ndim == 1
         if squeeze:
             obs_t = obs_t.unsqueeze(0)
         mu, _ = self.forward(obs_t)
+        mu = self._to_phys(mu)
         if self._act_low is not None:
             mu = torch.clamp(mu, self._act_low, self._act_high)
         mu_np = mu.cpu().numpy()

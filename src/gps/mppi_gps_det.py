@@ -63,6 +63,11 @@ def make_policy_prior(
     noise into the cost).
     """
     device = policy._device
+    # Per-dim weighting — see `make_mean_distance_prior` in
+    # `mppi_gps_unified.py` for the full rationale. Equalizes per-dim
+    # residual contribution by 1 / (per-dim half-range). No-op for envs
+    # whose `noise_scale` defaults to ones.
+    inv_scale = 1.0 / np.asarray(env.noise_scale, dtype=np.float64)
 
     def prior_cost(
         states: np.ndarray,
@@ -79,10 +84,16 @@ def make_policy_prior(
 
         with torch.no_grad():
             obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=device)
-            mu_flat = policy.forward(obs_t).cpu().numpy()
+            # `policy.action(...)` returns the physical-space mean (passing
+            # through `_to_phys` when output normalization is on). We must
+            # NOT use `policy.forward(...)` here — that returns the network-
+            # internal output, which is in normalized space when the
+            # action-norm toggle is on, and would silently produce huge
+            # residuals against the physical `actions` from MPPI.
+            mu_flat = policy.action(obs_t).cpu().numpy()
 
         mu = mu_flat.reshape(K, H, act_dim)
-        sq = ((actions - mu) ** 2).sum(axis=(1, 2))   # (K,)
+        sq = (((actions - mu) * inv_scale) ** 2).sum(axis=(1, 2))   # (K,)
         return alpha * sq
 
     return prior_cost

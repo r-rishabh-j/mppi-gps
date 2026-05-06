@@ -91,13 +91,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init-ckpt", default=None,
                    help="warm-start: load a wrapped or raw state_dict into the policy "
                         "before training. Must match --deterministic.")
-    p.add_argument("--num-epochs", type=int, default=500)
-    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--num-epochs", type=int, default=4000)
+    p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--val-frac", type=float, default=0,
                    help="fraction of trajectories (not transitions) held out for val")
     p.add_argument("--eval-every", type=int, default=5000,
                    help="run env eval every N epochs (0 disables mid-training eval)")
-    p.add_argument("--ckpt-every", type=int, default=100,
+    p.add_argument("--ckpt-every", type=int, default=1000,
                    help="save iter_<epoch>.pt every N epochs (best.pt/final.pt always saved)")
     p.add_argument("--n-eval-eps", type=int, default=10)
     p.add_argument("--eval-ep-len", type=int, default=200)
@@ -168,13 +168,25 @@ def split_and_flatten(
 
 @torch.no_grad()
 def eval_mse(policy, obs: np.ndarray, actions: np.ndarray, batch: int = 16384) -> float:
+    """Validation MSE in the policy's training-loss space.
+
+    When the action-norm toggle is on, ``mse_step`` normalizes labels and
+    computes MSE in the network's [-1, 1]-ish space; we mirror that here
+    so train_mse and val_mse are on the same scale (loss curve makes
+    sense, ``best.pt`` is selected on the same objective being optimized).
+    With the toggle off (`policy._has_act_norm = False`) this is byte-
+    identical to physical-space MSE — the rescale is a no-op.
+    """
     device = policy.device
     total, n = 0.0, 0
     for s in range(0, len(obs), batch):
         o = torch.as_tensor(obs[s:s + batch], dtype=torch.float32, device=device)
         a = torch.as_tensor(actions[s:s + batch], dtype=torch.float32, device=device)
-        pred = policy.action(o)
-        total += float(((pred - a) ** 2).sum().item())
+        pred = policy.action(o)                 # physical
+        diff = pred - a                         # physical residual
+        if policy._has_act_norm:
+            diff = diff / policy._act_scale     # → normalized space
+        total += float((diff ** 2).sum().item())
         n += a.numel()
     return total / max(n, 1)
 

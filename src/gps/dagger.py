@@ -368,13 +368,22 @@ class DAggerTrainer:
 
     @torch.no_grad()
     def _eval_mse(self, obs: np.ndarray, act: np.ndarray, batch: int = 16384) -> float:
+        """Validation MSE in the policy's training-loss space — see
+        ``scripts.test_sl.eval_mse`` for the rationale. With output norm
+        on, ``mse_step`` works in normalized space; this matches it so
+        round-best selection / curve plotting are on a single scale.
+        Byte-identical to physical-space MSE when output norm is off.
+        """
         device = self.policy.device
         total, n = 0.0, 0
         for s in range(0, len(obs), batch):
             o = torch.as_tensor(obs[s:s + batch], dtype=torch.float32, device=device)
             a = torch.as_tensor(act[s:s + batch], dtype=torch.float32, device=device)
-            pred = self.policy.action(o)
-            total += float(((pred - a) ** 2).sum().item())
+            pred = self.policy.action(o)            # physical
+            diff = pred - a
+            if self.policy._has_act_norm:
+                diff = diff / self.policy._act_scale  # → normalized space
+            total += float((diff ** 2).sum().item())
             n += a.numel()
         return total / max(n, 1)
 

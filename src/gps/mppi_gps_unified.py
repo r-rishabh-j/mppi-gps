@@ -60,6 +60,17 @@ def make_mean_distance_prior(
     For DeterministicPolicy this is the regression output directly.
     """
     device = policy._device
+    # Per-dim half-range from the env (1.0s for envs that don't override).
+    # Used to rescale the per-dim residual so a fixed *fraction-of-range*
+    # error costs the same on every dim, regardless of whether that dim
+    # is a 0.2 m arm slide or a 2.0 rad finger joint. Without this, the
+    # raw L2 prior is dominated by whichever dims have the largest
+    # ctrlrange, biasing MPPI toward "match the policy on the loud dims,
+    # ignore the quiet ones" — exactly the asymmetry that makes the
+    # high-DoF Adroit policy's arm look weak relative to its fingers.
+    # For envs whose noise_scale is `np.ones(action_dim)` (the default),
+    # this is a no-op — behaviour matches the previous unweighted L2.
+    inv_scale = 1.0 / np.asarray(env.noise_scale, dtype=np.float64)
 
     def prior_cost(
         states: np.ndarray,
@@ -76,7 +87,12 @@ def make_mean_distance_prior(
             obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=device)
             mu_flat = policy.action(obs_t).cpu().numpy()
         mu = mu_flat.reshape(K, H, act_dim)
-        sq = ((actions - mu) ** 2).sum(axis=(1, 2))     # (K,)
+        # ((a − μ) / scale)² — broadcasts over (K, H, act_dim); sum over
+        # time + dim → (K,). Equivalent to comparing actions and mu in
+        # normalized action space, but keeps mu in physical so the rest
+        # of the policy API (clip_eps surrogate, DAgger MSE, eval) is
+        # unchanged.
+        sq = (((actions - mu) * inv_scale) ** 2).sum(axis=(1, 2))   # (K,)
         return alpha * sq
 
     return prior_cost
@@ -92,6 +108,12 @@ def make_nll_prior(
     Negative log-likelihood as a cost contribution. Sigma-aware — actions
     near a low-σ mean carry more weight than the same residual at a high-σ
     mean. Effective contribution to ``log w`` is ``+(alpha/lambda) * Σ log π``.
+
+    Note: no per-dim weighting is applied here (unlike `mean_distance`).
+    The diagonal Gaussian NLL already normalizes per-dim by ``σ_i²`` —
+    σ adapts to the data scale per dim during training, so residuals are
+    intrinsically equalized across heterogeneous action ranges. Adding
+    extra weighting would double-count.
     """
     if not isinstance(policy, GaussianPolicy):
         raise TypeError(

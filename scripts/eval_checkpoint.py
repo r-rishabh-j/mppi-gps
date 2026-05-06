@@ -53,7 +53,7 @@ def parse_args():
     p.add_argument("--ckpt", required=True,
                    help="Path to a .pt checkpoint OR a run dir (in which case best.pt is used).")
     p.add_argument("--n-eval", type=int, default=1)
-    p.add_argument("--eval-len", type=int, default=2000)
+    p.add_argument("--eval-len", type=int, default=400)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda")
     p.add_argument("--render", action="store_true", help="save mp4 of episode 0", default=True)

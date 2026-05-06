@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.policy import USE_ACT_NORM
 from src.policy.ema import EMA
 from src.policy.gaussian_policy import RunningNormalizer
 from src.utils.config import PolicyConfig
@@ -42,10 +43,26 @@ class DeterministicPolicy(nn.Module):
         layers.append(nn.Linear(in_dim, act_dim))
         self.net = nn.Sequential(*layers)
 
+        # Action bounds + optional output-norm affine. See
+        # `src/policy/__init__.py` and the GaussianPolicy mirror of this
+        # block for the full rationale. `_has_act_norm` gates the
+        # `_to_phys` / `_to_norm` helpers — set only when both the toggle
+        # is on AND we have bounds to derive the affine from.
+        self._has_act_norm = False
         if action_bounds is not None:
             low, high = action_bounds
             self.register_buffer("_act_low", torch.as_tensor(low, dtype=torch.float32))
             self.register_buffer("_act_high", torch.as_tensor(high, dtype=torch.float32))
+            if USE_ACT_NORM:
+                scale = (high - low) / 2.0
+                bias = (high + low) / 2.0
+                self.register_buffer(
+                    "_act_scale", torch.as_tensor(scale, dtype=torch.float32)
+                )
+                self.register_buffer(
+                    "_act_bias", torch.as_tensor(bias, dtype=torch.float32)
+                )
+                self._has_act_norm = True
         else:
             self._act_low = None
             self._act_high = None
@@ -67,12 +84,30 @@ class DeterministicPolicy(nn.Module):
         self._device = next(self.parameters()).device
         return out
 
+    # ------------------------------------------------------------------
+    # Action-space (de)normalization helpers (mirror GaussianPolicy)
+    # ------------------------------------------------------------------
+
+    def _to_phys(self, normalized: torch.Tensor) -> torch.Tensor:
+        if not self._has_act_norm:
+            return normalized
+        return normalized * self._act_scale + self._act_bias
+
+    def _to_norm(self, physical: torch.Tensor) -> torch.Tensor:
+        if not self._has_act_norm:
+            return physical
+        return (physical - self._act_bias) / self._act_scale
+
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Network-internal output: NORMALIZED action space when the toggle
+        is on, physical space otherwise. Use `action()` for a physical-
+        space tensor at the user-facing boundary."""
         x = self.normalizer(obs) if self.normalizer is not None else obs
         return self.net(x)
 
     def action(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.forward(obs)
+        """Deterministic action tensor in PHYSICAL space."""
+        return self._to_phys(self.forward(obs))
 
     def mse_step(
         self,
@@ -88,6 +123,10 @@ class DeterministicPolicy(nn.Module):
         (unlike target-clipping the labels)."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
+        # Move physical labels into the network's space so per-dim losses
+        # are equalized — see `src/policy/__init__.py`. No-op when the
+        # action-norm toggle is off.
+        act_t = self._to_norm(act_t)
         if self.normalizer is not None:
             self.normalizer.update(obs_t)
         pred = self.forward(obs_t)
@@ -139,11 +178,13 @@ class DeterministicPolicy(nn.Module):
 
     @torch.no_grad()
     def act_np(self, obs: np.ndarray) -> np.ndarray:
+        """Physical-space action. Order: forward → denormalize → clip."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         squeeze = obs_t.ndim == 1
         if squeeze:
             obs_t = obs_t.unsqueeze(0)
         a = self.forward(obs_t)
+        a = self._to_phys(a)
         if self._act_low is not None:
             a = torch.clamp(a, self._act_low, self._act_high)
         a_np = a.cpu().numpy()
