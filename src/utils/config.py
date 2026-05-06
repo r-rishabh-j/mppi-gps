@@ -33,8 +33,8 @@ class PolicyConfig:
     lr: float = 5e-4
     activation: str = "relu"
     obs_norm: bool = True
-    log_sigma_min: float = -5.0
-    log_sigma_max: float = 2.0
+    log_sigma_min: float = -3.0
+    log_sigma_max: float = 0.0
 
     @classmethod
     def for_env(cls, env_name: str) -> "PolicyConfig":

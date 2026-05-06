@@ -42,6 +42,23 @@
             <geom size="0.04 0.5" pos="-0.4 0.4 -0.501" quat="0 1 0 0" type="cylinder" contype="0" conaffinity="0" />
             <geom size="0.04 0.5" pos="0.4 -0.4 -0.501" quat="0 1 0 0" type="cylinder" contype="0" conaffinity="0" />
             <geom size="0.04 0.5" pos="-0.4 -0.4 -0.501" quat="0 1 0 0" type="cylinder" contype="0" conaffinity="0" />
+            <!-- Containment walls: thin invisible boxes along the table edges
+                 so the ball cannot be flung / pushed off during MPPI
+                 exploration or policy rollouts. ±0.42 sits 2cm inside the
+                 table edge (±0.45) and 2cm outside the worst-case palm
+                 reach (~±0.4 from ARTx ±0.25 + palm extent). Height
+                 0.05m so a ball of radius 0.035 can't bounce over even
+                 at high velocity. rgba alpha=0 keeps the visual matching
+                 D4RL/DAPG screenshots — bump alpha (e.g. "1 0 0 0.3")
+                 while debugging to see the walls. -->
+            <geom name="wall_xpos" type="box" size="0.003 0.42 0.05"
+                  pos="0.42 0 0.05"  rgba="0 0 0 0" contype="1" conaffinity="1"/>
+            <geom name="wall_xneg" type="box" size="0.003 0.42 0.05"
+                  pos="-0.42 0 0.05" rgba="0 0 0 0" contype="1" conaffinity="1"/>
+            <geom name="wall_ypos" type="box" size="0.42 0.003 0.05"
+                  pos="0 0.42 0.05"  rgba="0 0 0 0" contype="1" conaffinity="1"/>
+            <geom name="wall_yneg" type="box" size="0.42 0.003 0.05"
+                  pos="0 -0.42 0.05" rgba="0 0 0 0" contype="1" conaffinity="1"/>
         </body>
 
         <!-- ======= MOCAP ======= -->
