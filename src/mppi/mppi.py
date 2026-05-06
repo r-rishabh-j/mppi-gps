@@ -21,17 +21,28 @@ class MPPI:
         self.nu = env.action_dim
         self.act_low, self.act_high = env.action_bounds
 
-        # Per-dim exploration sigma. cfg.noise_sigma stays a scalar in configs;
-        # envs with heterogeneous ctrlranges (e.g. Adroit) opt into per-dim
-        # scaling via env.noise_scale (default ones, so legacy envs are
-        # unchanged). Final shape: (nu,) — broadcasts cleanly with eps.
-        self.sigma = np.asarray(
-            cfg.noise_sigma * env.noise_scale, dtype=np.float64
+        # ---- Noise model ---------------------------------------------------
+        # Two modes:
+        #   * Diagonal (default, `cfg.noise_cov is None`): per-dim sigma from
+        #     `cfg.noise_sigma * env.noise_scale`. Existing path; broadcasts
+        #     cleanly with eps for fast sampling and a cheap diagonal IS
+        #     correction. Byte-identical to legacy behaviour.
+        #   * Full covariance (`cfg.noise_cov` provided): a (nu, nu) PSD
+        #     matrix used directly as Σ. Cholesky for sampling
+        #     `ε ~ N(0, Σ)`, precision for the IS correction
+        #     `u^T · Σ⁻¹ · ε`. `cfg.noise_sigma` and `env.noise_scale`
+        #     are ignored — caller is responsible for baking per-dim
+        #     scaling into the matrix.
+        # `_noise_diagonal` keeps the fast diagonal path when applicable
+        # (broadcast multiply vs einsum is ~30× faster for K·H·nu² flops).
+        self._noise_diagonal = cfg.noise_cov is None
+        self.noise_cov, self._noise_chol, self._noise_precision = (
+            self._build_noise_model(env, cfg)
         )
-        assert self.sigma.shape == (self.nu,), (
-            f"noise_sigma * env.noise_scale must be (action_dim={self.nu},), "
-            f"got {self.sigma.shape}"
-        )
+        # `self.sigma` is the marginal per-dim std (sqrt of diagonal of Σ).
+        # In the diagonal path it is the full noise model; in the full-Σ
+        # path it is just for diagnostics / logging.
+        self.sigma = np.sqrt(np.diag(self.noise_cov))
 
         self.reset()
 
@@ -95,8 +106,14 @@ class MPPI:
             info["replanned"] = False
             return action, info
 
-        # sample ε ~ N(0, σ² I), perturb, clamp for rollout
-        eps = np.random.randn(self.K, self.H, self.nu) * self.sigma
+        # sample ε ~ N(0, Σ). Diagonal path uses broadcast multiply (~30×
+        # cheaper than einsum for the typical K·H·nu² flops); full-cov path
+        # uses Cholesky factor: ε = standard @ chol.T.
+        if self._noise_diagonal:
+            eps = np.random.randn(self.K, self.H, self.nu) * self.sigma
+        else:
+            standard = np.random.randn(self.K, self.H, self.nu)
+            eps = np.einsum('khi,ji->khj', standard, self._noise_chol)
         if dry_run:
             U_perturbed = eps
         else:
@@ -202,6 +219,52 @@ class MPPI:
         self._last_info = info
         return action, info
 
+    def _build_noise_model(
+        self, env: BaseEnv, cfg: MPPIConfig,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(cov, chol, precision)`` for the action noise distribution.
+
+        Diagonal path (cfg.noise_cov is None): variance per dim is
+        ``(noise_sigma * env.noise_scale)²``. Cholesky and precision are
+        also diagonal — kept as full matrices so the einsum-based path
+        for the full-cov case can also use them as a uniform interface.
+
+        Full-Σ path (cfg.noise_cov provided): used directly. Validates
+        shape, symmetry, positive-definiteness loudly so a bad matrix
+        fails at construction rather than silently producing garbage
+        samples mid-training.
+        """
+        if cfg.noise_cov is not None:
+            cov = np.asarray(cfg.noise_cov, dtype=np.float64)
+            if cov.shape != (self.nu, self.nu):
+                raise ValueError(
+                    f"noise_cov must have shape ({self.nu}, {self.nu}), "
+                    f"got {cov.shape}"
+                )
+            if not np.allclose(cov, cov.T, atol=1e-8):
+                raise ValueError("noise_cov must be symmetric")
+            try:
+                chol = np.linalg.cholesky(cov)
+            except np.linalg.LinAlgError as exc:
+                raise ValueError(
+                    "noise_cov must be positive-definite (cholesky failed)"
+                ) from exc
+            precision = np.linalg.inv(cov)
+            return cov, chol, precision
+
+        # Diagonal path: per-dim sigma via cfg.noise_sigma * env.noise_scale.
+        sigma_per_dim = np.asarray(
+            cfg.noise_sigma * env.noise_scale, dtype=np.float64
+        )
+        assert sigma_per_dim.shape == (self.nu,), (
+            f"noise_sigma * env.noise_scale must be (action_dim={self.nu},), "
+            f"got {sigma_per_dim.shape}"
+        )
+        cov = np.diag(sigma_per_dim ** 2)
+        chol = np.diag(sigma_per_dim)
+        precision = np.diag(1.0 / sigma_per_dim ** 2)
+        return cov, chol, precision
+
     def _shift_horizon(self, shift: int) -> None:
         """Shift the nominal trajectory left by `shift` steps, repeating the
         last action to pad. Keeps warm-start consistent after executing an
@@ -217,14 +280,26 @@ class MPPI:
         self.U[-shift:] = self.U[-shift - 1]
     
     def _is_correction(self, eps: np.ndarray, lam: float) -> np.ndarray:
-        """γ · Σ_t u_t^T Σ^{-1} ε_{k,t} with γ=λ, Σ=diag(σ²) → (K,).
+        """γ · Σ_t u_t^T Σ⁻¹ ε_{k,t} with γ=λ → (K,).
 
-        Σ is diagonal with per-dim variance σ_u², so Σ^{-1} ε_{k,t} divides
-        each action dim by its own σ_u². ``self.sigma`` has shape (nu,) which
-        broadcasts over the (K, H, nu) eps tensor.
+        Diagonal path (``_noise_diagonal``): Σ⁻¹ ε divides each dim by
+        its own σ², broadcast multiply.
+        Full-cov path: Σ⁻¹ ε is precision @ ε per timestep (einsum); the
+        per-dim products with U are then summed over (H, nu).
+
+        Both paths produce the same shape ``(K,)`` and are mathematically
+        identical for diagonal Σ — the diagonal branch is kept purely for
+        speed (~30× faster than einsum at K·H·nu² scale).
         """
-        weighted = self.U[None, :, :] * eps / (self.sigma ** 2)   # (K, H, nu)
-        return lam * weighted.sum(axis=(1, 2))                    # (K,)
+        if self._noise_diagonal:
+            weighted = self.U[None, :, :] * eps / (self.sigma ** 2)   # (K, H, nu)
+            return lam * weighted.sum(axis=(1, 2))                    # (K,)
+
+        # Full Σ: prec_eps[k, t, i] = Σ_j precision[i, j] · eps[k, t, j]
+        prec_eps = np.einsum(
+            'ij,ktj->kti', self._noise_precision, eps
+        )                                                              # (K, H, nu)
+        return lam * (self.U[None, :, :] * prec_eps).sum(axis=(1, 2))  # (K,)
 
     def _softmin_weights(self, S: np.ndarray, lam: float) -> tuple[np.ndarray, float]:
         """Paper's weight formula with min-baseline stabilization."""

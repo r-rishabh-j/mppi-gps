@@ -19,12 +19,35 @@ class MPPIConfig:
     # Intermediate calls skip the sample/rollout/weight pipeline, so wall-clock drops
     # roughly linearly in open_loop_steps at the cost of reactivity. Must be in [1, H].
     open_loop_steps: int = 1
+    # Optional full action covariance for the MPPI sampling distribution.
+    # When None (default), the noise model is the per-dim diagonal
+    # `diag((noise_sigma * env.noise_scale)²)` — current behaviour, byte-
+    # identical for all existing envs.
+    # When set, must be a list-of-lists of shape `(action_dim, action_dim)`
+    # — symmetric, positive-definite. Used directly as Σ for sampling
+    # `ε ~ N(0, Σ)` (Cholesky) and for the IS correction `u^T·Σ⁻¹·ε`
+    # (precision matrix). `noise_sigma` and `env.noise_scale` are
+    # **ignored** when `noise_cov` is provided — pre-bake any per-dim
+    # scaling into the matrix you supply.
+    # Use case: correlate exploration across action dims (e.g. "extend
+    # arm + close fingers together" via off-diagonal entries between
+    # arm-z and finger-close dims) to discover coordinated grasp+lift
+    # moves that independent per-dim noise rarely samples.
+    noise_cov: list[list[float]] | None = None
 
     @staticmethod
     def load(env_name: str) -> "MPPIConfig":
-        """Load best tuned params from configs/<env_name>_best.json."""
+        """Load best tuned params from configs/<env_name>_best.json.
+
+        Keys starting with ``_`` are treated as documentation metadata
+        (e.g. ``_generated_by``, ``_hand_synergy`` from the noise-cov
+        generator) and stripped before instantiating the dataclass, so
+        configs can carry self-documenting fields without breaking the
+        loader.
+        """
         path = _CONFIGS_DIR / f"{env_name}_best.json"
         params = json.loads(path.read_text())
+        params = {k: v for k, v in params.items() if not k.startswith("_")}
         return MPPIConfig(**params)
 
 @dataclass
