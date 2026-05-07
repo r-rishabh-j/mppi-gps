@@ -5,17 +5,22 @@ import numpy as np
 from src.envs.acrobot import Acrobot
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
+from src.utils.policy_prior_loader import (
+    add_policy_prior_args, resolve_policy_prior,
+)
 from src.utils.seeding import add_seed_arg, seed_everything
 
 def main():
     parser = argparse.ArgumentParser()
     add_seed_arg(parser, default=0)
+    add_policy_prior_args(parser)
     args = parser.parse_args()
     seed_everything(args.seed)
 
     env = Acrobot()
     cfg = MPPIConfig.load("acrobot")
     controller = MPPI(env, cfg)
+    prior_fn = resolve_policy_prior(args, env)
 
     renderer = mujoco.Renderer(env.model, height=480, width=640)
     render = True
@@ -28,7 +33,7 @@ def main():
         state = env.get_state()
         total_cost = 0.0 
         for t in range(1000):
-            action, info = controller.plan_step(state)
+            action, info = controller.plan_step(state, prior=prior_fn)
             obs, cost, done, _ = env.step(action)
             total_cost += cost
 

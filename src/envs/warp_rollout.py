@@ -12,8 +12,8 @@ generalized to support models with mocap bodies (Adroit's target).
 Constraints (asserted in `_init_warp`)
 ----------------------------------------------------------------------
 - ``model.na == 0`` — actuators with state (e.g. muscles) unsupported.
-  All envs in this repo (acrobot, hopper, half_cheetah, adroit_pen,
-  adroit_relocate) satisfy this; muscles would need a separate path.
+  All envs in this repo (acrobot, hopper, adroit_pen, adroit_relocate)
+  satisfy this; muscles would need a separate path.
 - ``nworld`` is fixed at construction. To change MPPI's K, re-instantiate
   the env. (mujoco_warp's per-world buffers are pre-allocated.)
 - ``(K, H)`` pairing is captured into a CUDA graph on the first call.

@@ -23,7 +23,7 @@ Diagonal-Gaussian MLP with three training-stability features, all gated by `Poli
 
 1. **Running observation normalizer** (`RunningNormalizer`). Non-trainable buffers `mean`, `var`, `count` updated via a Welford parallel merge. Critically, `update()` is **explicit** — only the supervised training path (`train_weighted`) calls it, so MPPI's policy-prior queries (which pass trajectory-sample actions through `log_prob_np`) cannot corrupt the running stats.
 2. **`log_sigma` clamp** in `_head()` to `[log_sigma_min, log_sigma_max]` (defaults `[-5.0, 2.0]`). Prevents the classic NLL pathologies of `σ → 0` (infinite log-likelihood gradients on slight action mismatches) and `σ → ∞` (vanishing signal).
-3. **Optional tanh-squashed head** (`squash_tanh=True`). Rescales via buffers `_act_scale` / `_act_bias` to the env action box, with a change-of-variables correction `Σ_i log(1 - tanh² u_i + ε) + Σ_i log(scale_i)` applied in `log_prob`. Off by default for acrobot/point-mass; intended for hopper/cheetah where MPPI teacher samples live on the action-box boundary.
+3. **Optional tanh-squashed head** (`squash_tanh=True`). Rescales via buffers `_act_scale` / `_act_bias` to the env action box, with a change-of-variables correction `Σ_i log(1 - tanh² u_i + ε) + Σ_i log(scale_i)` applied in `log_prob`. Off by default for acrobot/point-mass; intended for envs like hopper where MPPI teacher samples live on the action-box boundary.
 
 `train_weighted` runs one Adam step of weighted NLL. `act_np` / `log_prob_np` are the numpy bridges used by MPPI and the eval harness.
 
@@ -60,7 +60,7 @@ Diagonal-Gaussian MLP with three training-stability features, all gated by `Poli
 - **`src/utils/evaluation.py`** — `evaluate_policy` and `evaluate_mppi` using a shared seed schedule `(seed + ep)` so GPS-vs-MPPI per-episode comparisons start from identical initial conditions.
 - **`src/utils/device.py`** — `pick_device("auto"|"cpu"|"mps"|"cuda")` resolving `auto` → cuda → mps → cpu.
 - **`src/utils/math.py`** — log-sum-exp, weight computation, weighted-mean-cov, KL helpers (numpy).
-- **`src/envs/`** — `BaseEnv` + `MuJoCoEnv` base, concrete envs: `acrobot`, `half_cheetah`, `point_mass`, `hopper`. Factory: `src.envs.make_env(name)`. Every env exposes `state_to_obs(states)` for the policy-sized projection and `obs_dim` as a property. Hopper terminates via `done=True` on `z < 0.7` or `|angle| > 0.2` in single-step mode; batch rollouts don't terminate — high unhealthy cost discourages falling.
+- **`src/envs/`** — `BaseEnv` + `MuJoCoEnv` base, concrete envs: `acrobot`, `point_mass`, `hopper`, `adroit_pen`, `adroit_relocate`. Factory: `src.envs.make_env(name)`. Every env exposes `state_to_obs(states)` for the policy-sized projection and `obs_dim` as a property. Hopper terminates via `done=True` on `z < 0.7` or `|angle| > 0.2` in single-step mode; batch rollouts don't terminate — high unhealthy cost discourages falling.
 
 ---
 
@@ -70,7 +70,6 @@ Diagonal-Gaussian MLP with three training-stability features, all gated by `Poli
 
 ```bash
 python -m scripts.run_acrobot       # per-env tuning-style harness
-python -m scripts.run_cheetah
 python -m scripts.run_hopper
 python -m scripts.run_point_mass
 python -m scripts.run_mppi          # generic entry
@@ -128,7 +127,6 @@ Loads any compatible `state_dict` (GPS / DAgger / BC) into a fresh `GaussianPoli
 
 ```bash
 python -m scripts.tuning.tune_acrobot
-python -m scripts.tuning.tune_cheetah
 python -m scripts.tuning.tune_hopper
 python -m scripts.run_sb3_baseline --env Hopper-v5 --algo SAC
 python -m scripts.run_ablations --env acrobot
@@ -163,8 +161,8 @@ src/policy/
                                          RunningNormalizer, log_sigma clamp, optional tanh squash
 
 src/envs/
-  base.py  mujoco_env.py  gym_wrapper.py
-  acrobot.py  half_cheetah.py  point_mass.py  hopper.py
+  base.py  mujoco_env.py
+  acrobot.py  point_mass.py  hopper.py  adroit_pen.py  adroit_relocate.py
   __init__.py                            make_env(name) factory
 
 src/utils/
@@ -177,11 +175,12 @@ scripts/
   run_gps.py                             GPS entry (KL + policy-prior-only)
   run_dagger.py                          DAgger entry
   eval_checkpoint.py                     Standalone checkpoint evaluator
-  run_mppi.py  run_acrobot.py  run_cheetah.py  run_hopper.py  run_point_mass.py
+  run_mppi.py  run_acrobot.py  run_hopper.py  run_point_mass.py
+  run_adroit_pen.py  run_adroit_relocate.py
   collect_bc_demos.py  test_sl.py        One-shot BC pipeline
   run_sb3_baseline.py                    SAC / PPO baselines
   run_ablations.py                       Ablation runner
-  tuning/tune_{acrobot,cheetah,hopper}.py
+  tuning/tune_{acrobot,hopper}.py
   visualisation/{plot_results,plot_cost,visualise_rollouts}.py
 
 configs/
@@ -189,7 +188,8 @@ configs/
   hopper_best.json                       K=512, H=64, noise_sigma=0.3, lam=1.0, adaptive_lam=true
 
 assets/
-  acrobot.xml  half_cheetah.xml  hopper.xml  point_mass.xml
+  acrobot.xml  hopper.xml  point_mass.xml
+  adroit/                                Shared Adroit XMLs + meshes (used by adroit_pen and adroit_relocate)
 ```
 
 ---

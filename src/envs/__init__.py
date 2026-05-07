@@ -7,7 +7,6 @@ _REGISTRY = {
     "acrobot": ("src.envs.acrobot", "Acrobot"),
     "adroit_pen": ("src.envs.adroit_pen", "AdroitPen"),
     "adroit_relocate": ("src.envs.adroit_relocate", "AdroitRelocate"),
-    "half_cheetah": ("src.envs.half_cheetah", "HalfCheetah"),
     "hopper": ("src.envs.hopper", "Hopper"),
     "point_mass": ("src.envs.point_mass", "PointMass"),
 }

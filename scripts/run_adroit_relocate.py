@@ -9,6 +9,9 @@ import numpy as np
 from src.envs.adroit_relocate import AdroitRelocate
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
+from src.utils.policy_prior_loader import (
+    add_policy_prior_args, resolve_policy_prior,
+)
 from src.utils.seeding import add_seed_arg, seed_everything
 
 T = 250
@@ -67,6 +70,7 @@ def main():
                              "the speedup; macOS / non-CUDA hosts should "
                              "stick with the CPU path).")
     add_seed_arg(parser, default=400)
+    add_policy_prior_args(parser)
     args = parser.parse_args()
     seed_everything(args.seed)
 
@@ -78,6 +82,7 @@ def main():
     else:
         env = AdroitRelocate()
     controller = MPPI(env, cfg)
+    prior_fn = resolve_policy_prior(args, env)
 
     dt = env.model.opt.timestep * env._frame_skip
 
@@ -101,7 +106,7 @@ def main():
         state = env.get_state()
         total_cost = 0.0
         for t in range(T):
-            action, info = controller.plan_step(state)
+            action, info = controller.plan_step(state, prior=prior_fn)
             _, cost, _, step_info = env.step(action)
             total_cost += cost
             state = env.get_state()

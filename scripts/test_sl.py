@@ -62,7 +62,6 @@ _ENVS = [
     "acrobot",
     "adroit_pen",
     "adroit_relocate",
-    "half_cheetah",
     "point_mass",
     "hopper",
 ]
@@ -70,7 +69,6 @@ _ENVS = [
 # Camera per env — must match <camera name="..."> in the MuJoCo XML.
 _CAMERA = {
     "hopper": "track",
-    "half_cheetah": "track",
     "acrobot": "fixed",
     "point_mass": "fixed",
     "adroit_pen": "vil_camera",

@@ -8,6 +8,9 @@ import torch
 from src.envs.hopper import Hopper
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
+from src.utils.policy_prior_loader import (
+    add_policy_prior_args, resolve_policy_prior,
+)
 from src.utils.seeding import add_seed_arg, seed_everything
 
 T = 1000
@@ -18,12 +21,14 @@ def main():
     parser.add_argument("--cost-mode", default="v2", choices=["v1", "v2"],
                         help="hopper running cost: original v1 or dm_control-style v2")
     add_seed_arg(parser, default=42)
+    add_policy_prior_args(parser)
     args = parser.parse_args()
     seed_everything(args.seed)
 
     env = Hopper(cost_mode=args.cost_mode)
     cfg = MPPIConfig.load("hopper")
     controller = MPPI(env, cfg)
+    prior_fn = resolve_policy_prior(args, env)
 
     dt = env.model.opt.timestep * env._frame_skip
 
@@ -42,7 +47,7 @@ def main():
     total_cost = 0.0
 
     for t in range(T):
-        action, info = controller.plan_step(state)
+        action, info = controller.plan_step(state, prior=prior_fn)
         _, cost, done, _ = env.step(action)
         total_cost += cost
         state = env.get_state()

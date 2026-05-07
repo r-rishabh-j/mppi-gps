@@ -11,7 +11,6 @@ uv sync
 ```bash
 python -m scripts.run_point_mass
 python -m scripts.run_acrobot
-python -m scripts.run_cheetah
 python -m scripts.run_hopper
 python -m scripts.run_adroit_pen     # 24-DoF Shadow Hand pen reorientation
 python -m scripts.run_adroit_relocate # 30-DoF Adroit arm+hand pick-and-place
@@ -137,7 +136,7 @@ python -m scripts.run_dagger --env acrobot \
 ```
 
 Flags:
-- `--env {acrobot,adroit_pen,adroit_relocate,half_cheetah,hopper,point_mass}` — resolved via the `src.envs.make_env` registry.
+- `--env {acrobot,adroit_pen,adroit_relocate,hopper,point_mass}` — resolved via the `src.envs.make_env` registry.
 - `--device auto|cpu|mps|cuda` — auto resolves to cuda → mps → cpu.
 - `--deterministic` — use `DeterministicPolicy` (single-head, direct action regression) instead of `GaussianPolicy`.
 - `--beta-schedule linear|constant_zero` — β decays 1→0 over K/2 iters, or always 0.
@@ -273,7 +272,7 @@ python -m scripts.run_gps --env acrobot --kl-target 0.1 \
 
 | flag | default | meaning |
 |---|---|---|
-| `--kl-target T` | 0.0 (off) | per-state KL target **summed over action dims** — scale with act_dim. Rule of thumb `act_dim × 0.05`: ~0.1 for acrobot (2-D), ~0.3 for cheetah (6-D), ~1.5 for adroit_relocate (30-D). Set > 0 to enable adaptive mode |
+| `--kl-target T` | 0.0 (off) | per-state KL target **summed over action dims** — scale with act_dim. Rule of thumb `act_dim × 0.05`: ~0.1 for acrobot (2-D), ~0.15 for hopper (3-D), ~1.5 for adroit_relocate (30-D). Set > 0 to enable adaptive mode |
 | `--kl-alpha-min` | 0.001 | lower bound on the dual α (allows multiplicative escape) |
 | `--kl-alpha-max` | 0.5 | upper bound on the dual α. α ≫ 0.1 typically crushes MPPI's exploration regardless of the constraint, so growing past 0.5 is rarely productive |
 | `--kl-step-rate` | 1.5 | multiplicative update rate per iter; 2.0+ for faster escape from sticky regimes |
@@ -328,7 +327,6 @@ Flags:
 python -m scripts.run_sb3_baseline --env Hopper-v5 --algo SAC
 
 python -m scripts.tuning.tune_acrobot
-python -m scripts.tuning.tune_cheetah
 python -m scripts.tuning.tune_hopper
 
 python -m scripts.run_ablations --env acrobot

@@ -73,7 +73,7 @@ class PolicyConfig:
         Adroit-specific bumps:
         * ``hidden_dims=(512, 512, 512)`` — 30-DoF action with 70+-D obs
           needs more capacity than the (256, 256) default that's tuned for
-          acrobot/cheetah.
+          the small envs (acrobot, point_mass, hopper).
         * ``lr=3e-4`` — slightly safer with the deeper net.
         """
         # if env_name.startswith("adroit"):
@@ -257,7 +257,6 @@ class GPSConfig:
     # per dim, on average"):
     #     point_mass / acrobot (2-D)        ≈ 0.10
     #     hopper (3-D)                       ≈ 0.15
-    #     half_cheetah (6-D)                 ≈ 0.30
     #     adroit_pen / adroit_relocate (24/30-D) ≈ 1.2 — 1.5
     # Below ``act_dim × 0.05`` the dual update tends to saturate at
     # ``kl_alpha_max`` and the KL constraint becomes effectively

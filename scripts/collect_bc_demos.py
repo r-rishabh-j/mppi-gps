@@ -41,7 +41,7 @@ from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
 
 
-_ENVS = ["acrobot", "adroit_pen", "adroit_relocate", "half_cheetah", "point_mass", "hopper"]
+_ENVS = ["acrobot", "adroit_pen", "adroit_relocate", "point_mass", "hopper"]
 
 
 def _try_capture_sensordata(env) -> np.ndarray | None:

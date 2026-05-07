@@ -26,7 +26,6 @@ _ENVS = [
     "acrobot",
     "adroit_pen",
     "adroit_relocate",
-    "half_cheetah",
     "point_mass",
     "hopper",
 ]
@@ -38,7 +37,6 @@ _ENVS = [
 # rendered eval video frames the workspace correctly.
 _CAMERA = {
     "hopper": "track",
-    "half_cheetah": "track",
     "acrobot": "fixed",
     "point_mass": "fixed",
     "adroit_pen": "vil_camera",

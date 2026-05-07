@@ -8,6 +8,9 @@ import numpy as np
 from src.envs.adroit_pen import AdroitPen
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
+from src.utils.policy_prior_loader import (
+    add_policy_prior_args, resolve_policy_prior,
+)
 from src.utils.seeding import add_seed_arg, seed_everything
 
 T = 200
@@ -18,12 +21,14 @@ def main():
     parser.add_argument("--live", action="store_true",
                         help="interactive viewer instead of recording")
     add_seed_arg(parser, default=400)
+    add_policy_prior_args(parser)
     args = parser.parse_args()
     seed_everything(args.seed)
 
     env = AdroitPen()
     cfg = MPPIConfig.load("adroit_pen")
     controller = MPPI(env, cfg)
+    prior_fn = resolve_policy_prior(args, env)
 
     dt = env.model.opt.timestep * env._frame_skip
 
@@ -44,7 +49,7 @@ def main():
         total_cost = 0.0
         done_counter = 0
         for t in range(T):
-            action, info = controller.plan_step(state)
+            action, info = controller.plan_step(state, prior=prior_fn)
             _, cost, done, step_info = env.step(action)
             total_cost += cost
             state = env.get_state()

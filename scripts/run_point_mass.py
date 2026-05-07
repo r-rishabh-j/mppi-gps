@@ -5,12 +5,16 @@ import numpy as np
 from src.envs.point_mass import PointMass
 from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
+from src.utils.policy_prior_loader import (
+    add_policy_prior_args, resolve_policy_prior,
+)
 from src.utils.seeding import add_seed_arg, seed_everything
 
 
 def main():
     parser = argparse.ArgumentParser()
     add_seed_arg(parser, default=0)
+    add_policy_prior_args(parser)
     args = parser.parse_args()
     seed_everything(args.seed)
 
@@ -23,6 +27,7 @@ def main():
         adaptive_lam=False,
     )
     controller = MPPI(env, cfg)
+    prior_fn = resolve_policy_prior(args, env)
 
     env.reset()
     state = env.get_state()
@@ -33,7 +38,7 @@ def main():
     for vid in range(5):
         env.reset()
         for t in range(500):
-            action, info = controller.plan_step(state)
+            action, info = controller.plan_step(state, prior=prior_fn)
             _, cost, _, _ = env.step(action)
             state = env.get_state()
 

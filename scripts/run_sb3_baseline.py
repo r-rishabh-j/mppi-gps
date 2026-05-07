@@ -11,8 +11,8 @@ Usage:
     # Train SAC on Hopper-v5 for 500k steps
     python scripts/run_sb3_baseline.py --env Hopper-v5 --algo SAC
 
-    # Train PPO on HalfCheetah-v5 for 1M steps
-    python scripts/run_sb3_baseline.py --env HalfCheetah-v5 --algo PPO --total-timesteps 1000000
+    # Train PPO on Hopper-v5 for 1M steps
+    python scripts/run_sb3_baseline.py --env Hopper-v5 --algo PPO --total-timesteps 1000000
 
 Results (mean reward/cost) are saved to checkpoints/sb3/<algo>_<env>_results.json.
 Cost = -reward so that the comparison with MPPI/GPS (which minimise cost) is direct.
@@ -31,7 +31,7 @@ from src.utils.seeding import seed_everything
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--env", default="Hopper-v5",
-                   help="Gymnasium env id (e.g. Hopper-v5, HalfCheetah-v5)")
+                   help="Gymnasium env id (e.g. Hopper-v5)")
     p.add_argument("--algo", default="SAC", choices=["SAC", "PPO"])
     p.add_argument("--total-timesteps", type=int, default=500_000)
     p.add_argument("--n-eval", type=int, default=10)
