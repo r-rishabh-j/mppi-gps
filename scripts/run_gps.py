@@ -29,6 +29,7 @@ import torch
 
 from src.envs import make_env
 from src.gps.mppi_gps_unified import MPPIGPS
+from src.gps.mppi_gps_warp import WarpMPPIGPS
 from src.mppi.mppi import MPPI
 from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
 from src.utils.device import pick_device
@@ -224,14 +225,11 @@ def main():
     args = parse_args()
     seed_everything(args.seed)
 
-    # Load MPPI cfg before constructing env: the warp env needs `nworld=cfg.K`
-    # and `nworld` is fixed for the env's lifetime.
+    # Load MPPI cfg + resolve final num_conditions BEFORE env construction:
+    # the warp env's nworld is pinned to N×K at build time. We can't move
+    # this after the gps_cfg overrides without re-instantiating the env,
+    # which would re-allocate every GPU buffer.
     mppi_cfg = MPPIConfig.load(args.env)
-    env_kwargs: dict = {}
-    if args.warp:
-        env_kwargs.update(use_warp=True, nworld=mppi_cfg.K)
-    env = make_env(args.env, **env_kwargs)
-
     policy_cfg = PolicyConfig.for_env(args.env)
     gps_cfg = GPSConfig()
 
@@ -239,6 +237,18 @@ def main():
         gps_cfg.num_iterations = args.gps_iters
     if args.num_conditions is not None:
         gps_cfg.num_conditions = args.num_conditions
+
+    env_kwargs: dict = {}
+    if args.warp:
+        # Warp path: BatchedMPPI runs N=num_conditions control problems in
+        # parallel, K samples per condition → N*K mjw worlds total. The
+        # standalone CPU path (no --warp) doesn't need this — env stays
+        # single-condition and MPPI loops over conditions sequentially.
+        env_kwargs.update(
+            use_warp=True,
+            nworld=gps_cfg.num_conditions * mppi_cfg.K,
+        )
+    env = make_env(args.env, **env_kwargs)
     if args.episode_length is not None:
         gps_cfg.episode_length = args.episode_length
     if args.alpha is not None:
@@ -312,7 +322,10 @@ def main():
 
     # ---- Construct trainer (needed early so we can load --init-ckpt and
     #      record the actual policy class in config.json) ----
-    gps = MPPIGPS(
+    # Warp path uses BatchedMPPI under the hood and parallelizes the C-step
+    # over conditions; CPU path is the standard MPPIGPS.
+    Trainer = WarpMPPIGPS if args.warp else MPPIGPS
+    gps = Trainer(
         env, mppi_cfg, policy_cfg, gps_cfg,
         device=device,
         deterministic=args.deterministic,

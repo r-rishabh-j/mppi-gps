@@ -244,38 +244,102 @@ class WarpRolloutMixin:
             wp.copy(self._qvel_buf[h],   self._wd.qvel)
             wp.copy(self._sensor_buf[h], self._wd.sensordata)
 
-    def _seed_warp_state(self, initial_state: np.ndarray) -> None:
-        """Apply `initial_state` to the CPU `data`, then broadcast qpos/qvel
-        (and mocap if present) to all `nworld` GPU worlds.
+    def _seed_warp_state(
+        self,
+        initial_state: np.ndarray,
+        per_world_mocap: np.ndarray | None = None,
+    ) -> None:
+        """Seed the GPU world buffers with the per-world initial state.
 
-        We round-trip through the CPU model on every rollout to avoid a
-        manual mj_setState parser — `state` is the FULLPHYSICS layout, and
-        we need qpos/qvel slices on the GPU side. mocap is read from
-        `self.data.mocap_pos`/`.mocap_quat` (set by env.reset()) since the
-        FULLPHYSICS state doesn't carry mocap.
+        Two input shapes are accepted (overload-by-shape):
+          * ``initial_state.shape == (nstate,)`` — single FULLPHYSICS state
+            broadcast to all ``nworld`` GPU worlds. Mocap pose is read
+            from the CPU ``self.data`` (also broadcast). This is the
+            single-condition path used by the standalone MPPI controller.
+          * ``initial_state.shape == (nworld, nstate)`` — per-world initial
+            state (one row per GPU world). Used by ``BatchedMPPI`` where
+            ``nworld = N × K`` and rows are tiled so worlds 0..K-1 share
+            condition 0's state, K..2K-1 share condition 1's, etc. Mocap
+            broadcast falls back to the CPU ``self.data`` unless
+            ``per_world_mocap`` is supplied — see below.
+
+        ``per_world_mocap`` (optional, only used in the per-world path):
+          * ``None`` (default) — broadcast ``self.data.mocap_pos`` /
+            ``.mocap_quat`` to all worlds. Adequate when all conditions
+            share the same mocap (e.g. all conditions point at the same
+            relocate target). Most current usage hits this path.
+          * ``(nworld, nmocap, 3+4)`` packed as ``(pos, quat)`` — per-world
+            mocap. Use when conditions have *different* mocap targets
+            (e.g. randomized target per condition). Caller must build it.
+
+        Why FULLPHYSICS doesn't carry mocap: it's a configuration knob
+        (set by ``env.reset()`` before the rollout) rather than dynamic
+        state, so MuJoCo excludes it from the snapshot. We have to carry
+        it separately on each rollout call.
         """
         import mujoco
-        mujoco.mj_setState(
-            self.model, self.data, initial_state,
-            mujoco.mjtState.mjSTATE_FULLPHYSICS,
-        )
+
         K = self._warp_nworld
         nq, nv = self.model.nq, self.model.nv
-        qpos0 = np.broadcast_to(self.data.qpos.astype(np.float32), (K, nq)).copy()
-        qvel0 = np.broadcast_to(self.data.qvel.astype(np.float32), (K, nv)).copy()
+
+        # Single-state vs per-world via shape detection.
+        is_per_world = (
+            initial_state.ndim == 2 and initial_state.shape[0] == K
+        )
+        if is_per_world:
+            # Round-trip each row through self.data to extract qpos/qvel
+            # without re-implementing mj_setState. Cheap (only K calls,
+            # no rollouts), and keeps a single source of truth for the
+            # FULLPHYSICS → (qpos, qvel) layout.
+            qpos0 = np.empty((K, nq), dtype=np.float32)
+            qvel0 = np.empty((K, nv), dtype=np.float32)
+            for k in range(K):
+                mujoco.mj_setState(
+                    self.model, self.data, initial_state[k],
+                    mujoco.mjtState.mjSTATE_FULLPHYSICS,
+                )
+                qpos0[k] = self.data.qpos
+                qvel0[k] = self.data.qvel
+        else:
+            mujoco.mj_setState(
+                self.model, self.data, initial_state,
+                mujoco.mjtState.mjSTATE_FULLPHYSICS,
+            )
+            qpos0 = np.broadcast_to(
+                self.data.qpos.astype(np.float32), (K, nq)
+            ).copy()
+            qvel0 = np.broadcast_to(
+                self.data.qvel.astype(np.float32), (K, nv)
+            ).copy()
+
         self._wd.qpos.assign(qpos0)
         self._wd.qvel.assign(qvel0)
 
         if self._has_mocap:
             nm = self.model.nmocap
-            mp = np.broadcast_to(
-                self.data.mocap_pos.astype(np.float32), (K, nm, 3)
-            ).copy()
-            mq = np.broadcast_to(
-                self.data.mocap_quat.astype(np.float32), (K, nm, 4)
-            ).copy()
-            self._wd.mocap_pos.assign(mp)
-            self._wd.mocap_quat.assign(mq)
+            if per_world_mocap is not None:
+                # Caller-supplied per-world mocap. Expect (K, nm, 7) packed
+                # as [pos(3), quat(4)] per body. Split for the wd assignments.
+                pwm = np.asarray(per_world_mocap, dtype=np.float32)
+                if pwm.shape != (K, nm, 7):
+                    raise ValueError(
+                        f"per_world_mocap shape {pwm.shape} does not match "
+                        f"({K}, {nm}, 7). Pack as [pos, quat] per body."
+                    )
+                self._wd.mocap_pos.assign(pwm[..., :3].copy())
+                self._wd.mocap_quat.assign(pwm[..., 3:].copy())
+            else:
+                # Broadcast self.data mocap to all worlds (single-target
+                # default; works for both per-world and single-state paths
+                # when conditions share a mocap target).
+                mp = np.broadcast_to(
+                    self.data.mocap_pos.astype(np.float32), (K, nm, 3)
+                ).copy()
+                mq = np.broadcast_to(
+                    self.data.mocap_quat.astype(np.float32), (K, nm, 4)
+                ).copy()
+                self._wd.mocap_pos.assign(mp)
+                self._wd.mocap_quat.assign(mq)
 
     # ------------------------------------------------------------------
     # Rollout entry point
@@ -285,14 +349,22 @@ class WarpRolloutMixin:
         self,
         initial_state: np.ndarray,
         action_sequences: np.ndarray,
+        per_world_mocap: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        wp = self._wp
-        K, H, nu = action_sequences.shape
-        self._ensure_warp_buffers(K, H)
-        self._seed_warp_state(initial_state)
+        """Run B = nworld parallel rollouts of horizon H.
 
-        # (K, H, nu) → (H, K, nu): the inner loop indexes by h first so
-        # actions_wp[h] is a contiguous (K, nu) slice for wp.copy.
+        ``initial_state`` is either ``(nstate,)`` (broadcast to all worlds)
+        or ``(B, nstate)`` (per-world); see ``_seed_warp_state``.
+        ``action_sequences`` is always ``(B, H, nu)`` — caller flattens any
+        outer batching (e.g. (N, K) → B = N*K) before this call.
+        """
+        wp = self._wp
+        B, H, nu = action_sequences.shape
+        self._ensure_warp_buffers(B, H)
+        self._seed_warp_state(initial_state, per_world_mocap=per_world_mocap)
+
+        # (B, H, nu) → (H, B, nu): the inner loop indexes by h first so
+        # actions_wp[h] is a contiguous (B, nu) slice for wp.copy.
         self._actions_wp.assign(
             np.ascontiguousarray(
                 action_sequences.transpose(1, 0, 2).astype(np.float32)
@@ -311,9 +383,9 @@ class WarpRolloutMixin:
 
         # Reconstruct FULLPHYSICS-layout states. time=0 since the GPU loop
         # doesn't track sim time; nothing in this codebase reads state[..., 0].
-        time_col = np.zeros((K, H, 1), dtype=np.float32)
+        time_col = np.zeros((B, H, 1), dtype=np.float32)
         states = np.concatenate([time_col, qpos, qvel], axis=-1)
-        c  = self.running_cost(states, action_sequences, sensordata)   # (K, H)
-        tc = self.terminal_cost(states[:, -1, :], sensordata[:, -1, :])  # (K,)
+        c  = self.running_cost(states, action_sequences, sensordata)   # (B, H)
+        tc = self.terminal_cost(states[:, -1, :], sensordata[:, -1, :])  # (B,)
         costs = c.sum(axis=1) + tc
         return states, costs, sensordata
