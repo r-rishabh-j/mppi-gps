@@ -410,7 +410,7 @@ class AdroitRelocate(MuJoCoEnv):
         # reward = reward + np.where(lifted, lift_bonus * lift_gate, 0.0)
         # Replace the gated lift_bonus block with something like:
         ball_height = obj_z - 0.035   # ball radius — z at rest
-        reward += 5.0 * np.tanh(ball_height / 0.1) * grasp     # ungated by tight; only needs ANY grasp
+        reward += 2 * np.tanh(ball_height / 0.1) * grasp     # ungated by tight; only needs ANY grasp
         reward += np.where(lifted, lift_bonus * lift_gate, 0.0)  # keep the existing tight-gated bonus
 
         # Milestone bonuses for object near target — gated on grasp so a
@@ -421,7 +421,7 @@ class AdroitRelocate(MuJoCoEnv):
         milestone = (
             np.where(goal_dist < _GOAL_LOOSE, 10.0, 0.0)
             + np.where(goal_dist < _GOAL_TIGHT, 20.0, 0.0)
-        )
+        ) * 3
         reward = reward + lift_gate * milestone
 
         # Smoothness — split arm vs finger so fast finger-closing isn't
