@@ -83,6 +83,78 @@ def schedule_alpha(iteration: int, cfg: GPSConfig) -> float:
 
 
 # ---------------------------------------------------------------------------
+# KL-adaptive α (MDGPS-style dual variable)
+# ---------------------------------------------------------------------------
+
+def estimate_kl_p_to_policy(
+    obs: np.ndarray,
+    mu_p_phys: np.ndarray,
+    var_p_phys: np.ndarray,
+    policy: GaussianPolicy,
+) -> float:
+    """E_state[ KL(N(μ_p, σ_p²) ‖ π_θ(·|s)) ] over visited states.
+
+    ``(μ_p, σ_p²)`` are the weighted mean and per-dim variance of MPPI's
+    first-step action samples at each state, in **physical** action space.
+    The policy's head outputs in **normalized** space when ``USE_ACT_NORM``
+    is on, so we move μ_p and σ_p into normalized space before evaluating
+    the closed-form Gaussian KL — same reason the distill loss normalizes
+    its labels (the network's μ_θ and σ_θ live there).
+
+    Diagonal-Gaussian assumption (no off-diagonals in the local-policy
+    covariance — fine for a per-dim variance estimate from MPPI samples).
+    """
+    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=policy.device)
+    with torch.no_grad():
+        mu_th_t, log_sigma_th_t = policy._head(obs_t)
+    mu_th = mu_th_t.cpu().numpy()
+    sigma_th = log_sigma_th_t.exp().cpu().numpy()
+
+    if policy._has_act_norm:
+        scale = policy._act_scale.detach().cpu().numpy()
+        bias = policy._act_bias.detach().cpu().numpy()
+        mu_p = (mu_p_phys - bias) / scale
+        var_p = var_p_phys / (scale ** 2)
+    else:
+        mu_p = mu_p_phys
+        var_p = var_p_phys
+
+    # Floor on σ_p so an extremely concentrated MPPI softmin doesn't
+    # produce log(0) — happens when one sample dominates the weights.
+    sigma_p = np.sqrt(np.maximum(var_p, 1e-12))
+
+    # KL(N(μ_p, σ_p²) ‖ N(μ_θ, σ_θ²)) per dim, summed across action dims:
+    #   = log(σ_θ/σ_p) + (σ_p² + (μ_p − μ_θ)²) / (2 σ_θ²)  − 0.5
+    kl_per_dim = (
+        np.log(sigma_th / sigma_p)
+        + (sigma_p ** 2 + (mu_p - mu_th) ** 2) / (2.0 * sigma_th ** 2 + 1e-12)
+        - 0.5
+    )
+    kl_per_state = kl_per_dim.sum(axis=-1)        # (N,)
+    return float(kl_per_state.mean())              # scalar — average over states
+
+
+def update_alpha_kl_adaptive(
+    alpha: float,
+    kl_est: float,
+    cfg: GPSConfig,
+) -> float:
+    """Multiplicative dual gradient update on the KL constraint.
+
+    α grows when MPPI strayed too far from the policy (kl_est > target),
+    shrinks when it's clamped close. Update is in log-α space (i.e.
+    multiplicative in α-space) so the symmetric step rate has the same
+    effect in both directions. Clipped to [kl_alpha_min, kl_alpha_max]
+    to avoid degenerate fixed points.
+    """
+    if kl_est > cfg.kl_target:
+        new = alpha * cfg.kl_step_rate
+    else:
+        new = alpha / cfg.kl_step_rate
+    return float(np.clip(new, cfg.kl_alpha_min, cfg.kl_alpha_max))
+
+
+# ---------------------------------------------------------------------------
 # Policy priors
 # ---------------------------------------------------------------------------
 
@@ -210,6 +282,7 @@ class GPSHistory:
     iteration_ema_drift: list[float] = field(default_factory=list)
     iteration_prev_iter_kl: list[float] = field(default_factory=list)
     iteration_alpha: list[float] = field(default_factory=list)
+    iteration_kl_est: list[float] = field(default_factory=list)   # MDGPS KL(p ‖ π_θ); NaN when adaptive α is off
     best_iter: int = -1
     best_cost: float = float("inf")
 
@@ -273,6 +346,11 @@ class MPPIGPS:
         # Cross-iteration episode replay buffer (rows-capped, FIFO eviction
         # by whole episodes). Empty when distill_buffer_cap == 0.
         self._episode_buffer: list[dict] = []
+
+        # KL-adaptive α (MDGPS dual variable). Lazily seeded from the
+        # schedule on the first iter that the adaptive rule activates;
+        # carried iter-to-iter once active. None means "schedule path".
+        self._kl_alpha: float | None = None
 
         # EMA shadow over trainable params. Eval and best.pt selection happen
         # inside an ema_swapped_in() window, so the on-disk checkpoint matches
@@ -475,17 +553,43 @@ class MPPIGPS:
 
         initial_conditions = self._sample_initial_conditions(cfg.num_conditions)
 
+        # KL-adaptive α activates only for Gaussian policies — needs σ for
+        # the closed-form Gaussian KL. Deterministic falls back to schedule.
+        kl_adaptive_enabled = (
+            cfg.kl_target > 0.0 and not self._deterministic
+        )
+
         outer_bar = tqdm(range(num_iterations), desc="GPS", unit="iter")
         for iteration in outer_bar:
-            # Per-iter α (constant by default; ramps from alpha_start to
-            # policy_augmented_alpha over alpha_warmup_iters when a
-            # schedule is configured). See `schedule_alpha` docstring.
-            alpha = schedule_alpha(iteration, cfg)
+            # Pick α for this iter:
+            #  * during warmup (or when adaptive disabled): use the schedule
+            #  * after warmup (when adaptive enabled): use the dual variable
+            #    self._kl_alpha, which is initialized lazily from the
+            #    schedule on the first adaptive iter and updated at the end
+            #    of each iter via dual gradient ascent.
+            use_kl_adaptive_this_iter = (
+                kl_adaptive_enabled and iteration >= cfg.alpha_warmup_iters
+            )
+            if use_kl_adaptive_this_iter:
+                if self._kl_alpha is None:
+                    self._kl_alpha = schedule_alpha(iteration, cfg)
+                alpha = self._kl_alpha
+            else:
+                alpha = schedule_alpha(iteration, cfg)
 
             all_obs: list[np.ndarray] = []
             all_actions: list[np.ndarray] = []
             all_weights: list[np.ndarray] = []
             condition_costs: list[float] = []
+
+            # KL-adaptive accumulator. Per plan_step we record (obs at
+            # plan time, weighted-mean of MPPI's first-step actions,
+            # weighted-var of same) — used after the C-step to estimate
+            # KL(p ‖ π_θ) and update the dual α. Empty when adaptive is
+            # disabled, kept tiny in size (3 small arrays per timestep).
+            kl_obs_buf: list[np.ndarray] = []
+            kl_mu_p_buf: list[np.ndarray] = []
+            kl_var_p_buf: list[np.ndarray] = []
 
             # ========== C-STEP ==========
             # eval() so the prior_fn forward (which goes through Dropout +
@@ -538,6 +642,21 @@ class MPPIGPS:
 
                     # Executor: MPPI with the policy prior. Steers the env.
                     action_exec, _info = self.mppi.plan_step(state, prior=prior_fn)
+
+                    # KL-adaptive: snapshot MPPI's per-state first-step
+                    # action distribution. weighted mean / variance over
+                    # the K samples; only collected on full-replan steps
+                    # (open-loop follow-up calls don't refresh _last_*).
+                    if use_kl_adaptive_this_iter and _info.get("replanned", True):
+                        ws = self.mppi._last_weights
+                        first_actions = self.mppi._last_actions[:, 0, :]   # (K, act_dim)
+                        mu_p = (ws[:, None] * first_actions).sum(axis=0)
+                        var_p = (
+                            ws[:, None] * (first_actions - mu_p) ** 2
+                        ).sum(axis=0)
+                        kl_obs_buf.append(obs.copy())
+                        kl_mu_p_buf.append(mu_p)
+                        kl_var_p_buf.append(var_p)
 
                     # DAgger-style relabel: a fresh prior-free MPPI call
                     # whose action is the training label. dry_run=True keeps
@@ -652,6 +771,24 @@ class MPPIGPS:
             if cfg.reset_optim_per_iter:
                 self.policy.reset_optimizer()
 
+            # ========== KL-adaptive α update (MDGPS dual ascent) =========
+            # Estimate KL(p ‖ π_θ) from the C-step data, then take a dual
+            # gradient step on α to drive KL toward kl_target. Uses an
+            # ema-swapped policy snapshot for consistency with eval — the
+            # KL we measure is against the policy that's about to be
+            # checkpointed and used as next iter's prior.
+            kl_est_iter = float("nan")
+            if use_kl_adaptive_this_iter and kl_obs_buf:
+                with self.policy.ema_swapped_in():
+                    self.policy.eval()
+                    kl_est_iter = estimate_kl_p_to_policy(
+                        np.stack(kl_obs_buf),
+                        np.stack(kl_mu_p_buf),
+                        np.stack(kl_var_p_buf),
+                        self.policy,
+                    )
+                self._kl_alpha = update_alpha_kl_adaptive(alpha, kl_est_iter, cfg)
+
             # ========== Logging ==========
             mppi_cost = float(np.mean(condition_costs))
             history.iteration_costs.append(mppi_cost)
@@ -659,6 +796,7 @@ class MPPIGPS:
             history.iteration_ema_drift.append(ema_drift)
             history.iteration_prev_iter_kl.append(prev_iter_kl_diag)
             history.iteration_alpha.append(float(alpha))
+            history.iteration_kl_est.append(kl_est_iter)
 
             # ========== Eval (drives best.pt) ==========
             eval_every = max(int(getattr(cfg, "eval_every", 1)), 1)
@@ -699,8 +837,13 @@ class MPPIGPS:
                 "loss": f"{loss:.3f}",
                 "best": history.best_iter if history.best_iter >= 0 else "-",
             }
-            if cfg.alpha_schedule != "constant" and cfg.alpha_warmup_iters > 0:
+            schedule_active = (
+                cfg.alpha_schedule != "constant" and cfg.alpha_warmup_iters > 0
+            )
+            if schedule_active or use_kl_adaptive_this_iter:
                 postfix["alpha"] = f"{alpha:.3f}"
+            if use_kl_adaptive_this_iter:
+                postfix["kl"] = f"{kl_est_iter:.3f}"
             if do_eval:
                 postfix["eval_cost"] = f"{eval_cost:.2f}"
             outer_bar.set_postfix(**postfix)
@@ -712,6 +855,8 @@ class MPPIGPS:
                 f"mppi_cost={mppi_cost:8.2f}  "
                 f"distill_loss={loss:.4f}"
             )
+            if use_kl_adaptive_this_iter:
+                base_line += f"  kl_est={kl_est_iter:7.4f}/tgt={cfg.kl_target:.3f}"
             if cfg.distill_buffer_cap > 0:
                 n_eps = len(self._episode_buffer)
                 n_rows = sum(len(ep["obs"]) for ep in self._episode_buffer)

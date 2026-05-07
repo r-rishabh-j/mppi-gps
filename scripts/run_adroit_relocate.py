@@ -11,7 +11,7 @@ from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
 from src.utils.seeding import add_seed_arg, seed_everything
 
-T = 150
+T = 250
 
 # Cameras to tile in the recorded video (2x2 grid). Order = top-left,
 # top-right, bottom-left, bottom-right.

@@ -214,6 +214,44 @@ class GPSConfig:
     alpha_schedule: str = "constant"
     alpha_warmup_iters: int = 0     # ramp duration (in GPS iters); 0 disables
     alpha_start: float = 0.0        # starting α (typically 0.0)
+
+    # ---- KL-adaptive α (MDGPS-style dual variable) ------------------------
+    # When kl_target > 0 (and policy is Gaussian), the trainer treats α as
+    # a DUAL VARIABLE auto-adjusted each iter to maintain a target KL
+    # divergence between MPPI's local-policy distribution and the global
+    # policy. The schedule fields above are used only during the warmup
+    # window (`alpha_warmup_iters`); after that, the KL-adaptive rule
+    # takes over and `alpha_schedule` / `policy_augmented_alpha` /
+    # `alpha_start` are ignored.
+    #
+    # Algorithm (per GPS iter, after the C-step):
+    #   kl_est = E_state[ KL(N(μ_p(s), σ_p²(s)) || π_θ(·|s)) ]
+    # where (μ_p, σ_p²) is the weighted mean/var of MPPI's first-step
+    # action samples at each visited state. Then dual gradient ascent in
+    # log-α space:
+    #   α ← α · kl_step_rate    if kl_est > kl_target  (tighten — pull MPPI back)
+    #   α ← α / kl_step_rate    if kl_est < kl_target  (loosen — let MPPI explore)
+    #   α ← clip(α, kl_alpha_min, kl_alpha_max)
+    #
+    # Why: replaces the manual α + schedule tuning with a data-driven
+    # rule. Per the MDGPS paper (Montgomery & Levine, NeurIPS 2016), this
+    # is approximate mirror descent in policy space with per-iter
+    # improvement bounds. For our specific "MPPI-trapped-in-bad-policy"
+    # failure mode: when the policy is bad, MPPI's cost-optimal local
+    # distribution matches it tightly → kl_est is small → α shrinks →
+    # MPPI explores more freely next iter → finds lift trajectories →
+    # buffer fills with unbiased data → policy improves. The trap breaks
+    # by construction.
+    #
+    # 0 = disabled (default; standard schedule path).
+    # Typical: 0.05 — 0.5 (per-state KL summed over action dims).
+    # Implemented Gaussian-only — needs σ from the policy for the closed-
+    # form KL. Silently ignored under --deterministic.
+    kl_target: float = 0.0
+    kl_alpha_min: float = 0.001    # lower bound on dual α (allows multiplicative escape)
+    kl_alpha_max: float = 1.0      # upper bound (prevents runaway)
+    kl_step_rate: float = 1.5      # multiplicative update rate per iter
+
     # PPO-style probability ratio clip for the Gaussian S-step surrogate
     # in `mppi_gps_unified._train_step_ppo_clip`. 0.0 = disabled (default;
     # falls through to plain NLL via `train_weighted`, which is what most

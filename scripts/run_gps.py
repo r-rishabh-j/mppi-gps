@@ -80,6 +80,25 @@ def parse_args():
     p.add_argument("--alpha-start", type=float, default=0,
                    help="Starting α value for the ramp (default 0.0). "
                         "Ignored when --alpha-schedule is 'constant'.")
+    p.add_argument("--kl-target", type=float, default=None,
+                   help="MDGPS-style KL-adaptive α (Gaussian only). When > 0, "
+                        "α becomes a dual variable auto-adjusted each iter to "
+                        "drive E_state[KL(N(μ_p,σ_p²) ‖ π_θ)] toward this "
+                        "target. The schedule fields above are still used for "
+                        "the warmup window (alpha_warmup_iters); after that "
+                        "the adaptive rule takes over. Typical: 0.05 — 0.5. "
+                        "0 (default) disables and uses the schedule path.")
+    p.add_argument("--kl-alpha-min", type=float, default=None,
+                   help="Lower bound on the KL-adaptive α (default 0.001). "
+                        "Allows multiplicative escape from a tight constraint.")
+    p.add_argument("--kl-alpha-max", type=float, default=None,
+                   help="Upper bound on the KL-adaptive α (default 1.0). "
+                        "Prevents runaway when MPPI is far from policy.")
+    p.add_argument("--kl-step-rate", type=float, default=None,
+                   help="Multiplicative update rate for the dual α step "
+                        "(default 1.5). Larger = faster adaptation but more "
+                        "iter-to-iter oscillation; 2.0+ if you need to escape "
+                        "a sticky α regime quickly.")
     p.add_argument("--policy-prior", default=None,
                    choices=["nll", "mean_distance"],
                    help="Policy prior shape used in the MPPI cost. Unset = "
@@ -203,6 +222,14 @@ def main():
         gps_cfg.alpha_warmup_iters = args.alpha_warmup_iters
     if args.alpha_start is not None:
         gps_cfg.alpha_start = args.alpha_start
+    if args.kl_target is not None:
+        gps_cfg.kl_target = args.kl_target
+    if args.kl_alpha_min is not None:
+        gps_cfg.kl_alpha_min = args.kl_alpha_min
+    if args.kl_alpha_max is not None:
+        gps_cfg.kl_alpha_max = args.kl_alpha_max
+    if args.kl_step_rate is not None:
+        gps_cfg.kl_step_rate = args.kl_step_rate
     if args.policy_prior is not None:
         gps_cfg.policy_prior_type = args.policy_prior
     if args.auto_reset:
@@ -233,7 +260,14 @@ def main():
     device = pick_device(args.device)
     print(f"policy device: {device}")
     policy_class = "Deterministic" if args.deterministic else "Gaussian"
-    if gps_cfg.alpha_schedule != "constant" and gps_cfg.alpha_warmup_iters > 0:
+    if gps_cfg.kl_target > 0.0 and not args.deterministic:
+        alpha_desc = (
+            f"alpha=KL-adaptive(target={gps_cfg.kl_target}, "
+            f"range=[{gps_cfg.kl_alpha_min}, {gps_cfg.kl_alpha_max}], "
+            f"warmup={gps_cfg.alpha_warmup_iters} iters via "
+            f"{gps_cfg.alpha_schedule})"
+        )
+    elif gps_cfg.alpha_schedule != "constant" and gps_cfg.alpha_warmup_iters > 0:
         alpha_desc = (
             f"alpha={gps_cfg.alpha_start}→{gps_cfg.policy_augmented_alpha} "
             f"({gps_cfg.alpha_schedule} ramp over "

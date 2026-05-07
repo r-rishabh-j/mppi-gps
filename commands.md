@@ -178,6 +178,64 @@ Flags:
 - `--exp-name`, `--exp-dir` — run-dir naming (parent defaults to `experiments/gps`).
 - `--device auto|cpu|mps|cuda` — policy training device (MPPI always runs on CPU).
 
+### α tuning: schedule and KL-adaptive
+
+`--alpha` controls the policy-prior weight in MPPI's cost. Three modes for choosing it per-iter, in order of sophistication:
+
+**Mode 1 — constant** (default). `α = --alpha` every iter.
+
+```bash
+python -m scripts.run_gps --env adroit_relocate --alpha 0.1 --gps-iters 40 --device auto
+```
+
+**Mode 2 — non-linear schedule.** Ramp α from `--alpha-start` to `--alpha` over `--alpha-warmup-iters`, then plateau. Useful at iter 0 when the policy is untrained: starting α at 0 lets MPPI explore freely while the policy bootstraps, ramping the prior in later for on-policy state coverage.
+
+```bash
+python -m scripts.run_gps --env adroit_relocate --auto-reset \
+    --alpha 0.1 \
+    --alpha-schedule smoothstep \    # or linear, cosine, constant
+    --alpha-warmup-iters 8 \         # ramp 0 → 0.1 over the first 8 iters
+    --alpha-start 0.0 \
+    --gps-iters 40 --device auto
+```
+
+| flag | meaning |
+|---|---|
+| `--alpha-schedule {constant,linear,smoothstep,cosine}` | shape of the ramp; `constant` (default) disables the schedule, `smoothstep` is the recommended ramp (cubic, derivative 0 at endpoints) |
+| `--alpha-warmup-iters N` | iters over which α ramps from `--alpha-start` to `--alpha` |
+| `--alpha-start S` | starting α (default 0.0) |
+
+**Mode 3 — MDGPS-style KL-adaptive α** (Gaussian policies only). `α` becomes a *dual variable* auto-adjusted each iter to maintain a target KL between MPPI's local-policy distribution and the global policy:
+
+```
+kl_est = E_state[ KL(N(μ_p(s), σ_p²(s)) ‖ π_θ(·|s)) ]
+α ← α · kl_step_rate    if kl_est > kl_target  (tighten — pull MPPI back to π)
+α ← α / kl_step_rate    if kl_est < kl_target  (loosen — let MPPI explore)
+```
+
+Per Montgomery & Levine (NIPS 2016), this is approximate mirror descent with per-iter improvement bounds — and breaks the "MPPI-trapped-in-bad-policy" failure mode by construction (when policy is bad, kl_est is small → α shrinks → MPPI explores → buffer fills with unbiased data → policy improves).
+
+```bash
+python -m scripts.run_gps --env adroit_relocate --auto-reset \
+    --kl-target 0.1 \                # the target per-state KL
+    --alpha 0.05 \                   # used only to seed α at end of warmup
+    --alpha-warmup-iters 5 \         # adaptive rule activates at iter 5
+    --alpha-schedule smoothstep --alpha-start 0 \   # warmup ramp shape
+    --gps-iters 40 --device auto --policy-prior mean_distance
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--kl-target T` | 0.0 (off) | per-state KL target. Typical 0.05 — 0.5 (sums over action dims). Set > 0 to enable adaptive mode |
+| `--kl-alpha-min` | 0.001 | lower bound on the dual α (allows multiplicative escape) |
+| `--kl-alpha-max` | 1.0 | upper bound on the dual α (prevents runaway) |
+| `--kl-step-rate` | 1.5 | multiplicative update rate per iter; 2.0+ for faster escape from sticky regimes |
+
+Notes:
+- The schedule (mode 2) is used **during the warmup window** — `--alpha-warmup-iters` iterations of standard schedule behavior. After warmup, the KL-adaptive rule takes over and the schedule fields become inert.
+- KL-adaptive is **Gaussian-only** (needs σ for the closed-form Gaussian KL). Silently falls back to schedule under `--deterministic`.
+- Per-iter `α`, `kl_est`, target are printed to the tqdm postfix and the per-iter line so you can watch the dual variable adapt.
+
 ## Evaluate a saved checkpoint
 
 Load any `.pt` policy state_dict and evaluate it. `--ckpt` accepts either a
