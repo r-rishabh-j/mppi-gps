@@ -1,8 +1,8 @@
 {
-  "K": 812,
+  "K": 1024,
   "H": 32,
   "lam": 0.08,
-  "noise_sigma": 0.8,
+  "noise_sigma": 1,
   "adaptive_lam": false,
   "n_eff_threshold": 256,
   "open_loop_steps": 1,

@@ -17,6 +17,7 @@ _REGISTRY = {
 # `cost`, `obs`, sensors, and bounds are inherited unchanged.
 _WARP_REGISTRY = {
     "adroit_relocate": ("src.envs.adroit_relocate_warp", "AdroitRelocateWarp"),
+    "hopper": ("src.envs.hopper_warp", "HopperWarp"),
 }
 
 

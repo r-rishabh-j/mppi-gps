@@ -134,7 +134,7 @@ _GRIP_TOUCH_SCALE = 1  # establishment tanh — saturates fast (~grip_score=2)
 # basic tanh saturates and MPPI converges to the loosest possible grasp,
 # which slips under any perturbation. Saturates around grip_score=15 to
 # prevent infinite-force pumping.
-_TIGHT_GRIP_BONUS = 1.0
+_TIGHT_GRIP_BONUS = 2.0
 _TIGHT_GRIP_SCALE = 3.0
 # Per-finger proximity gate σ (m). exp(-d²/σ²) — finger contributes ≈ 1 when
 # touching the ball (ball radius 0.035), ≈ 0 when touching the table or air
@@ -182,7 +182,7 @@ _THUMB_PROXIMITY_SCALE = 0.10  # σ in metres; ~2× the grip proximity gate
 # Object qvel[30:] is always excluded — moving the ball IS the task.
 # Set both to 0.0 to disable. Tune up arm penalty if reaches still look
 # jerky; tune up finger penalty only if fingers visibly twitch.
-_ARM_VEL_PENALTY = 0.03      # qvel[:6]   — ARTx/y/z, ARRx/y/z
+_ARM_VEL_PENALTY = 0.05      # qvel[:6]   — ARTx/y/z, ARRx/y/z
 _FINGER_VEL_PENALTY = 0.005  # qvel[6:30] — 24 hand joints
 
 # ---- Control-magnitude penalty (arm only) ----

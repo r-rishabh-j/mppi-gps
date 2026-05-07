@@ -1,6 +1,15 @@
  <mujocoinclude>
      <compiler angle="radian" meshdir='resources/meshes/' texturedir='resources/textures/' />
-    <option iterations="20" noslip_iterations="20"/>
+    <!-- noslip_iterations="0" (was 20): disabled so that mujoco_warp's
+         GPU rollouts and the CPU executor see identical physics. mjw
+         doesn't implement the noslip post-pass solver; running it on CPU
+         only would create a planner/executor model mismatch that
+         systematically biases MPPI toward over-gripping. The cost is a
+         small amount of tangential creep on sustained-contact grasps;
+         compensate (if needed) by bumping geom `friction` rather than
+         re-enabling noslip. Set back to 20 to restore the upstream
+         behaviour for CPU-only runs. -->
+    <option iterations="20" noslip_iterations="0"/>
     <size njmax="500" nconmax="100" nstack="600000" nuser_body="9" nuser_jnt="1" nuser_site="1" nuser_tendon="1" nuser_actuator="16" nuser_sensor="1" />
     <visual>
         <global offwidth="3024" offheight="1680" />

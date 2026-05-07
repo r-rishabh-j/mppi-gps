@@ -109,11 +109,29 @@ class WarpRolloutMixin:
             "Position actuators are fine; muscles are not."
         )
 
-        self._patch_model_for_warp()
+        # ---- Build a separate, unpatched model copy for mujoco_warp ----
+        # Deepcopy is defensive: mjw.put_model is logically read-only on
+        # the input, but isolating the warp side means we cannot
+        # accidentally affect the CPU executor's `self.model` /
+        # `self.data` even if a future mjw version mutates fields. The
+        # copy here is byte-equal to the CPU model — same noslip, same
+        # geom_margin, same everything. If `put_model` raises
+        # NotImplementedError on a model feature your mujoco_warp version
+        # doesn't support, call `self._patch_model_for_warp(warp_model)`
+        # before the put_model line below to disable that feature on the
+        # warp side ONLY (CPU executor stays consistent with the user's
+        # original tuning). The patches available are documented in
+        # `_patch_model_for_warp`. We don't auto-apply them: the
+        # planner/executor physics split they create is invisible most
+        # of the time but real, and silently disabling solver passes is
+        # not the kind of thing to do behind the user's back.
+        import copy
+        warp_model = copy.deepcopy(self.model)
+        # self._patch_model_for_warp(warp_model)   # ← uncomment if mjw rejects model
 
         self._wp = wp
         self._mjw = mjw
-        self._wm = mjw.put_model(self.model)
+        self._wm = mjw.put_model(warp_model)
 
         # Try to pass njmax/nconmax explicitly; fall back to model-derived
         # defaults if this mjw version doesn't accept the kwargs (very
@@ -123,7 +141,7 @@ class WarpRolloutMixin:
         # mismatch at construction.
         try:
             self._wd = mjw.make_data(
-                self.model, nworld=nworld,
+                warp_model, nworld=nworld,
                 njmax=njmax, nconmax=nconmax,
             )
         except TypeError:
@@ -134,7 +152,7 @@ class WarpRolloutMixin:
                 "buffers. If you hit 'nefc overflow', upgrade mujoco_warp.",
                 stacklevel=3,
             )
-            self._wd = mjw.make_data(self.model, nworld=nworld)
+            self._wd = mjw.make_data(warp_model, nworld=nworld)
 
         self._warp_nworld = nworld
         self._warp_H: int | None = None
@@ -150,39 +168,48 @@ class WarpRolloutMixin:
     # Compatibility patches
     # ------------------------------------------------------------------
 
-    def _patch_model_for_warp(self) -> None:
-        """Adjust ``self.model`` in-place to satisfy mujoco_warp's
-        ``put_model`` constraints. Each patch emits a single warning so the
-        change is visible to the user.
+    def _patch_model_for_warp(self, model=None) -> None:
+        """Disable model features that older mujoco_warp versions reject.
 
-        These changes apply to ``self.model`` — the CPU ``env.step`` path
-        also reads from this model, so CPU and warp rollouts stay
-        physics-consistent (otherwise the action *executed* via
-        ``env.step`` would have different physics from the rollout that
-        scored it).
+        OPT-IN — not called automatically. Apply selectively if mjw raises
+        ``NotImplementedError`` on your version. Each patch emits a single
+        warning so the change is visible.
 
-        Patches applied:
-        - ``noslip_iterations``: zeroed. mujoco_warp doesn't implement the
-          noslip post-pass solver. Adroit's XML defaults to 20 iterations.
-          Effect: slightly less accurate sliding-friction handling. For
-          grasp-style contacts (sticky, low slip) this is usually a no-op.
-        - ``geom_margin`` / ``pair_margin``: zeroed where non-zero.
-          mujoco_warp's ``put_model`` rejects geom pairs with non-zero
-          margin under MULTICCD-style processing. Adroit's XML sets
-          ``margin="0.0005"`` on every geom. Effect: contact detection
-          fires only at actual penetration instead of within a 0.5 mm
-          shell. Negligible for a grasping task.
+        ``model`` (optional) — apply patches to a specific MjModel instance
+        (e.g. the warp-only deepcopy in ``_init_warp``). Defaults to
+        ``self.model`` if omitted, which would change physics for the CPU
+        executor too — generally NOT what you want when paired with the
+        deepcopy approach in ``_init_warp``. Pass the warp copy explicitly.
+
+        Patches:
+        - ``noslip_iterations``: zeroed. mujoco_warp historically doesn't
+          implement the noslip post-pass solver. Adroit's XML defaults to
+          20 iterations. Effect: slightly less accurate sliding-friction
+          handling. For grasp-style contacts (sticky, low slip) usually a
+          no-op. Newer mjw versions may support it — try without first.
+        - ``geom_margin`` / ``pair_margin``: zeroed where non-zero. Older
+          mjw rejects non-zero geom margins under MULTICCD. Adroit's XML
+          sets ``margin="0.0005"`` on every geom. Effect: contact
+          detection fires at actual penetration instead of within a
+          0.5 mm shell. Negligible for grasping. Recent mjw versions may
+          handle margins natively — try without first.
+
+        Usage from ``_init_warp`` if you need it (uncomment the line in
+        the constructor that calls this on ``warp_model``):
+
+            warp_model = copy.deepcopy(self.model)
+            self._patch_model_for_warp(warp_model)   # only the warp side
+            self._wm = mjw.put_model(warp_model)
         """
         import warnings
-        m = self.model
+        m = model if model is not None else self.model
 
         if m.opt.noslip_iterations > 0:
             warnings.warn(
                 f"Disabling noslip solver (was noslip_iterations="
                 f"{m.opt.noslip_iterations}) — mujoco_warp does not implement "
-                "it. Friction on sliding contacts will be slightly less "
-                "accurate; for Adroit grasp rollouts this is usually a no-op "
-                "since contacts are sticky.",
+                "it on this version. Friction on sliding contacts will be "
+                "slightly less accurate.",
                 stacklevel=4,
             )
             m.opt.noslip_iterations = 0
@@ -193,9 +220,7 @@ class WarpRolloutMixin:
             warnings.warn(
                 f"Zeroing geom_margin on {n_nonzero_geom}/{m.ngeom} geoms "
                 f"(max was {max_margin:.4g} m) — mujoco_warp rejects non-zero "
-                "geom margins under MULTICCD. Contact detection now fires at "
-                "actual penetration; sub-millimetre margins are negligible "
-                "for grasp tasks.",
+                "geom margins under MULTICCD on this version.",
                 stacklevel=4,
             )
             m.geom_margin[:] = 0.0
