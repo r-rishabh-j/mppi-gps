@@ -20,13 +20,25 @@ def main():
     parser.add_argument("--live", action="store_true", help="interactive viewer instead of recording")
     parser.add_argument("--cost-mode", default="v2", choices=["v1", "v2"],
                         help="hopper running cost: original v1 or dm_control-style v2")
+    parser.add_argument("--warp", action="store_true",
+                        help="Use mujoco_warp GPU batch rollout for MPPI. "
+                             "Requires `uv pip install warp-lang mujoco-warp` "
+                             "and an NVIDIA GPU with CUDA. nworld is pinned "
+                             "to MPPIConfig.K — single-condition standalone, "
+                             "no batched-MPPI in this script.")
     add_seed_arg(parser, default=42)
     add_policy_prior_args(parser)
     args = parser.parse_args()
     seed_everything(args.seed)
 
-    env = Hopper(cost_mode=args.cost_mode)
+    # Load MPPI cfg before constructing env: the warp env needs `nworld=cfg.K`
+    # and `nworld` is fixed for the env's lifetime.
     cfg = MPPIConfig.load("hopper")
+    if args.warp:
+        from src.envs.hopper_warp import HopperWarp
+        env = HopperWarp(nworld=cfg.K, cost_mode=args.cost_mode)
+    else:
+        env = Hopper(cost_mode=args.cost_mode)
     controller = MPPI(env, cfg)
     prior_fn = resolve_policy_prior(args, env)
 

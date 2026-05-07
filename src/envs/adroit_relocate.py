@@ -125,7 +125,7 @@ USE_GRASP_SHAPING = True
 # where qvel actually helps the policy. See module docstring for the layout.
 USE_DAPG_OBS = True
 
-_GRIP_BONUS = 4.0         # weight on tanh(grip_score / GRIP_TOUCH_SCALE)
+_GRIP_BONUS = 5.0         # weight on tanh(grip_score / GRIP_TOUCH_SCALE)
 _GRIP_TOUCH_SCALE = 1  # establishment tanh — saturates fast (~grip_score=2)
                           # so MPPI gets a steep gradient establishing contact.
 # Tighter-grip reward: a second tanh with a much larger scale stays
@@ -194,7 +194,7 @@ _FINGER_VEL_PENALTY = 0.005  # qvel[6:30] — 24 hand joints
 # that briefly slams the arm to its joint limits. Set to 0.0 to disable.
 # Hand controls intentionally excluded — finger commands need to span
 # their range freely to grasp.
-_ARM_CTRL_PENALTY = 0.2
+_ARM_CTRL_PENALTY = 0.05
 
 
 class AdroitRelocate(MuJoCoEnv):
@@ -406,7 +406,7 @@ class AdroitRelocate(MuJoCoEnv):
             1.0
             - 0.5 * np.linalg.norm(palm - target, axis=-1)
             - 0.5 * np.linalg.norm(obj - target, axis=-1)
-        ) * 4
+        ) * 1
         # reward = reward + np.where(lifted, lift_bonus * lift_gate, 0.0)
         # Replace the gated lift_bonus block with something like:
         ball_height = obj_z - 0.035   # ball radius — z at rest
@@ -421,7 +421,7 @@ class AdroitRelocate(MuJoCoEnv):
         milestone = (
             np.where(goal_dist < _GOAL_LOOSE, 10.0, 0.0)
             + np.where(goal_dist < _GOAL_TIGHT, 20.0, 0.0)
-        ) * 3
+        ) * 5
         reward = reward + lift_gate * milestone
 
         # Smoothness — split arm vs finger so fast finger-closing isn't
