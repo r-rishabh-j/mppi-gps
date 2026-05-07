@@ -297,15 +297,33 @@ class AdroitRelocate(MuJoCoEnv):
 
         mujoco.mj_resetData(self.model, self.data)
 
-        # Randomise object body position (in x,y; z stays at 0.035).
-        self.model.body_pos[self._obj_body_id, 0] = np.random.uniform(*_OBJ_X_RANGE)
-        self.model.body_pos[self._obj_body_id, 1] = np.random.uniform(*_OBJ_Y_RANGE)
-        self._obj_body_init_pos = self.model.body_pos[self._obj_body_id].copy()
+        # Randomise object position via QPOS (the ball's 3 slide joints
+        # at indices 30:33), NOT via ``model.body_pos`` as the upstream
+        # adroit_relocate does. The two are equivalent for CPU rollouts
+        # since ``xpos[Object] = body_pos[Object] + qpos[30:33]``, but
+        # only the qpos path works under ``mujoco_warp``: ``mjw.put_model``
+        # captures the model state at env construction (before reset
+        # ever fires), so subsequent ``body_pos`` mutations do NOT
+        # propagate to the GPU model copy. ``qpos`` IS dynamic state,
+        # carried through ``mj_setState(FULLPHYSICS)`` and broadcast to
+        # the warp worlds in ``WarpRolloutMixin._seed_warp_state``, so
+        # the per-episode randomization shows up correctly on the warp
+        # side. ``body_pos[Object]`` now stays at its XML canonical
+        # default (typically [0, 0, 0.035]); ``_obj_body_init_pos`` set
+        # in ``__init__`` reflects that default and the cost/obs code
+        # in ``obs_from_qpos_qvel`` (which sums body_pos + qpos[30:33])
+        # still computes the correct world-aligned ball position.
+        self.data.qpos[30] = np.random.uniform(*_OBJ_X_RANGE)
+        self.data.qpos[31] = np.random.uniform(*_OBJ_Y_RANGE)
+        # qpos[32] (ball z) stays at 0 from mj_resetData; total ball z =
+        # body_pos.z (= 0.035 from XML).
 
-        # Randomise target body position (x,y,z). The site sits at body
-        # origin so it follows automatically; mocap-style writes to body_pos
-        # work for this welded body because mj_forward below propagates the
-        # change into the kinematic tree.
+        # Randomise target body position. Target is read from
+        # ``self._target_pos`` (Python attribute) by every cost / obs
+        # callsite — never via a sensor or mjw-side state — so the warp
+        # GPU model never needs to know about target position. The CPU
+        # ``model.body_pos[target_body]`` mutation is purely for
+        # rendering / kinematics on the CPU executor side.
         self.model.body_pos[self._target_body_id, 0] = np.random.uniform(*_TARGET_X_RANGE)
         self.model.body_pos[self._target_body_id, 1] = np.random.uniform(*_TARGET_Y_RANGE)
         self.model.body_pos[self._target_body_id, 2] = np.random.uniform(*_TARGET_Z_RANGE)
