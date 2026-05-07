@@ -26,7 +26,9 @@ shared. Policy-class-specific branches:
 from __future__ import annotations
 
 import copy
+import csv
 import math
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -576,6 +578,29 @@ class MPPIGPS:
             run_dir = Path(run_dir)
             run_dir.mkdir(parents=True, exist_ok=True)
 
+        # ---- Per-iter CSV log (crash-safe) ---------------------------------
+        # Opened once, header written once, one row per iter with explicit
+        # flush + fsync so a SIGKILL / OOM during iter N still leaves rows
+        # 0..N-1 readable on disk. Uniform schema across runs (NaN for
+        # inactive columns like kl_est when adaptive is off, ema_drift
+        # when EMA is off, etc.) so downstream code can pd.read_csv all
+        # runs without per-run column gymnastics.
+        csv_columns = [
+            "iter", "alpha", "mppi_cost", "distill_loss",
+            "kl_est", "kl_target",
+            "ema_drift", "prev_iter_kl",
+            "buffer_eps", "buffer_rows",
+            "eval_cost", "best_iter", "best_cost",
+        ]
+        csv_file = None
+        csv_writer = None
+        if run_dir is not None:
+            csv_path = run_dir / "gps_log.csv"
+            csv_file = open(csv_path, "w", newline="")
+            csv_writer = csv.DictWriter(csv_file, fieldnames=csv_columns)
+            csv_writer.writeheader()
+            csv_file.flush()
+
         initial_conditions = self._sample_initial_conditions(cfg.num_conditions)
 
         # KL-adaptive α activates only for Gaussian policies — needs σ for
@@ -632,9 +657,12 @@ class MPPIGPS:
             for ic_idx, ic_state in enumerate(initial_conditions):
                 # Fresh prior closure each condition — captures current
                 # policy weights and current alpha.
-                prior_fn = make_policy_prior(
-                    self.policy, self.env, alpha, self._prior_type,
-                )
+                if alpha > 0.0:
+                    prior_fn = make_policy_prior(
+                        self.policy, self.env, alpha, self._prior_type,
+                    )
+                else:
+                    prior_fn = None
 
                 if iteration > 0 and cfg.warm_start_policy:
                     self._warm_start_mppi(ic_state)
@@ -919,5 +947,44 @@ class MPPIGPS:
                 base_line += f"  eval_cost={eval_cost:8.2f}"
             tqdm.write(base_line)
 
+            # ---- Crash-safe per-iter CSV row -------------------------------
+            # Uniform schema: NaN for currently-inactive columns. flush()
+            # + fsync() so a hard kill during iter N+1 still leaves iter N
+            # readable.
+            if csv_writer is not None:
+                if cfg.distill_buffer_cap > 0:
+                    n_eps = len(self._episode_buffer)
+                    n_rows = sum(len(ep["obs"]) for ep in self._episode_buffer)
+                else:
+                    n_eps = float("nan")
+                    n_rows = float("nan")
+                row = {
+                    "iter": iteration,
+                    "alpha": float(alpha),
+                    "mppi_cost": mppi_cost,
+                    "distill_loss": float(loss),
+                    "kl_est": kl_est_iter,
+                    "kl_target": (
+                        float(cfg.kl_target) if use_kl_adaptive_this_iter
+                        else float("nan")
+                    ),
+                    "ema_drift": ema_drift,
+                    "prev_iter_kl": prev_iter_kl_diag,
+                    "buffer_eps": n_eps,
+                    "buffer_rows": n_rows,
+                    "eval_cost": eval_cost,
+                    "best_iter": history.best_iter,
+                    "best_cost": (
+                        history.best_cost
+                        if history.best_cost != float("inf")
+                        else float("nan")
+                    ),
+                }
+                csv_writer.writerow(row)
+                csv_file.flush()
+                os.fsync(csv_file.fileno())
+
         outer_bar.close()
+        if csv_file is not None:
+            csv_file.close()
         return history

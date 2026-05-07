@@ -70,7 +70,28 @@ class WarpRolloutMixin:
     # Setup
     # ------------------------------------------------------------------
 
-    def _init_warp(self, nworld: int) -> None:
+    def _init_warp(
+        self,
+        nworld: int,
+        njmax: int = 256,
+        nconmax: int = 96,
+    ) -> None:
+        """Initialize the Warp rollout side.
+
+        ``njmax`` / ``nconmax`` are **per-world** constraint / contact buffer
+        budgets passed into ``mjw.make_data``. They are NOT inherited from
+        the XML's ``<size njmax=… nconmax=…>`` — mujoco_warp maintains its
+        own per-world buffers separate from the CPU model's. Defaults are
+        tuned for Adroit grasping (which routinely sees 60+ constraint
+        rows when fingers + palm + table are all in contact). Bump if you
+        see "nefc overflow - please increase njmax to N" — pick a value
+        20-30% above the largest N reported, plus headroom for divergent
+        rollouts.
+
+        Memory cost: ``O(njmax * nworld * 8 bytes)`` per per-world buffer.
+        At ``njmax=256, nworld=1024`` that's a couple of MB total — safe
+        to crank well above the reported overflow.
+        """
         # Lazy import — warp / mujoco_warp aren't required for the CPU path.
         # ImportError surfaces clearly to the user with an install hint.
         try:
@@ -88,10 +109,32 @@ class WarpRolloutMixin:
             "Position actuators are fine; muscles are not."
         )
 
+        self._patch_model_for_warp()
+
         self._wp = wp
         self._mjw = mjw
         self._wm = mjw.put_model(self.model)
-        self._wd = mjw.make_data(self.model, nworld=nworld)
+
+        # Try to pass njmax/nconmax explicitly; fall back to model-derived
+        # defaults if this mjw version doesn't accept the kwargs (very
+        # old/very new API drift). The TypeError path keeps the env
+        # constructor working with the default budget so the user gets a
+        # clear runtime error from mjw.step instead of a confusing kwarg
+        # mismatch at construction.
+        try:
+            self._wd = mjw.make_data(
+                self.model, nworld=nworld,
+                njmax=njmax, nconmax=nconmax,
+            )
+        except TypeError:
+            import warnings
+            warnings.warn(
+                "mjw.make_data does not accept njmax/nconmax kwargs in this "
+                "mujoco_warp version — falling back to its default per-world "
+                "buffers. If you hit 'nefc overflow', upgrade mujoco_warp.",
+                stacklevel=3,
+            )
+            self._wd = mjw.make_data(self.model, nworld=nworld)
 
         self._warp_nworld = nworld
         self._warp_H: int | None = None
@@ -102,6 +145,68 @@ class WarpRolloutMixin:
         self._rollout_graph = None
         self._has_mocap = self.model.nmocap > 0
         self._use_warp = True
+
+    # ------------------------------------------------------------------
+    # Compatibility patches
+    # ------------------------------------------------------------------
+
+    def _patch_model_for_warp(self) -> None:
+        """Adjust ``self.model`` in-place to satisfy mujoco_warp's
+        ``put_model`` constraints. Each patch emits a single warning so the
+        change is visible to the user.
+
+        These changes apply to ``self.model`` — the CPU ``env.step`` path
+        also reads from this model, so CPU and warp rollouts stay
+        physics-consistent (otherwise the action *executed* via
+        ``env.step`` would have different physics from the rollout that
+        scored it).
+
+        Patches applied:
+        - ``noslip_iterations``: zeroed. mujoco_warp doesn't implement the
+          noslip post-pass solver. Adroit's XML defaults to 20 iterations.
+          Effect: slightly less accurate sliding-friction handling. For
+          grasp-style contacts (sticky, low slip) this is usually a no-op.
+        - ``geom_margin`` / ``pair_margin``: zeroed where non-zero.
+          mujoco_warp's ``put_model`` rejects geom pairs with non-zero
+          margin under MULTICCD-style processing. Adroit's XML sets
+          ``margin="0.0005"`` on every geom. Effect: contact detection
+          fires only at actual penetration instead of within a 0.5 mm
+          shell. Negligible for a grasping task.
+        """
+        import warnings
+        m = self.model
+
+        if m.opt.noslip_iterations > 0:
+            warnings.warn(
+                f"Disabling noslip solver (was noslip_iterations="
+                f"{m.opt.noslip_iterations}) — mujoco_warp does not implement "
+                "it. Friction on sliding contacts will be slightly less "
+                "accurate; for Adroit grasp rollouts this is usually a no-op "
+                "since contacts are sticky.",
+                stacklevel=4,
+            )
+            m.opt.noslip_iterations = 0
+
+        n_nonzero_geom = int((m.geom_margin > 0).sum())
+        if n_nonzero_geom > 0:
+            max_margin = float(m.geom_margin.max())
+            warnings.warn(
+                f"Zeroing geom_margin on {n_nonzero_geom}/{m.ngeom} geoms "
+                f"(max was {max_margin:.4g} m) — mujoco_warp rejects non-zero "
+                "geom margins under MULTICCD. Contact detection now fires at "
+                "actual penetration; sub-millimetre margins are negligible "
+                "for grasp tasks.",
+                stacklevel=4,
+            )
+            m.geom_margin[:] = 0.0
+
+        if m.npair > 0 and (m.pair_margin > 0).any():
+            warnings.warn(
+                f"Zeroing pair_margin on {int((m.pair_margin > 0).sum())}/"
+                f"{m.npair} explicit contact pairs (same MULTICCD reason).",
+                stacklevel=4,
+            )
+            m.pair_margin[:] = 0.0
 
     # ------------------------------------------------------------------
     # Buffer / graph management

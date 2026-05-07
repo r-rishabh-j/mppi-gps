@@ -40,9 +40,23 @@ from src.envs.warp_rollout import WarpRolloutMixin
 
 
 class AdroitRelocateWarp(WarpRolloutMixin, AdroitRelocate):
-    def __init__(self, nworld: int, frame_skip: int = 5, **kwargs) -> None:
+    def __init__(
+        self,
+        nworld: int,
+        frame_skip: int = 5,
+        njmax: int = 256,
+        nconmax: int = 96,
+        **kwargs,
+    ) -> None:
+        """``njmax`` / ``nconmax`` are **per-world** constraint / contact
+        buffer budgets for the GPU rollout (see WarpRolloutMixin._init_warp
+        for full details). Defaults are tuned for Adroit grasping; bump
+        them if you hit "nefc overflow - please increase njmax to N"
+        (pick e.g. ``int(N * 1.3)`` to leave headroom for divergent
+        rollouts during MPPI sampling).
+        """
         super().__init__(frame_skip=frame_skip, **kwargs)
-        self._init_warp(nworld=nworld)
+        self._init_warp(nworld=nworld, njmax=njmax, nconmax=nconmax)
 
     def batch_rollout(
         self,

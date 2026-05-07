@@ -17,6 +17,8 @@ MPPI runs on CPU (MuJoCo). Policy training uses the device selected by
 from __future__ import annotations
 
 import argparse
+import csv
+import os
 from contextlib import nullcontext as _nullctx
 from datetime import datetime
 from pathlib import Path
@@ -238,11 +240,22 @@ def main() -> None:
     #                             seed=cfg.seed)
     # print(f"MPPI baseline: {mppi_stats['mean_cost']:.2f} ± {mppi_stats['std_cost']:.2f}")
 
-    log_lines: list[str] = [
-        f"# DAgger on {args.env}, device={device}",
-        # f"# MPPI baseline: mean={mppi_stats['mean_cost']:.4f} std={mppi_stats['std_cost']:.4f}",
-        "iter,beta,new_samples,buffer_size,train_mse,val_mse,policy_mean_cost,policy_std_cost",
+    # Per-iter CSV log, opened once, header written once, one row per iter
+    # with explicit flush + fsync so a hard kill (SIGKILL/OOM/reboot) during
+    # iter N+1 still leaves rows 0..N readable on disk. Same crash-safe
+    # pattern as `gps_log.csv`. Uniform schema (NaN for inactive cols)
+    # makes pd.read_csv across runs straightforward.
+    csv_columns = [
+        "iter", "beta", "new_samples", "buffer_size",
+        "train_mse", "val_mse",
+        "policy_mean_cost", "policy_std_cost",
+        "best_iter", "best_cost",
     ]
+    csv_path = run_dir / "dagger_log.csv"
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.DictWriter(csv_file, fieldnames=csv_columns)
+    csv_writer.writeheader()
+    csv_file.flush()
 
     best_iter: int | None = None
     best_cost = float("inf")
@@ -268,12 +281,6 @@ def main() -> None:
             print(f"  policy cost: {eval_stats['mean_cost']:.2f} ± {eval_stats['std_cost']:.2f}  ")
                 #   f"(gap vs MPPI: {eval_stats['mean_cost'] - mppi_stats['mean_cost']:+.2f})")
 
-            log_lines.append(
-                f"{k},{info['beta']:.4f},{info['new_samples']},{info['buffer_size']},"
-                f"{info['train_mse']:.6f},{info['val_mse']:.6f},"
-                f"{eval_stats['mean_cost']:.4f},{eval_stats['std_cost']:.4f}"
-            )
-
             ckpt_path = run_dir / f"iter_{k:02d}.pt"
             save_checkpoint(
                 ckpt_path, policy,
@@ -290,7 +297,26 @@ def main() -> None:
                 best_iter = k
                 copy_as(ckpt_path, run_dir / "best.pt")
 
-        (run_dir / "dagger_log.csv").write_text("\n".join(log_lines))
+        # Crash-safe per-iter row. flush() + fsync() so a hard kill during
+        # iter k+1 still leaves iter k readable on disk.
+        csv_writer.writerow({
+            "iter": k,
+            "beta": info["beta"],
+            "new_samples": info["new_samples"],
+            "buffer_size": info["buffer_size"],
+            "train_mse": info["train_mse"],
+            "val_mse": info["val_mse"],
+            "policy_mean_cost": eval_stats["mean_cost"],
+            "policy_std_cost": eval_stats["std_cost"],
+            "best_iter": best_iter if best_iter is not None else float("nan"),
+            "best_cost": (
+                best_cost if best_cost != float("inf") else float("nan")
+            ),
+        })
+        csv_file.flush()
+        os.fsync(csv_file.fileno())
+
+    csv_file.close()
 
     if last_ckpt_path is not None:
         copy_as(last_ckpt_path, run_dir / "final.pt")

@@ -71,3 +71,27 @@ class Acrobot(MuJoCoEnv):
 
     def _get_obs(self) -> Float[ndarray, "4"]:
         return np.concatenate([self.data.qpos, self.data.qvel])
+
+    def state_to_obs(
+        self,
+        states: np.ndarray,
+        sensordata: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Mirrors ``_get_obs`` but works on (..., nstate) arrays from
+        ``batch_rollout``. The default implementation returns the full
+        nstate vector (which includes the leading time dim → 5-D), so
+        without this override the policy normalizer expects a 5-D obs but
+        ``_get_obs`` produces 4-D (qpos+qvel only) — the source of the
+        "size of tensor a (4) must match the size of tensor b (5)" error.
+        """
+        qpos = self.state_qpos(states)
+        qvel = self.state_qvel(states)
+        return np.concatenate([qpos, qvel], axis=-1)
+
+    @property
+    def obs_dim(self) -> int:
+        # qpos (2) + qvel (2) = 4. Without this override, the inherited
+        # MuJoCoEnv.obs_dim returns _nstate=5 (time + qpos + qvel) and
+        # the policy's input layer is sized wrong for what _get_obs
+        # actually produces.
+        return self._nq + self._nv
