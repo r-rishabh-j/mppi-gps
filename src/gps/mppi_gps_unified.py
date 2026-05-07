@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 from typing import Callable
 
+import h5py
 import numpy as np
 import torch
 from dataclasses import dataclass, field
@@ -44,6 +45,38 @@ from src.policy.gaussian_policy import GaussianPolicy
 from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
 from src.utils.evaluation import evaluate_policy
 from src.utils.experiment import copy_as, save_checkpoint
+
+
+# ---------------------------------------------------------------------------
+# α=0 rollout cache (BC-seed compatible h5 written into the run dir)
+# ---------------------------------------------------------------------------
+# Only fires on iters where the policy prior is inactive (`alpha == 0` at
+# resolved-α time). Schema mirrors `scripts/collect_bc_demos.py` exactly so
+# the file is plug-compatible with `--seed-from` (DAgger), `--demos`
+# (test_sl), and `--init-h5` consumers — i.e. when α is held at 0 for an
+# entire run, the GPS C-step is just MPPI demo collection with extra
+# bookkeeping, and we may as well save the demos for reuse.
+#
+# Datasets (resizable on the M axis):
+#   states     (M, T, obs_dim)   — env._get_obs() at each timestep
+#   actions    (M, T, act_dim)   — executor action (= label when α=0)
+#   costs      (M, T)            — env per-step cost
+#   sensordata (M, T, nsensor)   — only when env exposes non-empty sensors
+# Attrs: env, M, T, obs_dim, act_dim, source="run_gps_alpha0".
+#
+# Crash-safe via `h5_file.flush()` after each iter's append — a hard kill
+# during iter k+1 still leaves all rows from iters 0..k readable.
+
+def _try_capture_sensordata(env) -> np.ndarray | None:
+    """Copy of the helper in `scripts/collect_bc_demos.py`. Returns
+    ``env.data.sensordata`` snapshot or None for envs without it."""
+    data = getattr(env, "data", None)
+    if data is None:
+        return None
+    sd = getattr(data, "sensordata", None)
+    if sd is None or sd.size == 0:
+        return None
+    return sd.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +634,17 @@ class MPPIGPS:
             csv_writer.writeheader()
             csv_file.flush()
 
+        # ---- α=0 rollout h5 cache (lazy-initialised on first α=0 iter) ----
+        # Probe sensordata once to decide whether to allocate per-step
+        # sensor buffers (envs without MuJoCo-style sensors get None and
+        # the dataset is omitted from the file, matching collect_bc_demos).
+        h5_file: h5py.File | None = None
+        h5_cache_path = run_dir / "mppi_rollouts.h5" if run_dir is not None else None
+        nsensor = 0
+        probe_sd = _try_capture_sensordata(self.env)
+        if probe_sd is not None:
+            nsensor = int(probe_sd.shape[-1])
+
         initial_conditions = self._sample_initial_conditions(cfg.num_conditions)
 
         # KL-adaptive α activates only for Gaussian policies — needs σ for
@@ -654,6 +698,35 @@ class MPPIGPS:
                 unit="step",
                 leave=False,
             )
+
+            # α=0 rollout cache: this iter contributes rows to the h5 only
+            # when the prior is inactive (executor MPPI is the same as
+            # plain MPPI). Pre-allocate fixed-shape (num_conditions, T, ...)
+            # iter buffers so the per-step capture below is a cheap
+            # indexed assign; appended to the h5 once after the C-step.
+            cache_iter = (alpha == 0.0) and (run_dir is not None)
+            if cache_iter:
+                iter_states = np.zeros(
+                    (cfg.num_conditions, cfg.episode_length, self.env.obs_dim),
+                    dtype=np.float32,
+                )
+                iter_actions = np.zeros(
+                    (cfg.num_conditions, cfg.episode_length, self.env.action_dim),
+                    dtype=np.float32,
+                )
+                iter_costs = np.zeros(
+                    (cfg.num_conditions, cfg.episode_length), dtype=np.float32,
+                )
+                iter_sensors = (
+                    np.zeros(
+                        (cfg.num_conditions, cfg.episode_length, nsensor),
+                        dtype=np.float32,
+                    )
+                    if nsensor > 0 else None
+                )
+            else:
+                iter_states = iter_actions = iter_costs = iter_sensors = None
+
             for ic_idx, ic_state in enumerate(initial_conditions):
                 # Fresh prior closure each condition — captures current
                 # policy weights and current alpha.
@@ -692,6 +765,16 @@ class MPPIGPS:
                 for t in range(cfg.episode_length):
                     state = self.env.get_state()
                     obs = self.env._get_obs()
+
+                    # α=0 cache: capture sensordata BEFORE plan_step, while
+                    # `env.data` is still the live pre-action state. plan_step
+                    # does batched rollouts that mutate scratch buffers, and
+                    # env.step advances to t+1 — both would misalign the saved
+                    # row. (Mirrors collect_bc_demos.)
+                    if cache_iter and iter_sensors is not None:
+                        sd = _try_capture_sensordata(self.env)
+                        if sd is not None:
+                            iter_sensors[ic_idx, t] = sd
 
                     # Executor: MPPI with the policy prior. Steers the env.
                     action_exec, _info = self.mppi.plan_step(state, prior=prior_fn)
@@ -735,6 +818,16 @@ class MPPIGPS:
 
                     _, cost, done, _ = self.env.step(action_exec)
                     episode_cost += cost
+
+                    # α=0 cache: row-aligned with the (state, sensordata)
+                    # captured above. Action stored is the executed one
+                    # (= action_label when α=0, since dagger_relabel only
+                    # fires when alpha > 0).
+                    if cache_iter:
+                        iter_states[ic_idx, t] = obs
+                        iter_actions[ic_idx, t] = action_exec
+                        iter_costs[ic_idx, t] = cost
+
                     c_bar.update(1)
 
                     if done and t < cfg.episode_length - 1:
@@ -769,6 +862,55 @@ class MPPIGPS:
                     last_cost=f"{episode_cost:.1f}",
                 )
             c_bar.close()
+
+            # ========== α=0 rollout cache append ==========
+            # Lazily create the h5 on the FIRST α=0 iter so we don't leave
+            # an empty file behind for runs that never hit α=0. Append this
+            # iter's `cfg.num_conditions` rollouts as new rows; resize the
+            # M axis on each subsequent append. flush() per iter for
+            # crash-safety.
+            if cache_iter:
+                T = cfg.episode_length
+                M_iter = cfg.num_conditions
+                if h5_file is None:
+                    h5_file = h5py.File(h5_cache_path, "w")
+                    h5_file.create_dataset(
+                        "states", data=iter_states,
+                        maxshape=(None, T, self.env.obs_dim), chunks=True,
+                    )
+                    h5_file.create_dataset(
+                        "actions", data=iter_actions,
+                        maxshape=(None, T, self.env.action_dim), chunks=True,
+                    )
+                    h5_file.create_dataset(
+                        "costs", data=iter_costs,
+                        maxshape=(None, T), chunks=True,
+                    )
+                    if iter_sensors is not None:
+                        h5_file.create_dataset(
+                            "sensordata", data=iter_sensors,
+                            maxshape=(None, T, nsensor), chunks=True,
+                        )
+                    h5_file.attrs["env"] = type(self.env).__name__
+                    h5_file.attrs["T"] = T
+                    h5_file.attrs["obs_dim"] = self.env.obs_dim
+                    h5_file.attrs["act_dim"] = self.env.action_dim
+                    h5_file.attrs["M"] = M_iter
+                    h5_file.attrs["source"] = "run_gps_alpha0"
+                else:
+                    n0 = h5_file["states"].shape[0]
+                    n1 = n0 + M_iter
+                    h5_file["states"].resize((n1, T, self.env.obs_dim))
+                    h5_file["states"][n0:n1] = iter_states
+                    h5_file["actions"].resize((n1, T, self.env.action_dim))
+                    h5_file["actions"][n0:n1] = iter_actions
+                    h5_file["costs"].resize((n1, T))
+                    h5_file["costs"][n0:n1] = iter_costs
+                    if iter_sensors is not None and "sensordata" in h5_file:
+                        h5_file["sensordata"].resize((n1, T, nsensor))
+                        h5_file["sensordata"][n0:n1] = iter_sensors
+                    h5_file.attrs["M"] = n1
+                h5_file.flush()
 
             # ========== S-STEP ==========
             # train() so Dropout + LayerNorm-running-stats behave correctly
@@ -987,4 +1129,6 @@ class MPPIGPS:
         outer_bar.close()
         if csv_file is not None:
             csv_file.close()
+        if h5_file is not None:
+            h5_file.close()
         return history
