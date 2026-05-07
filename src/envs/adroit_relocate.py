@@ -182,7 +182,7 @@ _THUMB_PROXIMITY_SCALE = 0.10  # σ in metres; ~2× the grip proximity gate
 # Object qvel[30:] is always excluded — moving the ball IS the task.
 # Set both to 0.0 to disable. Tune up arm penalty if reaches still look
 # jerky; tune up finger penalty only if fingers visibly twitch.
-_ARM_VEL_PENALTY = 0.05      # qvel[:6]   — ARTx/y/z, ARRx/y/z
+_ARM_VEL_PENALTY = 0.05     # qvel[:6]   — ARTx/y/z, ARRx/y/z
 _FINGER_VEL_PENALTY = 0.005  # qvel[6:30] — 24 hand joints
 
 # ---- Control-magnitude penalty (arm only) ----
@@ -194,7 +194,7 @@ _FINGER_VEL_PENALTY = 0.005  # qvel[6:30] — 24 hand joints
 # that briefly slams the arm to its joint limits. Set to 0.0 to disable.
 # Hand controls intentionally excluded — finger commands need to span
 # their range freely to grasp.
-_ARM_CTRL_PENALTY = 0.02
+_ARM_CTRL_PENALTY = 0.2
 
 
 class AdroitRelocate(MuJoCoEnv):
@@ -420,7 +420,7 @@ class AdroitRelocate(MuJoCoEnv):
             reward
             - ( _ARM_VEL_PENALTY * arm_v2
             + _FINGER_VEL_PENALTY * finger_v2
-            + _ARM_CTRL_PENALTY * arm_u2 )
+            + _ARM_CTRL_PENALTY * arm_u2*10 )
         )
 
         return -reward
