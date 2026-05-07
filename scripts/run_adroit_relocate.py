@@ -60,12 +60,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true",
                         help="interactive viewer instead of recording")
+    parser.add_argument("--warp", action="store_true",
+                        help="Use mujoco_warp GPU batch rollout for MPPI. "
+                             "Requires `uv pip install warp-lang mujoco-warp` "
+                             "and an NVIDIA GPU with CUDA (graph replay is "
+                             "the speedup; macOS / non-CUDA hosts should "
+                             "stick with the CPU path).")
     add_seed_arg(parser, default=400)
     args = parser.parse_args()
     seed_everything(args.seed)
 
-    env = AdroitRelocate()
+    # MPPI cfg first — `nworld` for the warp env must match `cfg.K`.
     cfg = MPPIConfig.load("adroit_relocate")
+    if args.warp:
+        from src.envs.adroit_relocate_warp import AdroitRelocateWarp
+        env = AdroitRelocateWarp(nworld=cfg.K)
+    else:
+        env = AdroitRelocate()
     controller = MPPI(env, cfg)
 
     dt = env.model.opt.timestep * env._frame_skip

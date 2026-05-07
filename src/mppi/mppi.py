@@ -49,6 +49,14 @@ class MPPI:
         self._last_states = None
         self._last_actions = None
         self._last_weights = None
+        # Same K-vector as `_last_weights` but re-softmin'd over `S − track`
+        # — i.e. the weights MPPI WOULD have produced without the policy
+        # prior contribution. Used by GPS's KL-adaptive α to measure the
+        # gap between the *unbiased* teacher distribution and the global
+        # policy (the biased weights are a poor signal: they collapse to π
+        # by construction as α grows, so KL → 0 mechanically). When the
+        # call had no prior, this equals `_last_weights`.
+        self._last_unbiased_weights = None
         self._last_costs = None
         self._last_sensordata = None
 
@@ -213,6 +221,18 @@ class MPPI:
         self._last_states = states
         self._last_actions = U_clipped
         self._last_weights = weights
+        # Unbiased weights: re-softmin without the prior contribution.
+        # `track` is the per-sample policy-prior cost (None when no prior was
+        # passed). Subtracting it from S recovers the cost-only posterior, so
+        # the weighted-sample mean/var consumers compute reflects the *true*
+        # MPPI teacher rather than its prior-pulled-toward-policy variant.
+        # Cheap: a single softmin over an existing K-vector (no rollouts).
+        if track is not None:
+            self._last_unbiased_weights, _ = self._softmin_weights(
+                S - track, lam,
+            )
+        else:
+            self._last_unbiased_weights = weights
         self._last_costs = costs
         self._last_sensordata = sensordata
 

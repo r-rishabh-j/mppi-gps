@@ -18,6 +18,48 @@ python -m scripts.run_adroit_relocate # 30-DoF Adroit arm+hand pick-and-place
 python -m scripts.run_mppi           # generic entry
 ```
 
+## GPU rollouts via Warp (`--warp`)
+
+`adroit_relocate` has a `mujoco_warp`-backed batch rollout that runs MPPI's
+K trajectory rollouts on GPU instead of the CPU thread pool. The whole
+`H`-step rollout is captured into a CUDA graph on the first call and replayed
+thereafter — that's where the speedup comes from. Same cost / observations /
+sensors as the CPU path; only `batch_rollout` is replaced.
+
+**Install** (NVIDIA GPU + CUDA required for the graph-replay speedup):
+```bash
+uv pip install warp-lang mujoco-warp
+```
+
+**Standalone MPPI run:**
+```bash
+python -m scripts.run_adroit_relocate --warp                # opt-in flag
+```
+
+**GPS / DAgger:** the GPS script gates everything behind a single flag and
+pins `nworld = MPPIConfig.K` automatically:
+```bash
+python -m scripts.run_gps --env adroit_relocate --auto-reset \
+    --warp --gps-iters 40 --device auto --policy-prior mean_distance
+```
+
+Files:
+- `src/envs/warp_rollout.py` — `WarpRolloutMixin` (general; supports mocap).
+- `src/envs/adroit_relocate_warp.py` — `AdroitRelocateWarp(WarpRolloutMixin, AdroitRelocate)`.
+- `src/envs/__init__.py` — `make_env(name, use_warp=True, nworld=K)` dispatches.
+
+Constraints:
+- Only `adroit_relocate` has a Warp variant currently. Other envs raise
+  on `--warp`. Adding one for any `na==0` env is a ~10-line subclass.
+- `nworld` is **fixed at construction**. Changing MPPI's `K` (e.g. via a
+  config edit) means re-running the script — re-instantiation handles it.
+- Graph replay is CUDA-specific. macOS / non-NVIDIA hosts should stick
+  with the default CPU path; the code lazy-imports `warp` so the CPU
+  path doesn't need it installed.
+- The Warp path doesn't track sim time (`state[..., 0] = 0`). No cost or
+  obs function in this codebase reads time, so this is invisible — but
+  any future code that does will need to be aware.
+
 ## Behavior cloning (one-shot)
 
 Two-step pipeline: **collect** MPPI demos to `data/<env>_bc.h5` (cached —
@@ -205,36 +247,44 @@ python -m scripts.run_gps --env adroit_relocate --auto-reset \
 | `--alpha-warmup-iters N` | iters over which α ramps from `--alpha-start` to `--alpha` |
 | `--alpha-start S` | starting α (default 0.0) |
 
-**Mode 3 — MDGPS-style KL-adaptive α** (Gaussian policies only). `α` becomes a *dual variable* auto-adjusted each iter to maintain a target KL between MPPI's local-policy distribution and the global policy:
+**Mode 3 — KL-adaptive α with the unbiased teacher operand** (Gaussian policies only). `α` becomes a *dual variable* auto-adjusted each iter to track a target KL between MPPI's **unbiased** teacher distribution (cost-only posterior, prior stripped from the importance weights) and the global policy:
 
 ```
-kl_est = E_state[ KL(N(μ_p(s), σ_p²(s)) ‖ π_θ(·|s)) ]
-α ← α · kl_step_rate    if kl_est > kl_target  (tighten — pull MPPI back to π)
-α ← α / kl_step_rate    if kl_est < kl_target  (loosen — let MPPI explore)
+kl_est = E_state[ KL(N(μ_p(s), σ_p²(s)) ‖ π_θ(·|s)) ]      # μ_p, σ_p² re-weighted by S − track
+α ← α / kl_step_rate    if kl_est > kl_target  (policy is bad; let MPPI explore)
+α ← α · kl_step_rate    if kl_est < kl_target  (policy matches teacher; lean on it)
 ```
 
-Per Montgomery & Levine (NIPS 2016), this is approximate mirror descent with per-iter improvement bounds — and breaks the "MPPI-trapped-in-bad-policy" failure mode by construction (when policy is bad, kl_est is small → α shrinks → MPPI explores → buffer fills with unbiased data → policy improves).
+Note the **inverted update direction** vs vanilla MDGPS: with the unbiased operand, large `kl_est` means "policy is far from the cost-optimal teacher" → we want MPPI to ignore the prior and explore. With the biased operand the direction would flip, but that variant has a degenerate fixed point (biased MPPI → π_θ by construction as α → ∞, so KL → 0 mechanically regardless of policy quality). Stripping the prior breaks the self-reference and gives a meaningful "policy bad → small α → escape" loop.
 
 ```bash
+# Adroit (30-D) — target ≈ act_dim × 0.05 ≈ 1.5
 python -m scripts.run_gps --env adroit_relocate --auto-reset \
-    --kl-target 0.1 \                # the target per-state KL
-    --alpha 0.05 \                   # used only to seed α at end of warmup
+    --kl-target 1.5 \                # per-state KL summed over action dims
+    --alpha 0.05 \                   # seeds α at end of warmup
     --alpha-warmup-iters 5 \         # adaptive rule activates at iter 5
     --alpha-schedule smoothstep --alpha-start 0 \   # warmup ramp shape
     --gps-iters 40 --device auto --policy-prior mean_distance
+
+# Low-D toy (acrobot 1-D, hopper 3-D) — much smaller target
+python -m scripts.run_gps --env acrobot --kl-target 0.1 \
+    --alpha 0.05 --alpha-warmup-iters 3 --gps-iters 30 --device auto
 ```
 
 | flag | default | meaning |
 |---|---|---|
-| `--kl-target T` | 0.0 (off) | per-state KL target. Typical 0.05 — 0.5 (sums over action dims). Set > 0 to enable adaptive mode |
+| `--kl-target T` | 0.0 (off) | per-state KL target **summed over action dims** — scale with act_dim. Rule of thumb `act_dim × 0.05`: ~0.1 for acrobot (2-D), ~0.3 for cheetah (6-D), ~1.5 for adroit_relocate (30-D). Set > 0 to enable adaptive mode |
 | `--kl-alpha-min` | 0.001 | lower bound on the dual α (allows multiplicative escape) |
-| `--kl-alpha-max` | 1.0 | upper bound on the dual α (prevents runaway) |
+| `--kl-alpha-max` | 0.5 | upper bound on the dual α. α ≫ 0.1 typically crushes MPPI's exploration regardless of the constraint, so growing past 0.5 is rarely productive |
 | `--kl-step-rate` | 1.5 | multiplicative update rate per iter; 2.0+ for faster escape from sticky regimes |
+| `--kl-sigma-floor-frac` | 0.5 | floor on σ_p (local-policy std) in the KL estimator, expressed as a fraction of MPPI's proposal std. Prevents `log(σ_θ/σ_p)` from exploding when MPPI's softmin concentrates onto a few samples (var_p → 0). 0 disables the floor (legacy: clamp at 1e-6, biases kl_est upward by tens of nats per state) |
 
 Notes:
+- **Per-state KL is summed over action dims** — `kl_target=0.1` is meaningless on 30-D Adroit (would need `kl_est` ≈ 0.003 per dim, which never happens in practice with MPPI's softmin). Use the per-dim rule of thumb above.
 - The schedule (mode 2) is used **during the warmup window** — `--alpha-warmup-iters` iterations of standard schedule behavior. After warmup, the KL-adaptive rule takes over and the schedule fields become inert.
 - KL-adaptive is **Gaussian-only** (needs σ for the closed-form Gaussian KL). Silently falls back to schedule under `--deterministic`.
 - Per-iter `α`, `kl_est`, target are printed to the tqdm postfix and the per-iter line so you can watch the dual variable adapt.
+- **If `kl_est` is stuck at hundreds of nats and α saturates at the cap**, the σ_p collapse is dominating — make sure `--kl-sigma-floor-frac` is at its default 0.5 (not 0). With the floor active, `kl_est` for a 30-D env should land in the 1–30 range when the policy and MPPI are reasonably aligned.
 
 ## Evaluate a saved checkpoint
 

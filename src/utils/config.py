@@ -215,42 +215,76 @@ class GPSConfig:
     alpha_warmup_iters: int = 0     # ramp duration (in GPS iters); 0 disables
     alpha_start: float = 0.0        # starting α (typically 0.0)
 
-    # ---- KL-adaptive α (MDGPS-style dual variable) ------------------------
+    # ---- KL-adaptive α (MDGPS-style dual variable, unbiased operand) ------
     # When kl_target > 0 (and policy is Gaussian), the trainer treats α as
     # a DUAL VARIABLE auto-adjusted each iter to maintain a target KL
-    # divergence between MPPI's local-policy distribution and the global
-    # policy. The schedule fields above are used only during the warmup
-    # window (`alpha_warmup_iters`); after that, the KL-adaptive rule
-    # takes over and `alpha_schedule` / `policy_augmented_alpha` /
+    # divergence between MPPI's *unbiased* teacher distribution and the
+    # global policy. The schedule fields above are used only during the
+    # warmup window (`alpha_warmup_iters`); after that, the KL-adaptive
+    # rule takes over and `alpha_schedule` / `policy_augmented_alpha` /
     # `alpha_start` are ignored.
     #
     # Algorithm (per GPS iter, after the C-step):
     #   kl_est = E_state[ KL(N(μ_p(s), σ_p²(s)) || π_θ(·|s)) ]
     # where (μ_p, σ_p²) is the weighted mean/var of MPPI's first-step
-    # action samples at each visited state. Then dual gradient ascent in
-    # log-α space:
-    #   α ← α · kl_step_rate    if kl_est > kl_target  (tighten — pull MPPI back)
-    #   α ← α / kl_step_rate    if kl_est < kl_target  (loosen — let MPPI explore)
+    # action samples re-weighted by the COST-ONLY posterior (the prior
+    # contribution is stripped from the importance weights — see
+    # `MPPI._last_unbiased_weights`). Then dual gradient update in
+    # log-α space, INVERTED relative to the biased-operand variant:
+    #   α ← α / kl_step_rate    if kl_est > kl_target  (let MPPI escape a bad policy)
+    #   α ← α · kl_step_rate    if kl_est < kl_target  (lean on policy when it matches teacher)
     #   α ← clip(α, kl_alpha_min, kl_alpha_max)
     #
+    # Why this direction: with the *unbiased* operand, large `kl_est`
+    # means "policy is far from the cost-optimal teacher" — i.e. the
+    # policy is bad. We want MPPI to ignore it and explore (small α).
+    # With the *biased* operand the direction would be the opposite, but
+    # that variant has a degenerate fixed point: as α → ∞, biased MPPI
+    # → π_θ by construction so KL → 0 mechanically, regardless of policy
+    # quality. Stripping the prior breaks the self-reference.
+    #
     # Why: replaces the manual α + schedule tuning with a data-driven
-    # rule. Per the MDGPS paper (Montgomery & Levine, NeurIPS 2016), this
-    # is approximate mirror descent in policy space with per-iter
-    # improvement bounds. For our specific "MPPI-trapped-in-bad-policy"
-    # failure mode: when the policy is bad, MPPI's cost-optimal local
-    # distribution matches it tightly → kl_est is small → α shrinks →
-    # MPPI explores more freely next iter → finds lift trajectories →
-    # buffer fills with unbiased data → policy improves. The trap breaks
-    # by construction.
+    # rule. For the "MPPI-trapped-in-bad-policy" failure mode: bad policy
+    # → kl_unbiased large → α shrinks → MPPI explores freely next iter →
+    # finds lift trajectories → buffer fills with unbiased data → policy
+    # improves → kl_unbiased shrinks → α can grow → executor stabilises
+    # around the now-good policy. The trap breaks by construction.
     #
     # 0 = disabled (default; standard schedule path).
-    # Typical: 0.05 — 0.5 (per-state KL summed over action dims).
+    # ``kl_target`` is the per-state KL **summed over action dims** — so
+    # high-DoF envs need proportionally larger targets. A useful rule of
+    # thumb is ``act_dim × 0.05`` (≈ "policy mean within 0.3 σ_θ of MPPI
+    # per dim, on average"):
+    #     point_mass / acrobot (2-D)        ≈ 0.10
+    #     hopper (3-D)                       ≈ 0.15
+    #     half_cheetah (6-D)                 ≈ 0.30
+    #     adroit_pen / adroit_relocate (24/30-D) ≈ 1.2 — 1.5
+    # Below ``act_dim × 0.05`` the dual update tends to saturate at
+    # ``kl_alpha_max`` and the KL constraint becomes effectively
+    # unsatisfiable (see ``kl_sigma_floor_frac`` for the σ_p collapse
+    # that aggravates this).
     # Implemented Gaussian-only — needs σ from the policy for the closed-
     # form KL. Silently ignored under --deterministic.
     kl_target: float = 0.0
     kl_alpha_min: float = 0.001    # lower bound on dual α (allows multiplicative escape)
-    kl_alpha_max: float = 1.0      # upper bound (prevents runaway)
+    kl_alpha_max: float = 0.5      # upper bound (prevents runaway). 0.5 is
+                                   # a conservative cap; α ≫ 0.1 typically
+                                   # crushes MPPI's exploration regardless
+                                   # of the KL constraint, so growing past
+                                   # it is rarely productive.
     kl_step_rate: float = 1.5      # multiplicative update rate per iter
+    # Per-dim lower bound on the **local policy** std σ_p, expressed as a
+    # fraction of MPPI's proposal std (``cfg.noise_sigma * env.noise_scale``,
+    # in normalized action space ≈ ``cfg.noise_sigma``). When MPPI's softmin
+    # concentrates onto a few samples, the weighted-sample variance crashes
+    # toward zero and ``log(σ_θ/σ_p)`` in the closed-form Gaussian KL
+    # explodes, biasing ``kl_est`` upward by tens-to-hundreds of nats per
+    # state regardless of mean alignment. Flooring σ_p at e.g. 0.5 × the
+    # proposal std encodes a sensible "the policy will face proposal noise
+    # during execution, so its local distribution is at least that wide"
+    # prior. 0 disables the floor (legacy behaviour: estimator clamps at
+    # 1e-6 and returns near-pathological KL whenever ESS is low).
+    kl_sigma_floor_frac: float = 0.5
 
     # PPO-style probability ratio clip for the Gaussian S-step surrogate
     # in `mppi_gps_unified._train_step_ppo_clip`. 0.0 = disabled (default;

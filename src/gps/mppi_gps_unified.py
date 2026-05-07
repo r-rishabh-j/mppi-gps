@@ -91,6 +91,7 @@ def estimate_kl_p_to_policy(
     mu_p_phys: np.ndarray,
     var_p_phys: np.ndarray,
     policy: GaussianPolicy,
+    sigma_p_floor_norm: float | np.ndarray = 0.05,
 ) -> float:
     """E_state[ KL(N(μ_p, σ_p²) ‖ π_θ(·|s)) ] over visited states.
 
@@ -100,6 +101,18 @@ def estimate_kl_p_to_policy(
     is on, so we move μ_p and σ_p into normalized space before evaluating
     the closed-form Gaussian KL — same reason the distill loss normalizes
     its labels (the network's μ_θ and σ_θ live there).
+
+    ``sigma_p_floor_norm`` (scalar or per-dim, in NORMALIZED action space)
+    bounds σ_p from below. Critical because MPPI's importance weights can
+    become near-one-hot when a single sample dominates the softmin (low
+    effective sample size), driving the weighted variance toward zero. A
+    log(σ_θ/σ_p) term then explodes regardless of mean alignment, which
+    biases ``kl_est`` upward by tens-to-hundreds of nats per state and
+    makes the dual update saturate at ``kl_alpha_max`` even when the
+    distributions are reasonably aligned. The floor encodes "the local
+    policy is at least as wide as a fraction of MPPI's proposal noise" —
+    which is honest, since the policy will face that proposal noise during
+    execution.
 
     Diagonal-Gaussian assumption (no off-diagonals in the local-policy
     covariance — fine for a per-dim variance estimate from MPPI samples).
@@ -119,9 +132,11 @@ def estimate_kl_p_to_policy(
         mu_p = mu_p_phys
         var_p = var_p_phys
 
-    # Floor on σ_p so an extremely concentrated MPPI softmin doesn't
-    # produce log(0) — happens when one sample dominates the weights.
-    sigma_p = np.sqrt(np.maximum(var_p, 1e-12))
+    # Floor on σ_p prevents a near-one-hot MPPI weight distribution from
+    # collapsing weighted-sample variance to ~0 (would otherwise blow up
+    # log(σ_θ/σ_p)). 1e-12 → tens of nats per dim of bias — see docstring.
+    floor = np.asarray(sigma_p_floor_norm, dtype=var_p.dtype) ** 2
+    sigma_p = np.sqrt(np.maximum(var_p, floor))
 
     # KL(N(μ_p, σ_p²) ‖ N(μ_θ, σ_θ²)) per dim, summed across action dims:
     #   = log(σ_θ/σ_p) + (σ_p² + (μ_p − μ_θ)²) / (2 σ_θ²)  − 0.5
@@ -139,18 +154,28 @@ def update_alpha_kl_adaptive(
     kl_est: float,
     cfg: GPSConfig,
 ) -> float:
-    """Multiplicative dual gradient update on the KL constraint.
+    """Multiplicative dual update — but with the unbiased KL operand the
+    direction is inverted relative to vanilla MDGPS.
 
-    α grows when MPPI strayed too far from the policy (kl_est > target),
-    shrinks when it's clamped close. Update is in log-α space (i.e.
-    multiplicative in α-space) so the symmetric step rate has the same
-    effect in both directions. Clipped to [kl_alpha_min, kl_alpha_max]
-    to avoid degenerate fixed points.
+    `kl_est` here is ``E_state[ KL(p_unbiased ‖ π_θ) ]`` — the gap
+    between the *unbiased* MPPI teacher and the global policy. Large
+    `kl_est` ⇒ policy is bad ⇒ we want the executor MPPI to **ignore**
+    the policy prior and explore freely so the C-step gathers unbiased
+    data. Hence:
+
+      kl_est > target ⇒ SHRINK α (let MPPI escape the bad policy)
+      kl_est < target ⇒ GROW α   (policy is reliable; lean on it more)
+
+    Contrast with the biased-operand variant, where α would grow to pull
+    biased MPPI ever closer to π_θ regardless of policy quality — a fixed
+    point of "MPPI shadows policy", not "policy improves". Multiplicative
+    in α-space (symmetric in log-α). Clipped to [kl_alpha_min,
+    kl_alpha_max] to avoid degenerate fixed points.
     """
     if kl_est > cfg.kl_target:
-        new = alpha * cfg.kl_step_rate
-    else:
         new = alpha / cfg.kl_step_rate
+    else:
+        new = alpha * cfg.kl_step_rate
     return float(np.clip(new, cfg.kl_alpha_min, cfg.kl_alpha_max))
 
 
@@ -647,8 +672,15 @@ class MPPIGPS:
                     # action distribution. weighted mean / variance over
                     # the K samples; only collected on full-replan steps
                     # (open-loop follow-up calls don't refresh _last_*).
+                    #
+                    # Use UNBIASED weights (cost-only posterior, prior
+                    # contribution stripped) — measures the true
+                    # teacher-student gap. The biased weights would
+                    # collapse to π_θ by construction as α grows, making
+                    # the dual update self-referential. See
+                    # ``MPPI._last_unbiased_weights``.
                     if use_kl_adaptive_this_iter and _info.get("replanned", True):
-                        ws = self.mppi._last_weights
+                        ws = self.mppi._last_unbiased_weights
                         first_actions = self.mppi._last_actions[:, 0, :]   # (K, act_dim)
                         mu_p = (ws[:, None] * first_actions).sum(axis=0)
                         var_p = (
@@ -779,6 +811,23 @@ class MPPIGPS:
             # checkpointed and used as next iter's prior.
             kl_est_iter = float("nan")
             if use_kl_adaptive_this_iter and kl_obs_buf:
+                # σ_p floor in NORMALIZED action space. MPPI's per-dim
+                # proposal std is ``cfg.noise_sigma * env.noise_scale``;
+                # divided by ``policy._act_scale`` (also a per-dim
+                # half-range) it reduces to roughly ``cfg.noise_sigma`` —
+                # a scalar in normalized space when noise_scale matches
+                # the action-bound half-range (true for Adroit). Frac
+                # 0 disables flooring (legacy 1e-6 behaviour).
+                if cfg.kl_sigma_floor_frac > 0.0:
+                    if self.policy._has_act_norm:
+                        scale_np = self.policy._act_scale.detach().cpu().numpy()
+                        sigma_p_floor = (
+                            self.mppi.sigma * cfg.kl_sigma_floor_frac / scale_np
+                        )
+                    else:
+                        sigma_p_floor = self.mppi.sigma * cfg.kl_sigma_floor_frac
+                else:
+                    sigma_p_floor = 1e-6
                 with self.policy.ema_swapped_in():
                     self.policy.eval()
                     kl_est_iter = estimate_kl_p_to_policy(
@@ -786,6 +835,7 @@ class MPPIGPS:
                         np.stack(kl_mu_p_buf),
                         np.stack(kl_var_p_buf),
                         self.policy,
+                        sigma_p_floor_norm=sigma_p_floor,
                     )
                 self._kl_alpha = update_alpha_kl_adaptive(alpha, kl_est_iter, cfg)
 

@@ -1,0 +1,214 @@
+"""GPU-backed `batch_rollout` for MuJoCo envs via NVIDIA Warp + mujoco_warp.
+
+Drop-in mixin: any class inheriting `WarpRolloutMixin` alongside a
+`MuJoCoEnv`-shaped class can call `_init_warp(nworld=K)` after the parent
+`__init__`, then `_batch_rollout_warp(state, U)` returns the same
+`(states, costs, sensordata)` tuple as the CPU path.
+
+Adapted from upstream `jaiselsingh1/mppi-gps/src/envs/mujoco_env.py`,
+generalized to support models with mocap bodies (Adroit's target).
+
+----------------------------------------------------------------------
+Constraints (asserted in `_init_warp`)
+----------------------------------------------------------------------
+- ``model.na == 0`` — actuators with state (e.g. muscles) unsupported.
+  All envs in this repo (acrobot, hopper, half_cheetah, adroit_pen,
+  adroit_relocate) satisfy this; muscles would need a separate path.
+- ``nworld`` is fixed at construction. To change MPPI's K, re-instantiate
+  the env. (mujoco_warp's per-world buffers are pre-allocated.)
+- ``(K, H)`` pairing is captured into a CUDA graph on the first call.
+  Changing H invalidates the graph; the mixin handles this by reallocating
+  buffers and re-capturing on the next call. K is fixed (see above).
+- Hardware: warp + mujoco_warp can theoretically run on CPU, but graph
+  capture / replay (the speedup) is **CUDA-only**. On macOS or any
+  non-NVIDIA host this path will either fall back to CPU (slow, no graph)
+  or fail at `wp.ScopedCapture` — use the default CPU rollout instead.
+
+----------------------------------------------------------------------
+State layout returned
+----------------------------------------------------------------------
+``states.shape == (K, H, 1 + nq + nv)``, layout ``[time=0, qpos, qvel]``.
+Identical to ``mj_getState(FULLPHYSICS)`` for envs with ``na==0`` (where
+time + qpos + qvel exhausts the FULLPHYSICS state). All `state_qpos` /
+`state_qvel` indexing in the codebase keeps working unchanged. The only
+divergence is ``time`` — the warp path doesn't track sim time, so it
+reports 0. None of our cost or obs functions read state[..., 0], so this
+is invisible.
+
+----------------------------------------------------------------------
+Mocap handling (Adroit-relevant)
+----------------------------------------------------------------------
+Mocap pose is **static during a rollout** — set by `env.reset()` and not
+updated during stepping (it's a configuration, not a state). Per rollout,
+we broadcast `data.mocap_pos` / `data.mocap_quat` from the CPU model to
+all `nworld` GPU worlds so collision geometry attached to mocap bodies
+(Adroit's target site, containment walls anchored to mocap) sees the
+right configuration. `mj_getState(FULLPHYSICS)` does NOT carry mocap, so
+this has to be re-broadcast on every `_batch_rollout_warp` call.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+
+class WarpRolloutMixin:
+    """Adds a Warp-backed `_batch_rollout_warp` to a MuJoCoEnv subclass.
+
+    Subclass usage:
+        class MyEnvWarp(WarpRolloutMixin, MyEnv):
+            def __init__(self, nworld, **kw):
+                super().__init__(**kw)
+                self._init_warp(nworld=nworld)
+            def batch_rollout(self, state, actions):
+                return self._batch_rollout_warp(state, actions)
+
+    Inherits `self.model`, `self.data`, `self._frame_skip`,
+    `self.running_cost`, `self.terminal_cost` from the MuJoCoEnv parent.
+    """
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def _init_warp(self, nworld: int) -> None:
+        # Lazy import — warp / mujoco_warp aren't required for the CPU path.
+        # ImportError surfaces clearly to the user with an install hint.
+        try:
+            import warp as wp
+            import mujoco_warp as mjw
+        except ImportError as e:
+            raise ImportError(
+                "Warp rollout requires `warp-lang` and `mujoco-warp`. "
+                "Install with: `uv pip install warp-lang mujoco-warp` "
+                "(NVIDIA GPU + CUDA required for graph-replay speedup)."
+            ) from e
+
+        assert self.model.na == 0, (
+            f"warp path requires na==0 (no actuator state); got na={self.model.na}. "
+            "Position actuators are fine; muscles are not."
+        )
+
+        self._wp = wp
+        self._mjw = mjw
+        self._wm = mjw.put_model(self.model)
+        self._wd = mjw.make_data(self.model, nworld=nworld)
+
+        self._warp_nworld = nworld
+        self._warp_H: int | None = None
+        self._qpos_buf = None
+        self._qvel_buf = None
+        self._sensor_buf = None
+        self._actions_wp = None
+        self._rollout_graph = None
+        self._has_mocap = self.model.nmocap > 0
+        self._use_warp = True
+
+    # ------------------------------------------------------------------
+    # Buffer / graph management
+    # ------------------------------------------------------------------
+
+    def _ensure_warp_buffers(self, K: int, H: int) -> None:
+        """(Re)allocate (H, K, *) buffers; invalidate captured graph if H changed."""
+        if K != self._warp_nworld:
+            raise RuntimeError(
+                f"nworld fixed at construction ({self._warp_nworld}); got K={K}. "
+                "Re-instantiate the env with nworld=K."
+            )
+        if self._warp_H == H:
+            return
+        wp = self._wp
+        m = self.model
+        # (H, K, *) so buf[h] is a (K, *) leading-axis subview wp.copy can target.
+        self._qpos_buf   = wp.zeros((H, K, m.nq),          dtype=wp.float32)
+        self._qvel_buf   = wp.zeros((H, K, m.nv),          dtype=wp.float32)
+        self._sensor_buf = wp.zeros((H, K, m.nsensordata), dtype=wp.float32)
+        self._actions_wp = wp.zeros((H, K, m.nu),          dtype=wp.float32)
+        self._rollout_graph = None    # buffers changed → captured graph stale
+        self._warp_H = H
+
+    def _run_rollout(self, H: int) -> None:
+        """Capture-safe inner loop. Each outer step copies the per-step ctrl
+        into `wd.ctrl`, runs `frame_skip` `mjw.step`s, and snapshots qpos /
+        qvel / sensordata for that boundary."""
+        wp = self._wp
+        for h in range(H):
+            wp.copy(self._wd.ctrl, self._actions_wp[h])
+            for _ in range(self._frame_skip):
+                self._mjw.step(self._wm, self._wd)
+            wp.copy(self._qpos_buf[h],   self._wd.qpos)
+            wp.copy(self._qvel_buf[h],   self._wd.qvel)
+            wp.copy(self._sensor_buf[h], self._wd.sensordata)
+
+    def _seed_warp_state(self, initial_state: np.ndarray) -> None:
+        """Apply `initial_state` to the CPU `data`, then broadcast qpos/qvel
+        (and mocap if present) to all `nworld` GPU worlds.
+
+        We round-trip through the CPU model on every rollout to avoid a
+        manual mj_setState parser — `state` is the FULLPHYSICS layout, and
+        we need qpos/qvel slices on the GPU side. mocap is read from
+        `self.data.mocap_pos`/`.mocap_quat` (set by env.reset()) since the
+        FULLPHYSICS state doesn't carry mocap.
+        """
+        import mujoco
+        mujoco.mj_setState(
+            self.model, self.data, initial_state,
+            mujoco.mjtState.mjSTATE_FULLPHYSICS,
+        )
+        K = self._warp_nworld
+        nq, nv = self.model.nq, self.model.nv
+        qpos0 = np.broadcast_to(self.data.qpos.astype(np.float32), (K, nq)).copy()
+        qvel0 = np.broadcast_to(self.data.qvel.astype(np.float32), (K, nv)).copy()
+        self._wd.qpos.assign(qpos0)
+        self._wd.qvel.assign(qvel0)
+
+        if self._has_mocap:
+            nm = self.model.nmocap
+            mp = np.broadcast_to(
+                self.data.mocap_pos.astype(np.float32), (K, nm, 3)
+            ).copy()
+            mq = np.broadcast_to(
+                self.data.mocap_quat.astype(np.float32), (K, nm, 4)
+            ).copy()
+            self._wd.mocap_pos.assign(mp)
+            self._wd.mocap_quat.assign(mq)
+
+    # ------------------------------------------------------------------
+    # Rollout entry point
+    # ------------------------------------------------------------------
+
+    def _batch_rollout_warp(
+        self,
+        initial_state: np.ndarray,
+        action_sequences: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        wp = self._wp
+        K, H, nu = action_sequences.shape
+        self._ensure_warp_buffers(K, H)
+        self._seed_warp_state(initial_state)
+
+        # (K, H, nu) → (H, K, nu): the inner loop indexes by h first so
+        # actions_wp[h] is a contiguous (K, nu) slice for wp.copy.
+        self._actions_wp.assign(
+            np.ascontiguousarray(
+                action_sequences.transpose(1, 0, 2).astype(np.float32)
+            )
+        )
+
+        if self._rollout_graph is None:
+            with wp.ScopedCapture() as capture:
+                self._run_rollout(H)
+            self._rollout_graph = capture.graph
+        wp.capture_launch(self._rollout_graph)
+
+        qpos       = self._qpos_buf.numpy().transpose(1, 0, 2)
+        qvel       = self._qvel_buf.numpy().transpose(1, 0, 2)
+        sensordata = self._sensor_buf.numpy().transpose(1, 0, 2)
+
+        # Reconstruct FULLPHYSICS-layout states. time=0 since the GPU loop
+        # doesn't track sim time; nothing in this codebase reads state[..., 0].
+        time_col = np.zeros((K, H, 1), dtype=np.float32)
+        states = np.concatenate([time_col, qpos, qvel], axis=-1)
+        c  = self.running_cost(states, action_sequences, sensordata)   # (K, H)
+        tc = self.terminal_cost(states[:, -1, :], sensordata[:, -1, :])  # (K,)
+        costs = c.sum(axis=1) + tc
+        return states, costs, sensordata

@@ -52,6 +52,13 @@ _ENVS = ["acrobot", "adroit_pen", "adroit_relocate", "half_cheetah", "point_mass
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--env", default="acrobot", choices=_ENVS)
+    p.add_argument("--warp", action="store_true",
+                   help="Use mujoco_warp GPU batch rollout for MPPI's C-step. "
+                        "Only `adroit_relocate` has a warp variant currently. "
+                        "Requires `uv pip install warp-lang mujoco-warp` and "
+                        "an NVIDIA GPU + CUDA (graph replay = the speedup). "
+                        "`nworld` is pinned to MPPIConfig.K at env construction; "
+                        "changing K means re-running the script.")
     p.add_argument("--gps-iters", type=int, default=None,
                    help="Number of GPS iterations (default: from GPSConfig)")
     p.add_argument("--num-conditions", type=int, default=None,
@@ -86,19 +93,34 @@ def parse_args():
                         "drive E_state[KL(N(μ_p,σ_p²) ‖ π_θ)] toward this "
                         "target. The schedule fields above are still used for "
                         "the warmup window (alpha_warmup_iters); after that "
-                        "the adaptive rule takes over. Typical: 0.05 — 0.5. "
-                        "0 (default) disables and uses the schedule path.")
+                        "the adaptive rule takes over. Per-state KL is summed "
+                        "over action dims, so scale with act_dim — rule of "
+                        "thumb act_dim × 0.05 (e.g. ~0.1 for acrobot 2-D, "
+                        "~1.5 for adroit_relocate 30-D). 0 (default) disables "
+                        "and uses the schedule path.")
     p.add_argument("--kl-alpha-min", type=float, default=None,
                    help="Lower bound on the KL-adaptive α (default 0.001). "
                         "Allows multiplicative escape from a tight constraint.")
     p.add_argument("--kl-alpha-max", type=float, default=None,
-                   help="Upper bound on the KL-adaptive α (default 1.0). "
-                        "Prevents runaway when MPPI is far from policy.")
+                   help="Upper bound on the KL-adaptive α (default 0.5). "
+                        "Prevents runaway when MPPI is far from policy. "
+                        "α ≫ 0.1 typically crushes MPPI's exploration "
+                        "regardless of the constraint, so growing past 0.5 "
+                        "is rarely productive.")
     p.add_argument("--kl-step-rate", type=float, default=None,
                    help="Multiplicative update rate for the dual α step "
                         "(default 1.5). Larger = faster adaptation but more "
                         "iter-to-iter oscillation; 2.0+ if you need to escape "
                         "a sticky α regime quickly.")
+    p.add_argument("--kl-sigma-floor-frac", type=float, default=None,
+                   help="Per-dim floor on the local-policy std σ_p in the "
+                        "KL estimator, expressed as a fraction of MPPI's "
+                        "proposal std (default 0.5). Prevents log(σ_θ/σ_p) "
+                        "from exploding when MPPI's softmin concentrates "
+                        "onto a few samples and weighted-sample variance "
+                        "collapses toward zero. 0 disables the floor "
+                        "(legacy behaviour: clamps at 1e-6, biases kl_est "
+                        "upward by tens of nats per state).")
     p.add_argument("--policy-prior", default=None,
                    choices=["nll", "mean_distance"],
                    help="Policy prior shape used in the MPPI cost. Unset = "
@@ -202,9 +224,14 @@ def main():
     args = parse_args()
     seed_everything(args.seed)
 
-    env = make_env(args.env)
-
+    # Load MPPI cfg before constructing env: the warp env needs `nworld=cfg.K`
+    # and `nworld` is fixed for the env's lifetime.
     mppi_cfg = MPPIConfig.load(args.env)
+    env_kwargs: dict = {}
+    if args.warp:
+        env_kwargs.update(use_warp=True, nworld=mppi_cfg.K)
+    env = make_env(args.env, **env_kwargs)
+
     policy_cfg = PolicyConfig.for_env(args.env)
     gps_cfg = GPSConfig()
 
@@ -230,6 +257,8 @@ def main():
         gps_cfg.kl_alpha_max = args.kl_alpha_max
     if args.kl_step_rate is not None:
         gps_cfg.kl_step_rate = args.kl_step_rate
+    if args.kl_sigma_floor_frac is not None:
+        gps_cfg.kl_sigma_floor_frac = args.kl_sigma_floor_frac
     if args.policy_prior is not None:
         gps_cfg.policy_prior_type = args.policy_prior
     if args.auto_reset:
