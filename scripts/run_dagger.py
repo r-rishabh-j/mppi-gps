@@ -50,6 +50,17 @@ from src.gps.dagger import DAggerTrainer
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--env", default="hopper")
+    p.add_argument("--warp", action="store_true",
+                   help="Use mujoco_warp GPU batch rollout for MPPI's "
+                        "relabel step. Runs --rollouts-per-iter parallel "
+                        "envs simultaneously; one BatchedMPPI call per "
+                        "timestep instead of N sequential calls. Only envs "
+                        "with a Warp variant in the registry "
+                        "(adroit_relocate, hopper). Requires "
+                        "`uv pip install warp-lang mujoco-warp` and an "
+                        "NVIDIA GPU with CUDA. nworld is pinned to "
+                        "rollouts_per_iter * MPPIConfig.K at env "
+                        "construction.")
     p.add_argument("--dagger-iters", type=int, default=20)
     p.add_argument("--rollouts-per-iter", type=int, default=10)
     p.add_argument("--episode-len", type=int, default=600)
@@ -112,6 +123,18 @@ def parse_args() -> argparse.Namespace:
                         "ratio=1+eps). 0/unset = disabled (default = plain MSE-on-"
                         "mean). Typical 0.1–0.3; standard PPO uses 0.2. NOT applied "
                         "in --warmup. Only takes effect WITHOUT --deterministic.")
+    p.add_argument("--loss", default=None, choices=["mse", "nll"],
+                   dest="loss_type",
+                   help="Distillation loss for the Gaussian DAgger finetune. "
+                        "'mse' (default) — MSE on the policy mean; log_sigma "
+                        "is not supervised. 'nll' — full diagonal-Gaussian "
+                        "negative log-likelihood; both mu AND log_sigma are "
+                        "trained, so σ shrinks/widens to reflect expert action "
+                        "variance. Recommended when the policy's σ matters "
+                        "downstream (GPS warm-start, KL-adaptive α). Ignored "
+                        "with --deterministic (always MSE) and silently "
+                        "overridden when --clip-ratio > 0 (PPO clip is its "
+                        "own NLL variant).")
     p.add_argument("--exp-name", default="run",
                    help="Human-readable experiment name (used in the run dir name).")
     p.add_argument("--exp-dir", default="checkpoints/dagger",
@@ -145,6 +168,8 @@ def main() -> None:
         cfg.grad_clip_norm = args.grad_clip_norm
     if args.clip_ratio is not None:
         cfg.clip_ratio = args.clip_ratio
+    if args.loss_type is not None:
+        cfg.loss_type = args.loss_type
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
@@ -152,9 +177,21 @@ def main() -> None:
     seed_everything(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
-    env = make_env(args.env)
+    # Construct env + MPPI controller. Warp path uses BatchedMPPI with
+    # nworld = rollouts_per_iter * cfg.K so all parallel rollouts share
+    # one CUDA-graph launch per timestep.
     mppi_cfg = MPPIConfig.load(args.env)
-    mppi = MPPI(env, cfg=mppi_cfg)
+    if args.warp:
+        env = make_env(
+            args.env,
+            use_warp=True,
+            nworld=cfg.rollouts_per_iter * mppi_cfg.K,
+        )
+        from src.mppi.batched_mppi import BatchedMPPI
+        mppi = BatchedMPPI(env, mppi_cfg, num_conditions=cfg.rollouts_per_iter)
+    else:
+        env = make_env(args.env)
+        mppi = MPPI(env, cfg=mppi_cfg)
 
     obs_dim = env.obs_dim
     act_dim = env.action_dim
@@ -179,7 +216,11 @@ def main() -> None:
         report = load_state_dict_into(policy, blob)
         print(f"loaded initial policy weights from {init_ckpt}: {report['msg']}")
 
-    trainer = DAggerTrainer(env, mppi, policy, cfg, rng=rng)
+    if args.warp:
+        from src.gps.dagger_warp import WarpDAggerTrainer
+        trainer = WarpDAggerTrainer(env, mppi, policy, cfg, rng=rng)
+    else:
+        trainer = DAggerTrainer(env, mppi, policy, cfg, rng=rng)
     if args.seed_from is not None:
         seed_path = Path(args.seed_from)
         if seed_path.exists():

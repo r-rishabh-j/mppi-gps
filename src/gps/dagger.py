@@ -283,18 +283,22 @@ class DAggerTrainer:
         old_policy: "GaussianPolicy | None" = None,
         clip_ratio: float = 0.2,
     ) -> float:
-        """One distillation step. Two policy-class-specific paths:
+        """One distillation step. Three policy-class-specific paths:
 
         * Deterministic: MSE on the policy mean. ``grad_clip_norm > 0``
           activates an L2 gradient-norm clip inside ``DeterministicPolicy.
-          mse_step`` (between backward and the Adam step).
+          mse_step`` (between backward and the Adam step). ``cfg.loss_type``
+          is ignored — there's no σ to fit.
         * Gaussian + ``old_policy`` + ``clip_ratio > 0``: PPO-style ratio
           clip surrogate, mirroring ``mppi_gps_clip._train_step_clipped``.
-          With uniform "advantage" of 1 (DAgger has no MPPI weights at
-          training time), each row pulls its log-likelihood up to
-          ``ratio = 1 + clip_ratio`` per step, then saturates.
-        * Gaussian without those args: plain MSE-on-mean, the historical
-          DAgger default.
+          Takes priority over ``cfg.loss_type``.
+        * Gaussian + ``cfg.loss_type == "nll"``: full diagonal-Gaussian NLL
+          via ``GaussianPolicy.train_weighted`` with uniform weights. Both
+          ``mu`` and ``log_sigma`` heads are trained — σ shrinks/widens to
+          reflect expert action variance. Same code path GPS uses for its
+          ``distill_loss="nll"`` Gaussian S-step.
+        * Gaussian default (``loss_type == "mse"``): plain MSE-on-mean.
+          ``log_sigma`` stays at its init bias.
         """
         # Deterministic path -------------------------------------------------
         if isinstance(self.policy, DeterministicPolicy):
@@ -309,6 +313,15 @@ class DAggerTrainer:
             and clip_ratio > 0.0
         ):
             return self._train_step_gaussian_ppo(obs, act, old_policy, clip_ratio)
+
+        # Gaussian + NLL -----------------------------------------------------
+        loss_type = getattr(self.cfg, "loss_type", "mse")
+        if isinstance(self.policy, GaussianPolicy) and loss_type == "nll":
+            # Uniform weights → plain NLL. Reuses the GPS code path so
+            # any normalizer / EMA / NaN-guard fixes applied there carry
+            # over here automatically.
+            weights = np.ones(len(obs), dtype=np.float32)
+            return self.policy.train_weighted(obs, act, weights)
 
         # Gaussian default: plain MSE on mean --------------------------------
         return self.policy.mse_step(obs, act)

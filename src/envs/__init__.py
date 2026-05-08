@@ -9,6 +9,7 @@ _REGISTRY = {
     "adroit_relocate": ("src.envs.adroit_relocate", "AdroitRelocate"),
     "hopper": ("src.envs.hopper", "Hopper"),
     "point_mass": ("src.envs.point_mass", "PointMass"),
+    "ur5_push": ("src.envs.ur5_push", "UR5Push"),
 }
 
 # Warp/mujoco_warp GPU rollout variants. Selected via

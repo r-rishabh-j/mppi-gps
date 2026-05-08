@@ -64,6 +64,7 @@ _ENVS = [
     "adroit_relocate",
     "point_mass",
     "hopper",
+    "ur5_push",
 ]
 
 # Camera per env — must match <camera name="..."> in the MuJoCo XML.
@@ -73,6 +74,7 @@ _CAMERA = {
     "point_mass": "fixed",
     "adroit_pen": "vil_camera",
     "adroit_relocate": "vil_camera",
+    "ur5_push": "birdseye_tilted_cam",
 }
 
 

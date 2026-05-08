@@ -22,6 +22,7 @@ Caching:
 Examples:
     python -m scripts.collect_bc_demos --env acrobot
     python -m scripts.collect_bc_demos --env hopper --auto-reset -M 30 -T 500
+    python -m scripts.collect_bc_demos --env hopper --warp --auto-reset -M 30 -T 500
     python -m scripts.collect_bc_demos --env acrobot --force              # re-collect
     python -m scripts.collect_bc_demos --env acrobot --append -M 20       # add 20 more
 """
@@ -41,7 +42,7 @@ from src.mppi.mppi import MPPI
 from src.utils.config import MPPIConfig
 
 
-_ENVS = ["acrobot", "adroit_pen", "adroit_relocate", "point_mass", "hopper"]
+_ENVS = ["acrobot", "adroit_pen", "adroit_relocate", "point_mass", "hopper", "ur5_push"]
 
 
 def _try_capture_sensordata(env) -> np.ndarray | None:
@@ -70,6 +71,13 @@ def parse_args() -> argparse.Namespace:
                    dest="T", help="max steps per rollout")
     p.add_argument("--out", default=None,
                    help="output h5 path (default: data/<env>_bc.h5)")
+    p.add_argument("--warp", action="store_true",
+                   help="Use mujoco_warp GPU batch rollout for MPPI's K-sample "
+                        "evaluation. Requires `uv pip install warp-lang mujoco-warp` "
+                        "and an NVIDIA GPU with CUDA. Only hopper and adroit_relocate "
+                        "have Warp envs; others error out. nworld is pinned to "
+                        "MPPIConfig.K — single-condition collection (this script "
+                        "does sequential rollouts), no batched MPPI needed.")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--force", action="store_true",
                       help="overwrite an existing dataset at --out")
@@ -208,8 +216,15 @@ def main() -> None:
 
     np.random.seed(args.seed)
 
-    env = make_env(args.env)
+    # Load MPPI cfg first when using Warp — the GPU env needs `nworld=cfg.K`
+    # (the rollout-batch width) baked in at construction time and `nworld`
+    # is fixed for the env's lifetime. Pre-CPU path is unchanged.
     mppi_cfg = MPPIConfig.load(args.env)
+    if args.warp:
+        env = make_env(args.env, use_warp=True, nworld=mppi_cfg.K)
+        print(f"[warp] using GPU rollout for K={mppi_cfg.K} sample trajectories")
+    else:
+        env = make_env(args.env)
 
     # Probe sensordata presence once on the freshly-reset env. If non-empty,
     # we'll allocate a per-step buffer and capture each step's sensordata

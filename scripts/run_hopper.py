@@ -64,6 +64,9 @@ def main():
         total_cost += cost
         state = env.get_state()
 
+        if done:
+            print('done')
+
         if viewer is not None:
             viewer.sync()
             time.sleep(dt)

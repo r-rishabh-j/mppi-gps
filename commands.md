@@ -14,6 +14,7 @@ python -m scripts.run_acrobot
 python -m scripts.run_hopper
 python -m scripts.run_adroit_pen     # 24-DoF Shadow Hand pen reorientation
 python -m scripts.run_adroit_relocate # 30-DoF Adroit arm+hand pick-and-place
+python -m scripts.run_ur5            # 6-DoF UR5 arm pushing a tape roll to a target
 python -m scripts.run_mppi           # generic entry
 ```
 
@@ -136,7 +137,7 @@ python -m scripts.run_dagger --env acrobot \
 ```
 
 Flags:
-- `--env {acrobot,adroit_pen,adroit_relocate,hopper,point_mass}` — resolved via the `src.envs.make_env` registry.
+- `--env {acrobot,adroit_pen,adroit_relocate,hopper,point_mass,ur5_push}` — resolved via the `src.envs.make_env` registry.
 - `--device auto|cpu|mps|cuda` — auto resolves to cuda → mps → cpu.
 - `--deterministic` — use `DeterministicPolicy` (single-head, direct action regression) instead of `GaussianPolicy`.
 - `--beta-schedule linear|constant_zero` — β decays 1→0 over K/2 iters, or always 0.

@@ -1,0 +1,10 @@
+{
+  "_comment": "Default MPPI hyperparams for ur5_push. Seeded from upstream jaiselsingh1/ur5_research/mppi_ur5.py (lambda=100, sigma=0.2, K=5, H=10) but adjusted for our codebase: K bumped to 512 (upstream's 5 is below the noise floor for non-trivial cost landscapes), sigma raised to 0.8 to actually move the arm in 30 planning steps, lambda lowered to 10 for sharper softmin. adaptive_lam=true keeps n_eff in the 64-192 band as the cost landscape sharpens near contact.",
+  "K": 256,
+  "H": 32,
+  "lam": 0.05,
+  "noise_sigma": 0.8,
+  "adaptive_lam": true,
+  "n_eff_threshold": 64.0,
+  "open_loop_steps": 1
+}

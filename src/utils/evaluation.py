@@ -152,8 +152,15 @@ def evaluate_mppi(
             action, _ = controller.plan_step(state)
             _, cost, done, _ = env.step(action)
             ep_cost += cost
-            if done:
-                break
+            # Intentionally do NOT break on done. evaluate_policy() also runs
+            # the full episode_len regardless of termination (its `if done: break`
+            # is commented out), so breaking here would make MPPI-vs-policy
+            # comparisons asymmetric: the policy is judged on the full T steps
+            # while MPPI gets cut off early. For envs where the controller can
+            # recover from a `done` state (or where post-done per-step cost is
+            # ~0, e.g. hopper v2's tolerance-based reward), this matters.
+            # if done:
+            #     break
         returns.append(ep_cost)
 
     arr = np.array(returns)

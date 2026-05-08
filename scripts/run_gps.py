@@ -47,7 +47,7 @@ from src.utils.experiment import (
 )
 
 
-_ENVS = ["acrobot", "adroit_pen", "adroit_relocate", "point_mass", "hopper"]
+_ENVS = ["acrobot", "adroit_pen", "adroit_relocate", "point_mass", "hopper", "ur5_push"]
 
 
 def parse_args():

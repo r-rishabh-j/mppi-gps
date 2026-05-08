@@ -212,3 +212,5 @@ __marimo__/
 checkpoints*/*
 
 MUJOCO_LOG.txt
+
+PAPER/*

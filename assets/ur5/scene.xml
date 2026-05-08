@@ -1,0 +1,81 @@
+<mujoco model="ur5_push_scene">
+  <!-- UR5 push task scene: arm + table + free tape roll + mocap target.
+       Vendored / adapted from jaiselsingh1/ur5_research/env/assets/scene.xml.
+
+       Key differences from upstream:
+       * `target_marker` is a MOCAP body so the position can be set per-reset
+         via `data.mocap_pos[idx]` (mujoco_warp can broadcast that across
+         worlds; cleaner than mutating model.body_pos at reset).
+       * Added `framepos` sensors `ee_pos` (fingertip site) and `tape_pos`
+         (tape body) so the vectorised MPPI cost can read positions from
+         each rollout's `sensordata` row without per-state mj_kinematics.
+         Target position is constant during a rollout (set at reset only)
+         so the env caches it on `self._target_pos` and broadcasts in
+         running_cost. -->
+
+  <include file="./ur5_robot.xml"/>
+
+  <default>
+    <geom solref="0.005 1"/>
+  </default>
+
+  <statistic center="0.325 -0.105 -0.07" extent="1."/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0 0 0" active="1"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="179" elevation="-48" fovy="42" offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+             markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <camera name="side_cam" pos="0.502 -0.9 0" xyaxes="1 0 0 0 0 1"/>
+    <camera name="birdseye_tilted_cam"
+            pos="1.32854304 -0.12251691 1.04471724"
+            xyaxes="0.01745241 0.9998477 0 -0.74303164 0.01296967 0.66913061" fovy="42"/>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" pos="0 0 -1"/>
+
+    <!-- Mocap target marker. Position is set at reset via data.mocap_pos[0].
+         No collision (contype=0/conaffinity=0); purely a goal indicator. -->
+    <body name="target_marker" mocap="true" pos="0.7 0.2 -0.1175">
+      <geom name="target" type="cylinder" size="0.03 0.01" rgba="0.0 0.6 0.0 0.6"
+            contype="0" conaffinity="0"/>
+    </body>
+
+    <body pos="0.502 0.0 -0.18">
+      <geom name="table" type="box" size="0.3 0.6 0.03" mass="2.7"
+            rgba="0.5 0.5 0.5 0.3" condim="6"/>
+      <inertial pos="0 0 0" mass="2.7" diaginertia="0.003406 0.003406 0.004896"/>
+    </body>
+
+    <body name="tape_roll" pos="0.502 -0.05 -0.1175">
+      <freejoint name="root"/>
+      <geom name="tape" type="cylinder" size="0.06 0.0325" mass="0.270"
+            rgba="0.72 0.72 0.25 1.0" condim="6"/>
+      <inertial pos="0 0 0" mass="0.270" diaginertia="0.0003406 0.0003406 0.0004896"/>
+    </body>
+  </worldbody>
+
+  <sensor>
+    <!-- Fingertip world position. Used by running_cost in MPPI batch path
+         (sensordata flows out of mujoco rollout, no per-state kinematics). -->
+    <framepos name="ee_pos" objtype="site" objname="ee_finger_tip"/>
+    <!-- Tape position. Mirrors qpos[6:9] but cheaper to read directly. -->
+    <framepos name="tape_pos" objtype="body" objname="tape_roll"/>
+    <!-- ee_finger body orientation as a (w, x, y, z) quaternion. The
+         cylinder axis in world coords is the third column of the
+         body's rotation matrix, which has a closed-form expression in
+         the quat: cyl_axis_z = 1 − 2(qx² + qy²). running_cost uses this
+         to penalize non-downward orientations cheaply (no per-state
+         mj_kinematics). -->
+    <framequat name="ee_quat" objtype="body" objname="ee_finger"/>
+  </sensor>
+</mujoco>

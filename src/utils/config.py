@@ -345,4 +345,22 @@ class DAggerConfig:
     # (random-init policy → meaningless ratio). 0.0 = disabled (default
     # = plain MSE). Typical 0.1–0.3; standard PPO uses 0.2.
     clip_ratio: float = 0.0
+    # Distillation loss for Gaussian dagger. Choices:
+    #   "mse" (default) — MSE on the mean head; log_sigma stays at its
+    #         init bias and is not supervised. Historical behaviour, what
+    #         most existing checkpoints were trained under. Gradient-free
+    #         on σ → policy stays maximally exploratory at eval time.
+    #   "nll" — full diagonal-Gaussian negative log-likelihood. Both the
+    #         mean AND log_sigma heads are trained: σ shrinks where
+    #         expert actions are tightly distributed, widens where they're
+    #         multi-modal. Recommended when you want the policy's σ to
+    #         meaningfully reflect expert uncertainty (e.g. for downstream
+    #         GPS warm-start or KL-adaptive α). Internally calls
+    #         ``GaussianPolicy.train_weighted`` with uniform weights
+    #         (uniform weights → plain NLL — same path GPS uses for the
+    #         distill loss when `distill_loss="nll"`).
+    # Ignored for DeterministicPolicy (always MSE — there's no σ to fit).
+    # Ignored when `clip_ratio > 0` (PPO clip surrogate is its own NLL
+    # variant; the loss_type is overridden silently).
+    loss_type: str = "mse"
 
