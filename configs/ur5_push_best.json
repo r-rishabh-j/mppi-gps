@@ -1,9 +1,9 @@
 {
-  "_comment": "Default MPPI hyperparams for ur5_push. Seeded from upstream jaiselsingh1/ur5_research/mppi_ur5.py (lambda=100, sigma=0.2, K=5, H=10) but adjusted for our codebase: K bumped to 512 (upstream's 5 is below the noise floor for non-trivial cost landscapes), sigma raised to 0.8 to actually move the arm in 30 planning steps, lambda lowered to 10 for sharper softmin. adaptive_lam=true keeps n_eff in the 64-192 band as the cost landscape sharpens near contact.",
-  "K": 256,
+  "_comment": "Default MPPI hyperparams for ur5_push. With UR5Push.noise_scale = half_range = [3.15, 3.15], cfg.noise_sigma reads as a fraction of the action ctrlrange (matches adroit_relocate convention). σ=0.25 ⇒ effective per-dim noise std = 0.79 rad/s, matching the effective noise level of the old `noise_scale=ones, σ=0.8` config (so the commanded action magnitudes feel like the pre-fix setup). With λ=0.05 (sharp softmin), MPPI's chosen action ≈ best sample's noise, so action mean ~σ_eff. σ ≤ 0.1 explores too little; σ ≥ 0.5 saturates the actuator and overshoots.",
+  "K": 512,
   "H": 32,
-  "lam": 0.05,
-  "noise_sigma": 0.8,
+  "lam": 0.01,
+  "noise_sigma": 0.25,
   "adaptive_lam": true,
   "n_eff_threshold": 64.0,
   "open_loop_steps": 1

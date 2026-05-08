@@ -14,7 +14,7 @@ from src.utils.policy_prior_loader import (
 )
 from src.utils.seeding import add_seed_arg, seed_everything
 
-T = 250
+T = 150
 
 # Cameras to tile in the recorded video (2x2 grid). Order = top-left,
 # top-right, bottom-left, bottom-right.

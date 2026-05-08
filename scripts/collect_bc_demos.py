@@ -247,17 +247,16 @@ def main() -> None:
     act_dim = env.action_dim
     M, T = args.M, args.T
 
-    # Preallocate so the file shape is fixed and the in-RAM footprint is bounded.
-    # When auto_reset fires, early-terminated segments are stitched contiguously,
-    # so the (M, T) layout still holds exactly T steps per row.
-    states = np.zeros((M, T, obs_dim), dtype=np.float32)
-    actions = np.zeros((M, T, act_dim), dtype=np.float32)
-    costs = np.zeros((M, T), dtype=np.float32)
-    sensordatas = (
-        np.zeros((M, T, nsensor), dtype=np.float32) if nsensor > 0 else None
+    # Per-rollout buffers (one trajectory at a time — incremental writes
+    # mean we no longer hold all M in RAM). Reused each loop iteration.
+    states_row = np.zeros((T, obs_dim), dtype=np.float32)
+    actions_row = np.zeros((T, act_dim), dtype=np.float32)
+    costs_row = np.zeros((T,), dtype=np.float32)
+    sensordata_row = (
+        np.zeros((T, nsensor), dtype=np.float32) if nsensor > 0 else None
     )
 
-    sd_msg = f", nsensor={nsensor}" if sensordatas is not None else ""
+    sd_msg = f", nsensor={nsensor}" if sensordata_row is not None else ""
     if existing is not None:
         print(f"appending {M} rollouts to existing {existing_M} on {args.env}  "
               f"(obs_dim={obs_dim}, act_dim={act_dim}, "
@@ -266,79 +265,63 @@ def main() -> None:
         print(f"collecting {M} rollouts x {T} steps on {args.env}  "
               f"(obs_dim={obs_dim}, act_dim={act_dim}, "
               f"auto_reset={args.auto_reset}{sd_msg})")
-    print(f"→ {out_path}")
+    print(f"→ {out_path}  (incremental: each rollout flushed on completion)")
 
-    outer = tqdm(range(M), desc="rollouts", unit="traj")
-    for i in outer:
-        # Deterministic per-trajectory init so reruns are reproducible.
-        # Offset by existing_M when appending so new rollouts don't duplicate
-        # the seeds that produced the cached trajectories.
-        np.random.seed(args.seed + existing_M + i)
-        env.reset()
-        controller.reset()
+    # ---- Initialise the on-disk file with resizable datasets ----
+    # Fresh: empty resizable datasets at size 0, will grow per rollout.
+    # Append: rewrite the existing rows into resizable datasets first
+    #         (a one-time migration cost; legacy files weren't created
+    #         with `maxshape=None` so we can't extend them in place),
+    #         then append new rollouts. After this prologue the file
+    #         is "incrementally extensible" forever.
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        for t in range(T):
-            obs = env._get_obs()
-            state = env.get_state()
-            # Capture sensordata BEFORE plan_step / step so it pairs with
-            # the (obs, state) at time t (i.e. pre-action). plan_step does
-            # batched rollouts that mutate scratch buffers but not the
-            # live env.data; step() advances to t+1, which is the wrong
-            # alignment for the saved row.
-            if sensordatas is not None:
-                sensordatas[i, t] = env.data.sensordata
-            action, info = controller.plan_step(state)
-            _, cost, done, _ = env.step(action)
-
-            states[i, t] = obs
-            actions[i, t] = action
-            costs[i, t] = cost
-
-            if done and t < T - 1:
-                if args.auto_reset:
-                    env.reset()
-                    controller.reset()
-                    continue
-                # no auto-reset: fill the remainder with the last (obs, 0, 0).
-                # Downstream BC drops trailing zeros via cost/action sanity, but
-                # for the common non-terminating envs we just never hit this.
-                break
-
-        total_cost = float(costs[i].sum())
-        outer.set_postfix(total_cost=f"{total_cost:.1f}",
-                          last_cost_min=f"{info['cost_min']:.2f}")
-
-    # Concatenate with the existing dataset before writing. We overwrite the
-    # file in "w" mode either way; there's no resize because legacy datasets
-    # weren't created with maxshape=None (read+concat+rewrite keeps those
-    # files compatible).
-    if existing is not None:
-        states_out = np.concatenate([existing["states"], states], axis=0)
-        actions_out = np.concatenate([existing["actions"], actions], axis=0)
-        costs_out = np.concatenate([existing["costs"], costs], axis=0)
-        # Validator already enforced that sensordata presence matches
-        # between cached + current, so either both have it or neither.
-        if sensordatas is not None:
-            sensordatas_out = np.concatenate(
-                [existing["sensordata"], sensordatas], axis=0
+    def _create_dataset(f, name, initial_data, full_shape, dtype=np.float32):
+        """Helper: create a resizable dataset. `initial_data` may be None
+        (size-0 placeholder) or a numpy array (seed with existing rows).
+        ``full_shape`` is (None, *trailing) — trailing dims are fixed."""
+        if initial_data is None:
+            f.create_dataset(
+                name,
+                shape=(0,) + tuple(full_shape[1:]),
+                maxshape=full_shape,
+                chunks=True,
+                dtype=dtype,
             )
         else:
-            sensordatas_out = None
-        total_M = existing_M + M
-    else:
-        states_out, actions_out, costs_out = states, actions, costs
-        sensordatas_out = sensordatas
-        total_M = M
+            f.create_dataset(
+                name,
+                data=initial_data.astype(dtype),
+                maxshape=full_shape,
+                chunks=True,
+            )
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(out_path, "w") as f:
-        f.create_dataset("states", data=states_out)
-        f.create_dataset("actions", data=actions_out)
-        f.create_dataset("costs", data=costs_out)
-        if sensordatas_out is not None:
-            f.create_dataset("sensordata", data=sensordatas_out)
+        _create_dataset(
+            f, "states",
+            existing["states"] if existing is not None else None,
+            (None, T, obs_dim),
+        )
+        _create_dataset(
+            f, "actions",
+            existing["actions"] if existing is not None else None,
+            (None, T, act_dim),
+        )
+        _create_dataset(
+            f, "costs",
+            existing["costs"] if existing is not None else None,
+            (None, T),
+        )
+        if sensordata_row is not None:
+            _create_dataset(
+                f, "sensordata",
+                existing["sensordata"] if (existing is not None and "sensordata" in existing) else None,
+                (None, T, nsensor),
+            )
+        # Static attrs — set once, frozen for the lifetime of the file.
+        # `M` is updated incrementally inside the rollout loop below.
         f.attrs["env"] = args.env
-        f.attrs["M"] = total_M
+        f.attrs["M"] = existing_M
         f.attrs["T"] = T
         f.attrs["obs_dim"] = obs_dim
         f.attrs["act_dim"] = act_dim
@@ -346,15 +329,94 @@ def main() -> None:
         f.attrs["auto_reset"] = args.auto_reset
         f.attrs["mppi_cfg"] = json.dumps(asdict(mppi_cfg))
 
+    # ---- Rollout loop with incremental writes ----
+    # Open in r+ for the duration: we resize + write a new row + flush
+    # after each completed rollout, so a SIGKILL / OOM / wallclock cap at
+    # any point salvages all rollouts up to the last flush.
+    outer = tqdm(range(M), desc="rollouts", unit="traj")
+    new_costs_so_far: list[float] = []
+    with h5py.File(out_path, "r+") as f:
+        for i in outer:
+            # Deterministic per-trajectory init so reruns are reproducible.
+            # Offset by existing_M when appending so new rollouts don't duplicate
+            # the seeds that produced the cached trajectories.
+            np.random.seed(args.seed + existing_M + i)
+            env.reset()
+            controller.reset()
+
+            # Reset row buffers to zero so prior trailing data from a shorter
+            # auto-reset segment doesn't leak across rollouts.
+            states_row.fill(0.0)
+            actions_row.fill(0.0)
+            costs_row.fill(0.0)
+            if sensordata_row is not None:
+                sensordata_row.fill(0.0)
+
+            for t in range(T):
+                obs = env._get_obs()
+                state = env.get_state()
+                # Capture sensordata BEFORE plan_step / step so it pairs with
+                # the (obs, state) at time t (i.e. pre-action). plan_step does
+                # batched rollouts that mutate scratch buffers but not the
+                # live env.data; step() advances to t+1, which is the wrong
+                # alignment for the saved row.
+                if sensordata_row is not None:
+                    sensordata_row[t] = env.data.sensordata
+                action, info = controller.plan_step(state)
+                _, cost, done, _ = env.step(action)
+
+                states_row[t] = obs
+                actions_row[t] = action
+                costs_row[t] = cost
+
+                if done and t < T - 1:
+                    if args.auto_reset:
+                        env.reset()
+                        controller.reset()
+                        continue
+                    # no auto-reset: fill the remainder with the last (obs, 0, 0).
+                    # Downstream BC drops trailing zeros via cost/action sanity, but
+                    # for the common non-terminating envs we just never hit this.
+                    break
+
+            # ---- Append this rollout to the file + flush ----
+            slot = existing_M + i
+            f["states"].resize(slot + 1, axis=0)
+            f["states"][slot] = states_row
+            f["actions"].resize(slot + 1, axis=0)
+            f["actions"][slot] = actions_row
+            f["costs"].resize(slot + 1, axis=0)
+            f["costs"][slot] = costs_row
+            if sensordata_row is not None:
+                f["sensordata"].resize(slot + 1, axis=0)
+                f["sensordata"][slot] = sensordata_row
+            # Update the rollout count attr each iter so a partial file
+            # is self-describing — readers can use attrs["M"] without
+            # also checking dataset.shape[0].
+            f.attrs["M"] = slot + 1
+            # flush() forces buffered writes to OS; fsync would be needed
+            # for hard crash safety against OS caches, but flush+normal
+            # exit covers the common kill / Ctrl-C / OOM paths cheaply.
+            f.flush()
+
+            total_cost = float(costs_row.sum())
+            new_costs_so_far.append(total_cost)
+            outer.set_postfix(total_cost=f"{total_cost:.1f}",
+                              last_cost_min=f"{info['cost_min']:.2f}")
+
+    total_M = existing_M + M
     if existing is not None:
-        new_cost_mean = float(costs.sum(axis=1).mean())
-        total_cost_mean = float(costs_out.sum(axis=1).mean())
+        new_cost_mean = float(np.mean(new_costs_so_far)) if new_costs_so_far else float("nan")
+        # Read the full costs back to get the all-time mean (cheap; T*total_M floats).
+        with h5py.File(out_path, "r") as f:
+            all_cost_mean = float(f["costs"][:].sum(axis=1).mean())
         print(f"\nappended {M} trajectories (new mean cost: {new_cost_mean:.2f}); "
               f"dataset now holds {total_M} trajectories of length {T} at {out_path}")
-        print(f"mean total cost across ALL trajectories: {total_cost_mean:.2f}")
+        print(f"mean total cost across ALL trajectories: {all_cost_mean:.2f}")
     else:
+        cost_mean = float(np.mean(new_costs_so_far)) if new_costs_so_far else float("nan")
         print(f"\nsaved {M} trajectories of length {T} to {out_path}")
-        print(f"mean total cost across trajectories: {costs.sum(axis=1).mean():.2f}")
+        print(f"mean total cost across trajectories: {cost_mean:.2f}")
     env.close()
 
 

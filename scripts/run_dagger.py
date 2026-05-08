@@ -123,18 +123,11 @@ def parse_args() -> argparse.Namespace:
                         "ratio=1+eps). 0/unset = disabled (default = plain MSE-on-"
                         "mean). Typical 0.1–0.3; standard PPO uses 0.2. NOT applied "
                         "in --warmup. Only takes effect WITHOUT --deterministic.")
-    p.add_argument("--loss", default=None, choices=["mse", "nll"],
-                   dest="loss_type",
-                   help="Distillation loss for the Gaussian DAgger finetune. "
-                        "'mse' (default) — MSE on the policy mean; log_sigma "
-                        "is not supervised. 'nll' — full diagonal-Gaussian "
-                        "negative log-likelihood; both mu AND log_sigma are "
-                        "trained, so σ shrinks/widens to reflect expert action "
-                        "variance. Recommended when the policy's σ matters "
-                        "downstream (GPS warm-start, KL-adaptive α). Ignored "
-                        "with --deterministic (always MSE) and silently "
-                        "overridden when --clip-ratio > 0 (PPO clip is its "
-                        "own NLL variant).")
+    # NOTE: --loss flag removed in the "always NLL for Gaussian" sweep.
+    # Gaussian DAgger now always uses NLL (or PPO clip when --clip-ratio
+    # > 0). Deterministic DAgger is always MSE — no σ to fit. Saved
+    # `cfg.loss_type` field on legacy DAggerConfig instances is ignored
+    # by `_train_step` if encountered.
     p.add_argument("--exp-name", default="run",
                    help="Human-readable experiment name (used in the run dir name).")
     p.add_argument("--exp-dir", default="checkpoints/dagger",
@@ -168,8 +161,6 @@ def main() -> None:
         cfg.grad_clip_norm = args.grad_clip_norm
     if args.clip_ratio is not None:
         cfg.clip_ratio = args.clip_ratio
-    if args.loss_type is not None:
-        cfg.loss_type = args.loss_type
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
@@ -269,7 +260,7 @@ def main() -> None:
             cache_path=warmup_cache,
         )
         if losses:
-            print(f"  warmup train_mse: {losses[0]:.5f} → {losses[-1]:.5f}  "
+            print(f"  warmup train_loss: {losses[0]:.5f} → {losses[-1]:.5f}  "
                   f"(buf={trainer.buffer_size():,})")
 
     # # --- MPPI baseline (once, shared across iterations) ---
@@ -288,7 +279,7 @@ def main() -> None:
     # makes pd.read_csv across runs straightforward.
     csv_columns = [
         "iter", "beta", "new_samples", "buffer_size",
-        "train_mse", "val_mse",
+        "train_loss", "val_mse",
         "policy_mean_cost", "policy_std_cost",
         "best_iter", "best_cost",
     ]
@@ -306,7 +297,7 @@ def main() -> None:
         print(f"\n=== DAgger iter {k}/{cfg.dagger_iters - 1} ===")
         info = trainer.step(k)
         print(f"  beta={info['beta']:.2f}  new={info['new_samples']:,}  "
-              f"buf={info['buffer_size']:,}  train_mse={info['train_mse']:.5f}  "
+              f"buf={info['buffer_size']:,}  train_loss={info['train_loss']:.5f}  "
               f"val_mse={info['val_mse']:.5f}")
 
         # EMA-swap window: eval and per-iter save happen with the smoothed
@@ -326,7 +317,7 @@ def main() -> None:
             save_checkpoint(
                 ckpt_path, policy,
                 round=k,
-                train_mse=info["train_mse"],
+                train_loss=info["train_loss"],
                 val_mse=info["val_mse"],
                 eval_mean_cost=eval_stats["mean_cost"],
                 eval_std_cost=eval_stats["std_cost"],
@@ -345,7 +336,7 @@ def main() -> None:
             "beta": info["beta"],
             "new_samples": info["new_samples"],
             "buffer_size": info["buffer_size"],
-            "train_mse": info["train_mse"],
+            "train_loss": info["train_loss"],
             "val_mse": info["val_mse"],
             "policy_mean_cost": eval_stats["mean_cost"],
             "policy_std_cost": eval_stats["std_cost"],

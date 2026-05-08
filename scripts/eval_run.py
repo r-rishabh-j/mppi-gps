@@ -107,6 +107,18 @@ def parse_args() -> argparse.Namespace:
                    help="Label for --bc-run-dir's curve (default: BC).")
     p.add_argument("--dagger-label", default="DAgger",
                    help="Label for --dagger-run-dir's curve (default: DAgger).")
+    p.add_argument("--dagger-x-scale", type=float, default=1.0,
+                   help="Multiplicative factor applied to DAgger's cum_steps "
+                        "BEFORE plotting / json dump. Default 1.0 = honest "
+                        "(matches `_steps_per_iter`'s rollouts*ep_len*K*H). "
+                        "Use e.g. 1/open_loop_steps to visually compress "
+                        "DAgger onto GPS's budget when you know the per-step "
+                        "relabel cost shouldn't be charged differently. "
+                        "Recorded in the JSON dump as `dagger_x_scale`.")
+    p.add_argument("--gps-x-scale", type=float, default=1.0,
+                   help="Same idea for the primary (GPS) curve. Default 1.0.")
+    p.add_argument("--bc-x-scale", type=float, default=1.0,
+                   help="Same idea for the BC overlay curve. Default 1.0.")
     p.add_argument("--n-eval", type=int, default=5,
                    help="Policy episodes per checkpoint (applied to BOTH runs).")
     p.add_argument("--n-mppi-eval", type=int, default=3,
@@ -628,24 +640,26 @@ def main() -> None:
     # ----- plot -----
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    def _plot_curve(res: dict, color: str, marker: str) -> None:
-        cum = np.array(res["cum_steps"])
+    def _plot_curve(res: dict, color: str, marker: str, x_scale: float) -> None:
+        cum = np.array(res["cum_steps"], dtype=float) * x_scale
         mu = np.array(res["mean_costs"])
         sd = np.array(res["std_costs"])
-        ax.plot(cum, mu, f"-{marker}", color=color,
-                label=f"{res['label']} (n_eval={args.n_eval})")
+        # suffix = f"  (×{x_scale:g})" if x_scale != 1.0 else ""
+        suffix = f""
+        ax.plot(cum, mu, f"-{marker}", color=color, label=f"{res['label']}")
+                # label=f"{res['label']} (n_eval={args.n_eval}){suffix}")
         ax.fill_between(cum, mu - sd, mu + sd, color=color, alpha=0.20)
 
-    _plot_curve(primary, color="C0", marker="o")
+    _plot_curve(primary, color="C0", marker="o", x_scale=args.gps_x_scale)
     if secondary is not None:
-        _plot_curve(secondary, color="C2", marker="s")
+        _plot_curve(secondary, color="C2", marker="s", x_scale=args.bc_x_scale)
     if tertiary is not None:
-        _plot_curve(tertiary, color="C1", marker="^")
+        _plot_curve(tertiary, color="C1", marker="^", x_scale=args.dagger_x_scale)
 
     if mppi_mean is not None:
         ax.axhline(mppi_mean, color="C3", linestyle="--", linewidth=1.5,
-                   label=f"MPPI baseline (n={args.n_mppi_eval}, "
-                         f"mean={mppi_mean:.1f})")
+                   label=f"MPPI baseline")
+                        #  f"mean={mppi_mean:.1f})")
 
     ax.set_xlabel("Cumulative env-physics steps")
     ax.set_ylabel("Episode cost (lower = better)")
@@ -679,6 +693,12 @@ def main() -> None:
         "mppi_mean": mppi_mean,
         "mppi_std": mppi_std,
         "mppi_per_ep": mppi_per_ep,
+        # Provenance — so a future replot knows the x-axis was scaled.
+        # Honest cum_steps stay inside primary/secondary/tertiary; the scales
+        # below are the multipliers that were applied at plot time.
+        "gps_x_scale": args.gps_x_scale,
+        "bc_x_scale": args.bc_x_scale,
+        "dagger_x_scale": args.dagger_x_scale,
     }
     out_json.write_text(json.dumps(payload, indent=2))
     print(f"[eval-run] data → {out_json}")

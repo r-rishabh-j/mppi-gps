@@ -76,16 +76,29 @@
   </worldbody>
 
   <actuator>
-    <!-- All 6 joints velocity-controlled, matching upstream
-         jaiselsingh1/ur5_research. Wrist orientation is held downward
-         at runtime by a Cartesian IK controller (see CartesianController
-         in src/envs/ur5_push.py), NOT by the actuator type. The IK
-         feeds joint velocities into all 6 actuators every step. -->
+    <!-- Active joints (shoulder + elbow): velocity-controlled, the
+         3-D MPPI / policy action space lives here. Matches upstream
+         jaiselsingh1/ur5_research/ur5_joint_limited_robot_velcontroller.xml
+         for the first 3 actuators. -->
     <velocity kv="2000" forcerange="-150 150" name="shoulder_pan"  ctrlrange="-3.15 3.15" joint="shoulder_pan_joint"/>
     <velocity kv="2000" forcerange="-150 150" name="shoulder_lift" ctrlrange="-3.15 3.15" joint="shoulder_lift_joint"/>
     <velocity kv="2000" forcerange="-150 150" name="elbow"         ctrlrange="-3.15 3.15" joint="elbow_joint"/>
-    <velocity kv="500"  forcerange="-28 28"   name="wrist_1"        ctrlrange="-3.2 3.2"   joint="wrist_1_joint"/>
-    <velocity kv="500"  forcerange="-28 28"   name="wrist_2"        ctrlrange="-3.2 3.2"   joint="wrist_2_joint"/>
-    <velocity kv="500"  forcerange="-28 28"   name="wrist_3"        ctrlrange="-3.2 3.2"   joint="wrist_3_joint"/>
+    <!-- Wrist joints: POSITION-controlled (PD servo to a setpoint).
+         **Departure from upstream:** their XML uses velocity controllers
+         throughout, but their upright EE is achieved at runtime via a
+         Cartesian IK controller (`cartesian_controller.py`) that runs
+         only in their PPO env's step path — NOT in their MPPI. With our
+         larger MPPI noise (K=256, sigma~0.5–0.8 vs upstream's K=5,
+         sigma=0.2), velocity-controlled wrists drift visibly under
+         contact and exploration noise. Position-controlled wrists hold
+         the joint at a setpoint via `kp·(ctrl − qpos) − kv·qvel`, fully
+         restoring after any disturbance. The env writes the init wrist
+         angles (-π/3-π/2, -π/2, 0) into ctrl[3:6] every step (see
+         `_WRIST_SETPOINTS` in src/envs/ur5_push.py); MPPI samples noise
+         only on the 3 active dims (shoulder_pan/lift/elbow). kp=2000 /
+         kv=100 is overdamped for the wrist link inertia ~0.1 kg·m². -->
+    <position kp="2000" kv="100" forcerange="-28 28" ctrlrange="-6.28319 6.28319" name="wrist_1" joint="wrist_1_joint"/>
+    <position kp="2000" kv="100" forcerange="-28 28" ctrlrange="-6.28319 6.28319" name="wrist_2" joint="wrist_2_joint"/>
+    <position kp="2000" kv="100" forcerange="-28 28" ctrlrange="-6.28319 6.28319" name="wrist_3" joint="wrist_3_joint"/>
   </actuator>
 </mujoco>

@@ -107,8 +107,12 @@ class MPPIGPS:
         """Trust-region update for the S-Step (student policy)."""
         device = self.policy.device
         
-        # Determine if we are doing MSE (Deterministic) or NLL (Gaussian)
-        if self.gps_cfg.distill_loss == "mse" or not hasattr(self.policy, "log_prob"):
+        # Always NLL for Gaussian; MSE only for Deterministic.
+        # (As of the project-wide "always NLL for Gaussian" sweep, the
+        # legacy ``distill_loss == "mse"`` opt-out for Gaussian is gone.
+        # Falling through to MSE only fires when the policy lacks
+        # ``log_prob`` — i.e. DeterministicPolicy.)
+        if not hasattr(self.policy, "log_prob"):
             # --- Deterministic Policy / MSE Path ---
             with torch.no_grad():
                 o_t = torch.as_tensor(obs, dtype=torch.float32, device=device)

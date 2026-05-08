@@ -484,11 +484,27 @@ class AdroitRelocate(MuJoCoEnv):
                     "USE_DAPG_OBS=True requires palm_pos; "
                     "callers must populate it from sensordata or mj_forward."
                 )
+            # NOTE: palm-to-target is currently zeroed out (the policy
+            # shouldn't condition on it). The slot is preserved so
+            # ``obs_dim`` stays at 39 — existing GaussianPolicy /
+            # DeterministicPolicy checkpoints, h5 datasets, and DAgger
+            # buffers all keep loading without shape errors. To re-enable,
+            # swap the zeros line back to ``palm_pos - target``.
+            #
+            # Note: existing h5 datasets *contain* real palm-target
+            # values at indices [33:36); when fine-tuning a policy on
+            # an old dataset under this zeroed env, the policy will
+            # see real values from old rows and zeros from any rows
+            # collected post-change. If you want to fully neutralise
+            # the input across old + new data, mask in the policy
+            # forward (``obs[..., 33:36] = 0``) instead of here.
+            palm_target_zero = np.zeros_like(palm_pos)
             return np.concatenate(
                 [
                     qpos[..., :30],          # 30  arm + hand joint angles
                     palm_pos - obj_world,    # 3   hand → ball
-                    palm_pos - target,       # 3   hand → target
+                    # palm_pos - target,     # 3   hand → target  ← DROPPED
+                    palm_target_zero,        # 3   zeroed slot (preserves obs_dim=39)
                     obj_world - target,      # 3   ball → target
                 ],
                 axis=-1,

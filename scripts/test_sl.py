@@ -91,8 +91,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init-ckpt", default=None,
                    help="warm-start: load a wrapped or raw state_dict into the policy "
                         "before training. Must match --deterministic.")
-    p.add_argument("--num-epochs", type=int, default=4000)
-    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--num-epochs", type=int, default=10000)
+    p.add_argument("--batch-size", type=int, default=4084)
     p.add_argument("--val-frac", type=float, default=0,
                    help="fraction of trajectories (not transitions) held out for val")
     p.add_argument("--eval-every", type=int, default=5000,
@@ -172,7 +172,7 @@ def eval_mse(policy, obs: np.ndarray, actions: np.ndarray, batch: int = 16384) -
 
     When the action-norm toggle is on, ``mse_step`` normalizes labels and
     computes MSE in the network's [-1, 1]-ish space; we mirror that here
-    so train_mse and val_mse are on the same scale (loss curve makes
+    so val_mse stays interpretable as a fixed reference metric (the loss
     sense, ``best.pt`` is selected on the same objective being optimized).
     With the toggle off (`policy._has_act_norm = False`) this is byte-
     identical to physical-space MSE — the rescale is a no-op.
@@ -296,9 +296,17 @@ def main() -> None:
     log_lines = [
         f"# BC on {args.env}, device={device}, policy={type(policy).__name__}",
         f"# demos={demo_path}  n_train={len(tr_s)}  n_val={len(va_s)}",
-        "epoch,train_mse,val_mse,eval_mean_cost,eval_std_cost",
+        "epoch,train_loss,val_mse,eval_mean_cost,eval_std_cost",
     ]
 
+    # Gaussian: full diagonal-Gaussian NLL via train_weighted with uniform
+    # weights. Both mu AND log_sigma heads are trained (σ shrinks/widens
+    # to reflect expert action variance). Deterministic: MSE-on-mean —
+    # there's no σ to fit on a single-head policy. The Gaussian → NLL
+    # default applies project-wide; a checkpoint trained under MSE-on-
+    # mean will load and re-train fine, just won't have meaningful σ
+    # until the new training updates it.
+    is_gaussian = isinstance(policy, GaussianPolicy)
     epoch_bar = tqdm(range(args.num_epochs), desc="BC", unit="ep")
     for epoch in epoch_bar:
         policy.train()
@@ -306,11 +314,21 @@ def main() -> None:
         running, nb = 0.0, 0
         for start in range(0, N, args.batch_size):
             b = idx[start:start + args.batch_size]
-            running += policy.mse_step(tr_s[b], tr_a[b])
+            if is_gaussian:
+                # Uniform weights → plain NLL (same path GPS uses for
+                # distill_loss="nll" Gaussian S-step).
+                w = np.ones(len(b), dtype=np.float32)
+                running += policy.train_weighted(tr_s[b], tr_a[b], w)
+            else:
+                running += policy.mse_step(tr_s[b], tr_a[b])
             nb += 1
-        train_mse = running / max(nb, 1)
+        # `train_loss` reflects whatever the policy class trained under
+        # — NLL for Gaussian, MSE-on-mean for Deterministic. `val_mse` is
+        # always MSE-on-mean (held-out, computed via `eval_mse`) so the
+        # validation curve stays comparable across runs and policy classes.
+        train_loss = running / max(nb, 1)
         val_mse = eval_mse(policy, va_s, va_a)
-        train_losses.append(train_mse)
+        train_losses.append(train_loss)
         val_losses.append(val_mse)
 
         # optional mid-training env eval — expensive on long episodes
@@ -342,7 +360,7 @@ def main() -> None:
             save_checkpoint(
                 ckpt_path, policy,
                 round=epoch,
-                train_mse=train_mse,
+                train_loss=train_loss,
                 val_mse=val_mse,
                 eval_mean_cost=eval_mean,
                 eval_std_cost=eval_std,
@@ -353,14 +371,14 @@ def main() -> None:
 
         if do_eval:
             log_lines.append(
-                f"{epoch},{train_mse:.6f},{val_mse:.6f},"
+                f"{epoch},{train_loss:.6f},{val_mse:.6f},"
                 f"{eval_mean:.4f},{eval_std:.4f}"
             )
         else:
-            log_lines.append(f"{epoch},{train_mse:.6f},{val_mse:.6f},,")
+            log_lines.append(f"{epoch},{train_loss:.6f},{val_mse:.6f},,")
         (run_dir / "bc_log.csv").write_text("\n".join(log_lines))
 
-        postfix = {"train": f"{train_mse:.4f}", "val": f"{val_mse:.4f}",
+        postfix = {"train": f"{train_loss:.4f}", "val": f"{val_mse:.4f}",
                    "best": f"{best_val:.4f}@{best_epoch}"}
         if do_eval:
             postfix["cost"] = f"{eval_mean:.1f}"

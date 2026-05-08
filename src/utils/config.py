@@ -77,7 +77,7 @@ class PolicyConfig:
         * ``lr=3e-4`` — slightly safer with the deeper net.
         """
         # if env_name.startswith("adroit"):
-        #     return cls(hidden_dims=(512, 512, 512), lr=3e-4)
+        #     return cls(hidden_dims=(512, 512), lr=8e-4)
         return cls()
 
 @dataclass
@@ -94,7 +94,14 @@ class GPSConfig:
     distill_batch_size: int = 1024   # mini-batch size for policy distillation
     distill_epochs: int = 30         # gradient epochs per GPS iteration
     warm_start_policy: bool = False  # warm-start MPPI nominal U from policy rollout
-    distill_loss: str = "nll"       # "nll" (weighted NLL on policy log-prob) or "mse" (MSE on mean)
+    # NOTE: ``distill_loss`` is vestigial after the project-wide
+    # "always NLL for Gaussian" sweep. Gaussian S-step always uses
+    # weighted NLL via ``GaussianPolicy.train_weighted``; Deterministic
+    # always uses MSE via ``DeterministicPolicy.mse_step``. The field is
+    # kept (default "nll") so legacy ``config.json`` files load without
+    # dataclass init errors, but it no longer drives any branch in the
+    # trainers (``mppi_gps_unified.py``, ``mppi_gps.py``, ``mppi_gps_clip.py``).
+    distill_loss: str = "nll"
     # Policy-prior shape used by the unified MPPIGPS trainer
     # (`src/gps/mppi_gps_unified.py`). Choices:
     #   * "auto" → "nll" for GaussianPolicy, "mean_distance" for DeterministicPolicy.
@@ -345,22 +352,11 @@ class DAggerConfig:
     # (random-init policy → meaningless ratio). 0.0 = disabled (default
     # = plain MSE). Typical 0.1–0.3; standard PPO uses 0.2.
     clip_ratio: float = 0.0
-    # Distillation loss for Gaussian dagger. Choices:
-    #   "mse" (default) — MSE on the mean head; log_sigma stays at its
-    #         init bias and is not supervised. Historical behaviour, what
-    #         most existing checkpoints were trained under. Gradient-free
-    #         on σ → policy stays maximally exploratory at eval time.
-    #   "nll" — full diagonal-Gaussian negative log-likelihood. Both the
-    #         mean AND log_sigma heads are trained: σ shrinks where
-    #         expert actions are tightly distributed, widens where they're
-    #         multi-modal. Recommended when you want the policy's σ to
-    #         meaningfully reflect expert uncertainty (e.g. for downstream
-    #         GPS warm-start or KL-adaptive α). Internally calls
-    #         ``GaussianPolicy.train_weighted`` with uniform weights
-    #         (uniform weights → plain NLL — same path GPS uses for the
-    #         distill loss when `distill_loss="nll"`).
-    # Ignored for DeterministicPolicy (always MSE — there's no σ to fit).
-    # Ignored when `clip_ratio > 0` (PPO clip surrogate is its own NLL
-    # variant; the loss_type is overridden silently).
-    loss_type: str = "mse"
+    # NOTE: ``loss_type`` field removed in the "always NLL for Gaussian"
+    # sweep. Gaussian DAgger now always uses NLL (via
+    # ``GaussianPolicy.train_weighted`` with uniform weights), or the
+    # PPO clip surrogate when ``clip_ratio > 0``. Deterministic DAgger
+    # is always MSE on the mean — no σ to fit. Loading a config json
+    # that includes ``loss_type`` will fail dataclass strict-init; if
+    # you have such a file, drop the key (no other code reads it now).
 

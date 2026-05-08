@@ -70,12 +70,11 @@
     <framepos name="ee_pos" objtype="site" objname="ee_finger_tip"/>
     <!-- Tape position. Mirrors qpos[6:9] but cheaper to read directly. -->
     <framepos name="tape_pos" objtype="body" objname="tape_roll"/>
-    <!-- ee_finger body orientation as a (w, x, y, z) quaternion. The
-         cylinder axis in world coords is the third column of the
-         body's rotation matrix, which has a closed-form expression in
-         the quat: cyl_axis_z = 1 − 2(qx² + qy²). running_cost uses this
-         to penalize non-downward orientations cheaply (no per-state
-         mj_kinematics). -->
+    <!-- ee_finger orientation as wxyz quat. Position-locked wrists hold
+         the wrist joints, but the policy can still tilt the EE by
+         pitching shoulder_lift + elbow (cumulative pitch). The
+         orientation cost in running_cost penalises that. Closed-form
+         cyl_z = 1 − 2(qx² + qy²); free with the rollout. -->
     <framequat name="ee_quat" objtype="body" objname="ee_finger"/>
   </sensor>
 </mujoco>

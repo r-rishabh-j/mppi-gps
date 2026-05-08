@@ -271,7 +271,7 @@ class DAggerTrainer:
                 nb += 1
             loss = running / max(nb, 1)
             losses.append(loss)
-            epoch_bar.set_postfix(train_mse=f"{loss:.4f}")
+            epoch_bar.set_postfix(train_loss=f"{loss:.4f}")
         return losses
 
     # ---------- training ----------
@@ -283,22 +283,25 @@ class DAggerTrainer:
         old_policy: "GaussianPolicy | None" = None,
         clip_ratio: float = 0.2,
     ) -> float:
-        """One distillation step. Three policy-class-specific paths:
+        """One distillation step. Two policy-class-specific paths:
 
         * Deterministic: MSE on the policy mean. ``grad_clip_norm > 0``
           activates an L2 gradient-norm clip inside ``DeterministicPolicy.
-          mse_step`` (between backward and the Adam step). ``cfg.loss_type``
-          is ignored — there's no σ to fit.
+          mse_step`` (between backward and the Adam step).
         * Gaussian + ``old_policy`` + ``clip_ratio > 0``: PPO-style ratio
           clip surrogate, mirroring ``mppi_gps_clip._train_step_clipped``.
-          Takes priority over ``cfg.loss_type``.
-        * Gaussian + ``cfg.loss_type == "nll"``: full diagonal-Gaussian NLL
-          via ``GaussianPolicy.train_weighted`` with uniform weights. Both
-          ``mu`` and ``log_sigma`` heads are trained — σ shrinks/widens to
+          Takes priority over plain NLL.
+        * Gaussian default: full diagonal-Gaussian NLL via
+          ``GaussianPolicy.train_weighted`` with uniform weights. Both
+          ``mu`` AND ``log_sigma`` heads are trained — σ shrinks/widens to
           reflect expert action variance. Same code path GPS uses for its
-          ``distill_loss="nll"`` Gaussian S-step.
-        * Gaussian default (``loss_type == "mse"``): plain MSE-on-mean.
-          ``log_sigma`` stays at its init bias.
+          Gaussian S-step (``train_weighted`` with uniform weights → NLL).
+
+        NOTE: as of the project-wide "always NLL for Gaussian" sweep,
+        the historical MSE-on-mean default is gone. Existing Gaussian
+        checkpoints trained under MSE still load (head shapes match);
+        they just had a frozen log_sigma. Re-training under NLL updates
+        log_sigma alongside the mean.
         """
         # Deterministic path -------------------------------------------------
         if isinstance(self.policy, DeterministicPolicy):
@@ -314,17 +317,11 @@ class DAggerTrainer:
         ):
             return self._train_step_gaussian_ppo(obs, act, old_policy, clip_ratio)
 
-        # Gaussian + NLL -----------------------------------------------------
-        loss_type = getattr(self.cfg, "loss_type", "mse")
-        if isinstance(self.policy, GaussianPolicy) and loss_type == "nll":
-            # Uniform weights → plain NLL. Reuses the GPS code path so
-            # any normalizer / EMA / NaN-guard fixes applied there carry
-            # over here automatically.
-            weights = np.ones(len(obs), dtype=np.float32)
-            return self.policy.train_weighted(obs, act, weights)
-
-        # Gaussian default: plain MSE on mean --------------------------------
-        return self.policy.mse_step(obs, act)
+        # Gaussian default: NLL via train_weighted with uniform weights.
+        # Reuses the GPS code path so any normalizer / EMA / NaN-guard
+        # fixes applied there carry over here automatically.
+        weights = np.ones(len(obs), dtype=np.float32)
+        return self.policy.train_weighted(obs, act, weights)
 
     def _train_step_gaussian_ppo(
         self,
@@ -460,14 +457,14 @@ class DAggerTrainer:
                 nb += 1
             last_train = running / max(nb, 1)
             last_val = self._eval_mse(va_o, va_a)
-            epoch_bar.set_postfix(train_mse=f"{last_train:.4f}", val_mse=f"{last_val:.4f}")
+            epoch_bar.set_postfix(train_loss=f"{last_train:.4f}", val_mse=f"{last_val:.4f}")
         return last_train, last_val
 
     # ---------- full iteration ----------
     def step(self, k: int) -> dict:
         obs_r, act_r = self.collect_round(k)
         self.append(obs_r, act_r, round_idx=k)
-        train_mse, val_mse = self.finetune(obs_r, act_r, round_idx=k)
+        train_loss, val_mse = self.finetune(obs_r, act_r, round_idx=k)
         # End-of-round stabilisers, mirroring MPPIGPS:
         #  - ema_hard_sync: θ ← EMA so next round's rollouts run the smoothed policy.
         #  - reset_optim_per_iter: wipe Adam moments so stale momentum doesn't
@@ -481,6 +478,12 @@ class DAggerTrainer:
             "beta": self.beta(k),
             "new_samples": len(obs_r),
             "buffer_size": self.buffer_size(),
-            "train_mse": train_mse,
+            # `train_loss` is the per-step training loss returned by
+            # `_train_step` — NLL for Gaussian (default since the
+            # always-NLL sweep), MSE-on-mean for Deterministic, PPO-clip
+            # surrogate when `clip_ratio > 0`. `val_mse` is the held-out
+            # MSE-on-mean from `_eval_mse` regardless of training loss
+            # type, so it stays comparable across runs / policy classes.
+            "train_loss": train_loss,
             "val_mse": val_mse,
         }

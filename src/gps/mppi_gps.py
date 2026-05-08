@@ -203,26 +203,24 @@ class MPPIGPS:
         N = len(obs)
         indices = np.arange(N)
         last_loss = 0.0
-        # KL-to-prev is only defined for the Gaussian NLL path — MSE trains
-        # only the mean and has no distribution to constrain.
+        # As of the project-wide "always NLL for Gaussian" sweep, the
+        # ``distill_loss == "mse"`` opt-out is gone — Gaussian here always
+        # uses NLL via ``train_weighted``. Kept the prev-iter-KL trust
+        # region (always defined when prev_policy + coef > 0).
         use_prev_kl = (
             prev_policy is not None
             and cfg.prev_iter_kl_coef > 0.0
-            and cfg.distill_loss != "mse"
         )
         for _ in range(cfg.distill_epochs):
             np.random.shuffle(indices)
             for start in range(0, N, cfg.distill_batch_size):
                 batch = indices[start : start + cfg.distill_batch_size]
-                if cfg.distill_loss == "mse":
-                    last_loss = self.policy.mse_step(obs[batch], actions[batch])
-                else:
-                    # train_weighted computes -Σ w log π / Σ w  and does one Adam step
-                    last_loss = self.policy.train_weighted(
-                        obs[batch], actions[batch], weights[batch],
-                        prev_policy=prev_policy if use_prev_kl else None,
-                        prev_kl_coef=cfg.prev_iter_kl_coef if use_prev_kl else 0.0,
-                    )
+                # train_weighted computes -Σ w log π / Σ w  and does one Adam step
+                last_loss = self.policy.train_weighted(
+                    obs[batch], actions[batch], weights[batch],
+                    prev_policy=prev_policy if use_prev_kl else None,
+                    prev_kl_coef=cfg.prev_iter_kl_coef if use_prev_kl else 0.0,
+                )
         return last_loss
 
     # def _train_step_mse(self, obs: np.ndarray, actions: np.ndarray) -> float:
@@ -465,7 +463,7 @@ class MPPIGPS:
             # at 0 and grows with drift — harmless) so the code path is
             # unconditional; the loss just applies it when coef > 0.
             prev_policy: "GaussianPolicy | None" = None
-            if cfg.prev_iter_kl_coef > 0.0 and cfg.distill_loss != "mse":
+            if cfg.prev_iter_kl_coef > 0.0:
                 prev_policy = copy.deepcopy(self.policy)
                 prev_policy.eval()
                 for p in prev_policy.parameters():
@@ -584,7 +582,7 @@ class MPPIGPS:
                 base_line += f"  buf={n_eps}eps/{n_rows}rows"
             if cfg.ema_decay > 0.0:
                 base_line += f"  ema_drift={ema_drift:.4f}"
-            if cfg.prev_iter_kl_coef > 0.0 and cfg.distill_loss != "mse":
+            if cfg.prev_iter_kl_coef > 0.0:
                 base_line += f"  prev_kl={prev_iter_kl_diag:.4f}"
             if do_eval:
                 base_line += f"  eval_cost={eval_cost:8.2f}"
