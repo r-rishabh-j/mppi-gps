@@ -188,6 +188,14 @@ class WarpMPPIGPS(MPPIGPS):
         # Inherited bookkeeping
         self._episode_buffer: list[dict] = []
         self._kl_alpha: float | None = None
+        # Policy-trust dual scalar (multiplicative α dampener). Cold-start
+        # at `policy_trust_min` under adaptive; else `policy_trust_max`
+        # (constant, == 1.0 by default → no-op).
+        self._policy_trust: float = (
+            float(gps_cfg.policy_trust_min)
+            if gps_cfg.adaptive_policy_trust
+            else float(gps_cfg.policy_trust_max)
+        )
 
         # Loud opt-out warnings for unsupported features.
         import warnings
