@@ -123,6 +123,11 @@ def parse_args():
     p.add_argument("--eval-every", type=int, default=1,
                    help="Run the per-iter policy eval every N iterations "
                         "(default from GPSConfig.eval_every). Last iter is always evaluated.")
+    p.add_argument("--distill-epochs", type=int, default=None,
+                   help="Gradient epochs over the C-step data per GPS iter's "
+                        "S-step (default from GPSConfig.distill_epochs = 3). "
+                        "Bump to 5–10 with --distill-buffer-cap or for high-DoF "
+                        "envs where one pass per iter undertrains.")
     p.add_argument("--distill-buffer-cap", type=int, default=0,
                    help="Cross-iteration distillation buffer capacity, measured in "
                         "(obs, action) rows (matches DAgger's --buffer-cap convention). "
@@ -267,6 +272,8 @@ def main():
         gps_cfg.eval_ep_len = args.eval_len
     if args.distill_buffer_cap is not None:
         gps_cfg.distill_buffer_cap = args.distill_buffer_cap
+    if args.distill_epochs is not None:
+        gps_cfg.distill_epochs = args.distill_epochs
     if args.reset_optim_per_iter:
         gps_cfg.reset_optim_per_iter = True
     if args.prev_iter_kl_coef is not None:
