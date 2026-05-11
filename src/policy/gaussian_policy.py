@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.policy import USE_ACT_NORM
+from src.policy import USE_ACT_NORM, featurize_obs, featurized_dim
 from src.policy.ema import EMA
 from src.utils.config import PolicyConfig
 
@@ -73,18 +73,44 @@ class GaussianPolicy(nn.Module):
         activations = {"relu": nn.ReLU, "tanh": nn.Tanh}
         act_fn = activations[cfg.activation]
 
-        self.normalizer = RunningNormalizer(obs_dim) if cfg.obs_norm else None
+        # ---- Input pre-processor (see DeterministicPolicy for rationale) ----
+        self._featurize_mode = getattr(cfg, "featurize", "running_norm")
+        if self._featurize_mode == "hand_crafted":
+            self.normalizer = None
+            mlp_in = featurized_dim(obs_dim)
+        else:
+            self.normalizer = RunningNormalizer(obs_dim) if cfg.obs_norm else None
+            mlp_in = obs_dim
+
+        # ---- MLP stack with optional reg toggles ----
+        use_dropout = getattr(cfg, "use_dropout", True)
+        use_layernorm = getattr(cfg, "use_layernorm", True)
+        dropout_p = getattr(cfg, "dropout_p", None)
+        if dropout_p is None:
+            dropout_p = 0.1   # legacy default for the Gaussian policy
 
         layers = []
-        in_dim = obs_dim
+        in_dim = mlp_in
         for h in cfg.hidden_dims:
-            layers += [nn.Linear(in_dim, h), act_fn(),nn.LayerNorm(h), nn.Dropout(0.1)]
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(act_fn())
+            if use_layernorm:
+                layers.append(nn.LayerNorm(h))
+            if use_dropout:
+                layers.append(nn.Dropout(dropout_p))
             in_dim = h
         layers.append(nn.Linear(in_dim, 2 * act_dim))
         self.net = nn.Sequential(*layers)
 
         # Init log_sigma head bias to 0 → sigma ≈ 1 at start.
         nn.init.zeros_(self.net[-1].bias[act_dim:])
+
+        # Optional tanh on the mu head only. log_sigma stays unbounded
+        # (clamped to [log_sigma_min, log_sigma_max] in `_head`). When on,
+        # `mu` is in normalized action space (-1, 1) and `_to_phys` maps
+        # it to the physical range. NLL and PPO surrogates work unchanged
+        # — they read `mu` and `log_sigma` independently.
+        self._tanh_squash = bool(getattr(cfg, "tanh_squash", False))
 
         # Bounds are used to clip at execution time (act_np). When the
         # action-norm toggle is on, we additionally register a per-dim
@@ -154,11 +180,20 @@ class GaussianPolicy(nn.Module):
         return (physical - self._act_bias) / self._act_scale
 
     def _head(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply normalizer + MLP, return (mu, log_sigma) in NORMALIZED action
-        space when the toggle is on, otherwise in physical space (legacy)."""
-        x = self.normalizer(obs) if self.normalizer is not None else obs
+        """Apply (featurize|normalizer) + MLP, return (mu, log_sigma) in
+        NORMALIZED action space when USE_ACT_NORM is on, otherwise in
+        physical space (legacy). When `tanh_squash` is on, `mu` is tanh-
+        squashed to (-1, 1) before returning."""
+        if self._featurize_mode == "hand_crafted":
+            x = featurize_obs(obs)
+        elif self.normalizer is not None:
+            x = self.normalizer(obs)
+        else:
+            x = obs
         out = self.net(x)
         mu, log_sigma = out[..., :self.act_dim], out[..., self.act_dim:]
+        if self._tanh_squash:
+            mu = torch.tanh(mu)
         log_sigma = log_sigma.clamp(self.cfg.log_sigma_min, self.cfg.log_sigma_max)
         return mu, log_sigma
 

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.policy import USE_ACT_NORM
+from src.policy import USE_ACT_NORM, featurize_obs, featurized_dim
 from src.policy.ema import EMA
 from src.policy.gaussian_policy import RunningNormalizer
 from src.utils.config import PolicyConfig
@@ -33,14 +33,50 @@ class DeterministicPolicy(nn.Module):
         activations = {"relu": nn.ReLU, "tanh": nn.Tanh}
         act_fn = activations[cfg.activation]
 
-        self.normalizer = RunningNormalizer(obs_dim) if cfg.obs_norm else None
+        # ---- Input pre-processor ---------------------------------------
+        # "hand_crafted" featurization is env-aware (see src/policy/__init__.py).
+        # It already produces ~unit-scaled features, so we bypass
+        # RunningNormalizer in that mode. Effective input dim into the MLP
+        # is whatever `featurized_dim(obs_dim)` returns.
+        self._featurize_mode = getattr(cfg, "featurize", "running_norm")
+        if self._featurize_mode == "hand_crafted":
+            self.normalizer = None
+            mlp_in = featurized_dim(obs_dim)
+        else:
+            self.normalizer = RunningNormalizer(obs_dim) if cfg.obs_norm else None
+            mlp_in = obs_dim
+
+        # ---- MLP stack -------------------------------------------------
+        # `use_dropout` / `use_layernorm` (PolicyConfig) toggle the per-
+        # hidden-layer regularisation. Default keeps both on (legacy
+        # behaviour, biased for high-DoF envs). Flip both off to match
+        # upstream's plain MLP + tanh setup for tiny tasks (point_mass,
+        # acrobot) where the regularisation over-smooths.
+        use_dropout = getattr(cfg, "use_dropout", True)
+        use_layernorm = getattr(cfg, "use_layernorm", True)
+        dropout_p = getattr(cfg, "dropout_p", None)
+        if dropout_p is None:
+            dropout_p = 0.2   # legacy default for the deterministic policy
 
         layers = []
-        in_dim = obs_dim
+        in_dim = mlp_in
         for h in cfg.hidden_dims:
-            layers += [nn.Linear(in_dim, h), act_fn(),nn.LayerNorm(h), nn.Dropout(0.2)]
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(act_fn())
+            if use_layernorm:
+                layers.append(nn.LayerNorm(h))
+            if use_dropout:
+                layers.append(nn.Dropout(dropout_p))
             in_dim = h
         layers.append(nn.Linear(in_dim, act_dim))
+        # Optional tanh on the output. When on, the network output is
+        # bounded to (-1, 1) in NORMALIZED action space and `_to_phys`
+        # denormalizes. The `act_np` clamp then becomes a safety net (it
+        # can still fire if tanh saturates exactly at ±1 and the affine
+        # is non-trivial, but it's a no-op in the typical case).
+        self._tanh_squash = bool(getattr(cfg, "tanh_squash", False))
+        if self._tanh_squash:
+            layers.append(nn.Tanh())
         self.net = nn.Sequential(*layers)
 
         # Action bounds + optional output-norm affine. See
@@ -102,7 +138,12 @@ class DeterministicPolicy(nn.Module):
         """Network-internal output: NORMALIZED action space when the toggle
         is on, physical space otherwise. Use `action()` for a physical-
         space tensor at the user-facing boundary."""
-        x = self.normalizer(obs) if self.normalizer is not None else obs
+        if self._featurize_mode == "hand_crafted":
+            x = featurize_obs(obs)
+        elif self.normalizer is not None:
+            x = self.normalizer(obs)
+        else:
+            x = obs
         return self.net(x)
 
     def action(self, obs: torch.Tensor) -> torch.Tensor:

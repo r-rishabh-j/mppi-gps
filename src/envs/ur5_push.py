@@ -211,6 +211,10 @@ class UR5Push(MuJoCoEnv):
 
     def reset(self, state: np.ndarray | None = None) -> np.ndarray:
         if state is not None:
+            # State-restore path. Parent calls our overridden `set_state`,
+            # which unpacks the trailing target_pos entries from the
+            # extended state vector and syncs `self._target_pos` + mocap.
+            # See module-level note on get_state/set_state below.
             return super().reset(state=state)
 
         mujoco.mj_resetData(self.model, self.data)
@@ -223,6 +227,62 @@ class UR5Push(MuJoCoEnv):
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs()
 
+    # ------------------------------------------------------------------
+    # State capture/restore — extended with target_pos so condition-
+    # restore round-trips through MPPI / GPS / DAgger correctly.
+    #
+    # MuJoCo's `mjSTATE_FULLPHYSICS` in our version does NOT include
+    # `mjSTATE_MOCAP_POS`, so the captured state alone doesn't carry the
+    # target marker. Without this override, GPS C-step `env.reset(state=
+    # ic_state)` would leave `self._target_pos` stale (last value sampled
+    # by an in-the-clear `env.reset()`) and mocap reset to its XML pose,
+    # so every (obs, action) in n−1 of n conditions trained on the wrong
+    # target. Same bug as PointMass — see that env's docstring.
+    # ------------------------------------------------------------------
+
+    def get_state(self) -> np.ndarray:
+        physics = super().get_state()                       # FULLPHYSICS
+        return np.concatenate([physics, self._target_pos])  # +3 target_xyz
+
+    def set_state(self, state: np.ndarray) -> None:
+        # Accept extended (state_dim) and raw (FULLPHYSICS) inputs so any
+        # legacy caller still works (target cache unchanged in the raw
+        # branch — same as prior behaviour).
+        if state.shape[-1] == self._nstate + 3:
+            super().set_state(state[: self._nstate])
+            tgt = state[self._nstate : self._nstate + 3]
+            self._target_pos = np.asarray(tgt, dtype=np.float64).copy()
+            self.data.mocap_pos[0] = self._target_pos
+        else:
+            super().set_state(state)
+
+    @property
+    def state_dim(self) -> int:
+        return self._nstate + 3
+
+    def batch_rollout(
+        self,
+        initial_state: np.ndarray,
+        action_sequences: np.ndarray,         # (K, H, 3)
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # Strip the trailing target_pos from the captured state before
+        # handing off to mujoco.rollout (which expects FULLPHYSICS shape),
+        # then broadcast it into self._target_pos for running_cost /
+        # terminal_cost. One MPPI call has one target, so all K rollouts
+        # share the same target — taking the first row is safe.
+        initial_state = np.asarray(initial_state)
+        if initial_state.shape[-1] == self._nstate + 3:
+            if initial_state.ndim == 1:
+                tgt = initial_state[self._nstate : self._nstate + 3]
+            else:
+                tgt = initial_state[0, self._nstate : self._nstate + 3]
+            self._target_pos = np.asarray(tgt, dtype=np.float64).copy()
+            self.data.mocap_pos[0] = self._target_pos
+            initial_state = initial_state[..., : self._nstate]
+        return super().batch_rollout(
+            initial_state, self._expand_action(action_sequences),
+        )
+
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         action = np.clip(action, self.action_bounds[0], self.action_bounds[1])
         action_full = self._expand_action(action)
@@ -234,17 +294,6 @@ class UR5Push(MuJoCoEnv):
         info["tape_to_target"] = float(np.linalg.norm(tape - self._target_pos))
         info["success"] = bool(info["tape_to_target"] < _SUCCESS_DIST)
         return obs, cost_arr, done, info
-
-    def batch_rollout(
-        self,
-        initial_state: np.ndarray,
-        action_sequences: np.ndarray,         # (K, H, 3)
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # Pad active-only actions with wrist setpoints, then hand off to
-        # the parent's C-side mujoco.rollout — no Python in the hot loop.
-        return super().batch_rollout(
-            initial_state, self._expand_action(action_sequences),
-        )
 
     # ------------------------------------------------------------------
     # Observation

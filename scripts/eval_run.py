@@ -25,12 +25,14 @@ X-axis steps formula (per training iteration):
             (no /open_loop divisor — relabel forces a full rollout per
             env step.)
 
-Checkpoint ``iter_k`` is plotted at ``(k+1) * steps_per_iter``. DAgger's
-``warmup_rollouts`` phase (a one-time fixed offset of ~hundreds of
-millions of physics steps for typical configs) is intentionally NOT
-added to the curve — it would visually push the whole DAgger curve to
-the right and obscure per-iter cost differences. The warmup count is
-still computed and printed in the per-run breakdown for transparency.
+Checkpoint ``iter_k`` is plotted at ``k * steps_per_iter`` — so every
+curve starts at x=0 regardless of per-iter cost (e.g. DAgger's 82M
+per-iter on hopper vs GPS's 27M does not push DAgger right by 55M at
+iter 0). DAgger's ``warmup_rollouts`` phase (a one-time fixed offset)
+is also intentionally NOT added — it would visually push the whole
+DAgger curve to the right and obscure per-iter cost differences. The
+warmup count is still computed and printed in the per-run breakdown
+for transparency.
 
 CSV is intentionally NOT read — costs are recomputed live so this script
 is the source of truth for the curve.
@@ -468,14 +470,13 @@ def _eval_one_run(
             n_misses += 1
             tag = "fresh "
 
-        # Warmup is intentionally NOT added — DAgger's `warmup_rollouts`
-        # phase happens before iter 0 and produces a one-time fixed offset
-        # (~hundreds of millions of physics steps for typical configs)
-        # that visually pushes the entire DAgger curve to the right and
-        # dwarfs the per-iter cost differences we're trying to compare.
-        # The offset is still computed and printed in the breakdown for
-        # auditability — see `_steps_per_iter` and the per-run banner.
-        steps = (it_idx + 1) * steps_per_iter
+        # Plot iter k at `k * steps_per_iter` so every curve starts at x=0
+        # (iter 0 = "cost before any training steps were charged"). Previously
+        # this was `(k+1) * steps_per_iter`, which forced each curve's first
+        # point to its own per-iter cost and made methods with different
+        # per-iter budgets (e.g. DAgger 82M vs GPS 27M on hopper) look
+        # offset at the start. Warmup is still NOT added — see header.
+        steps = it_idx * steps_per_iter
         iter_indices.append(it_idx)
         cum_steps.append(steps)
         mean_costs.append(mean_cost)
@@ -661,20 +662,40 @@ def main() -> None:
                    label=f"MPPI baseline")
                         #  f"mean={mppi_mean:.1f})")
 
-    ax.set_xlabel("Cumulative env-physics steps")
-    ax.set_ylabel("Episode cost (lower = better)")
-    title = f"{env_name} — {run_dir.name}"
+    # Right-align curves: clip x-axis to the SHORTEST run's right edge so
+    # every curve terminates at the same x. Avoids the longest-run trailing
+    # off solo to the right and visually swamping the others. Each curve's
+    # data is unchanged — matplotlib just doesn't render past x_max.
+    curve_endpoints: list[float] = []
+    for res, scale in [
+        (primary, args.gps_x_scale),
+        (secondary, args.bc_x_scale),
+        (tertiary, args.dagger_x_scale),
+    ]:
+        if res is not None and res["cum_steps"]:
+            curve_endpoints.append(max(res["cum_steps"]) * scale)
+    if curve_endpoints:
+        ax.set_xlim(left=0, right=min(curve_endpoints))
+
+    ax.set_xlabel("Cumulative Environment Steps (1e8)", fontsize=14)
+    ax.set_ylabel("Episode Cost", fontsize=14)
+    title = f"{env_name} - MPPI-GPS"
     if secondary is not None:
         title += f"  vs  {bc_run_dir.name}"
     if tertiary is not None:
         title += f"  vs  {dagger_run_dir.name}"
-    ax.set_title(title)
+    ax.set_title(title, fontsize=14)
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    # Park the legend outside the axes (upper-right of the figure) so it
+    # never overlaps the curves regardless of where they end up.
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0),
+              borderaxespad=0.0, frameon=True)
     fig.tight_layout()
 
     out_plot = Path(args.out) if args.out else (run_dir / "eval_curve.png")
-    fig.savefig(out_plot, dpi=150)
+    # bbox_inches='tight' makes savefig include the out-of-axes legend in
+    # the rendered image (otherwise it gets clipped).
+    fig.savefig(out_plot, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[eval-run] plot → {out_plot}")
 

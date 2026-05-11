@@ -91,8 +91,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init-ckpt", default=None,
                    help="warm-start: load a wrapped or raw state_dict into the policy "
                         "before training. Must match --deterministic.")
-    p.add_argument("--num-epochs", type=int, default=10000)
-    p.add_argument("--batch-size", type=int, default=4084)
+    p.add_argument("--num-epochs", type=int, default=20000)
+    p.add_argument("--batch-size", type=int, default=20000)
     p.add_argument("--val-frac", type=float, default=0,
                    help="fraction of trajectories (not transitions) held out for val")
     p.add_argument("--eval-every", type=int, default=5000,
@@ -102,6 +102,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-eval-eps", type=int, default=10)
     p.add_argument("--eval-ep-len", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--disable-tanh", action="store_true",
+                   help="Disable the default tanh squash on the policy head "
+                        "(see PolicyConfig.tanh_squash). Use when reproducing "
+                        "pre-tanh experiments.")
     p.add_argument("--exp-name", default="run",
                    help="human-readable experiment name (goes in the run dir name)")
     p.add_argument("--exp-dir", default="checkpoints/bc",
@@ -240,10 +244,12 @@ def main() -> None:
         )
 
     policy_cfg = PolicyConfig.for_env(args.env)
+    if args.disable_tanh:
+        policy_cfg.tanh_squash = False
     PolicyCls = DeterministicPolicy if args.deterministic else GaussianPolicy
     policy = PolicyCls(obs_dim, act_dim, policy_cfg,
                        device=device, action_bounds=env.action_bounds)
-    print(f"policy: {PolicyCls.__name__}  device: {device}")
+    print(f"policy: {PolicyCls.__name__}  device: {device}  tanh={policy_cfg.tanh_squash}")
 
     if args.init_ckpt is not None:
         init_ckpt = Path(args.init_ckpt)

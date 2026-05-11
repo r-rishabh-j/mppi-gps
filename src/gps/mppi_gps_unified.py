@@ -43,7 +43,7 @@ from src.mppi.mppi import MPPI
 from src.policy.deterministic_policy import DeterministicPolicy
 from src.policy.gaussian_policy import GaussianPolicy
 from src.utils.config import GPSConfig, MPPIConfig, PolicyConfig
-from src.utils.evaluation import evaluate_policy
+from src.utils.evaluation import evaluate_mppi, evaluate_policy
 from src.utils.experiment import copy_as, save_checkpoint
 
 
@@ -182,6 +182,49 @@ def estimate_kl_p_to_policy(
     )
     kl_per_state = kl_per_dim.sum(axis=-1)        # (N,)
     return float(kl_per_state.mean())              # scalar — average over states
+
+
+# ---------------------------------------------------------------------------
+# Policy-trust α dampener (adapted from jaiselsingh1/mppi-gps `gps_train.py`)
+# ---------------------------------------------------------------------------
+
+def compute_policy_trust(
+    *,
+    policy_cost: float | None,
+    raw_mppi_cost: float | None,
+    eval_episode_len: int,
+    cfg: GPSConfig,
+) -> float:
+    """Map (policy_cost, raw_mppi_cost) → trust scalar in [min, max].
+
+    Mirrors upstream's `compute_policy_trust` semantics: linearly interpolate
+    between `policy_trust_min` (policy is "as bad as no policy") and
+    `policy_trust_max` (policy is as good as raw MPPI), clipped to the
+    bounds. The interpolation is in **per-step** cost space so the result is
+    invariant to changes in `eval_ep_len`.
+
+    Behaviour:
+    * Adaptive disabled → always returns `policy_trust_max` (constant).
+    * Adaptive enabled but a cost is missing (e.g. no raw-MPPI baseline)
+      → returns `policy_trust_min` (defensive: don't trust the policy
+      without a comparable baseline).
+    * Adaptive enabled with both costs → linear interpolation per the
+      `quality` formula in `GPSConfig`.
+    """
+    if not cfg.adaptive_policy_trust:
+        return float(cfg.policy_trust_max)
+    if policy_cost is None or raw_mppi_cost is None:
+        return float(cfg.policy_trust_min)
+
+    j_policy = policy_cost / max(eval_episode_len, 1)
+    j_mppi = raw_mppi_cost / max(eval_episode_len, 1)
+    j_bad = cfg.policy_trust_bad_cost_per_step
+    denom = max(j_bad - j_mppi, 1e-8)
+    quality = float(np.clip((j_bad - j_policy) / denom, 0.0, 1.0))
+    return float(
+        cfg.policy_trust_min
+        + (cfg.policy_trust_max - cfg.policy_trust_min) * quality
+    )
 
 
 def update_alpha_kl_adaptive(
@@ -343,6 +386,8 @@ class GPSHistory:
     iteration_prev_iter_kl: list[float] = field(default_factory=list)
     iteration_alpha: list[float] = field(default_factory=list)
     iteration_kl_est: list[float] = field(default_factory=list)   # MDGPS KL(p ‖ π_θ); NaN when adaptive α is off
+    iteration_policy_trust: list[float] = field(default_factory=list)        # effective trust used this iter
+    iteration_raw_mppi_eval_cost: list[float] = field(default_factory=list)  # NaN on non-eval iters or when baseline disabled
     best_iter: int = -1
     best_cost: float = float("inf")
 
@@ -411,6 +456,16 @@ class MPPIGPS:
         # schedule on the first iter that the adaptive rule activates;
         # carried iter-to-iter once active. None means "schedule path".
         self._kl_alpha: float | None = None
+
+        # Policy-trust dual scalar (multiplicative α dampener). Cold-start:
+        # `policy_trust_min` under adaptive (policy unproven → prior off),
+        # else `policy_trust_max` (constant scaling — backward compatible
+        # with the legacy unscaled path when max == 1.0).
+        self._policy_trust: float = (
+            float(gps_cfg.policy_trust_min)
+            if gps_cfg.adaptive_policy_trust
+            else float(gps_cfg.policy_trust_max)
+        )
 
         # EMA shadow over trainable params. Eval and best.pt selection happen
         # inside an ema_swapped_in() window, so the on-disk checkpoint matches
@@ -619,7 +674,9 @@ class MPPIGPS:
         # when EMA is off, etc.) so downstream code can pd.read_csv all
         # runs without per-run column gymnastics.
         csv_columns = [
-            "iter", "alpha", "mppi_cost", "distill_loss",
+            "iter", "alpha", "base_alpha", "policy_trust", "policy_trust_next",
+            "raw_mppi_eval_cost",
+            "mppi_cost", "distill_loss",
             "kl_est", "kl_target",
             "ema_drift", "prev_iter_kl",
             "buffer_eps", "buffer_rows",
@@ -667,9 +724,18 @@ class MPPIGPS:
             if use_kl_adaptive_this_iter:
                 if self._kl_alpha is None:
                     self._kl_alpha = schedule_alpha(iteration, cfg)
-                alpha = self._kl_alpha
+                base_alpha = self._kl_alpha
             else:
-                alpha = schedule_alpha(iteration, cfg)
+                base_alpha = schedule_alpha(iteration, cfg)
+
+            # Policy-trust dampener (multiplicative on top of the schedule /
+            # KL-adaptive α). With `adaptive_policy_trust=False` this is a
+            # constant `policy_trust_max` (default 1.0 → no-op). With
+            # adaptive, it gets recomputed at each eval iter and frozen
+            # between evals. Effective α drives MPPI prior strength, the
+            # α=0 rollout cache gate, and all alpha logging.
+            policy_trust_iter = float(self._policy_trust)
+            alpha = float(base_alpha) * policy_trust_iter
 
             all_obs: list[np.ndarray] = []
             all_actions: list[np.ndarray] = []
@@ -1024,6 +1090,7 @@ class MPPIGPS:
             do_eval = is_last or ((iteration + 1) % eval_every == 0)
 
             eval_cost = float("nan")
+            raw_mppi_eval_cost: float = float("nan")
             with self.policy.ema_swapped_in():
                 if do_eval:
                     self.policy.eval()
@@ -1035,6 +1102,26 @@ class MPPIGPS:
                     )
                     eval_cost = float(eval_stats["mean_cost"])
                 history.iteration_eval_costs.append(eval_cost)
+
+                # Raw-MPPI baseline eval — only on eval iters, only when
+                # `policy_trust_eval_mppi_eps > 0`. Used to feed the trust
+                # update; also logged so users can see the policy↔MPPI gap.
+                # Runs OUTSIDE the policy prior (the mppi controller's own
+                # plan_step has no prior arg), so it's a clean baseline.
+                # Recorded even when `adaptive_policy_trust=False` if
+                # baseline_eps > 0 — useful diagnostic with no extra cost.
+                if (
+                    do_eval
+                    and cfg.policy_trust_eval_mppi_eps > 0
+                ):
+                    mppi_stats = evaluate_mppi(
+                        self.env, self.mppi,
+                        n_episodes=cfg.policy_trust_eval_mppi_eps,
+                        episode_len=cfg.eval_ep_len,
+                        seed=iteration,
+                    )
+                    raw_mppi_eval_cost = float(mppi_stats["mean_cost"])
+                history.iteration_raw_mppi_eval_cost.append(raw_mppi_eval_cost)
 
                 if run_dir is not None:
                     iter_path = run_dir / f"iter_{iteration:03d}.pt"
@@ -1052,6 +1139,27 @@ class MPPIGPS:
                         history.best_iter = iteration
                         copy_as(iter_path, run_dir / "best.pt")
 
+            # Policy-trust update — fires after eval so next iter's C-step
+            # sees the refreshed dual. When eval didn't run this iter (e.g.
+            # `eval_every > 1`), the previous trust carries over. Recording
+            # this in history captures the trust *used during this iter*,
+            # not the post-update value.
+            history.iteration_policy_trust.append(policy_trust_iter)
+            if do_eval and cfg.adaptive_policy_trust:
+                policy_cost_for_trust = (
+                    eval_cost if not math.isnan(eval_cost) else None
+                )
+                raw_mppi_cost_for_trust = (
+                    raw_mppi_eval_cost
+                    if not math.isnan(raw_mppi_eval_cost) else None
+                )
+                self._policy_trust = compute_policy_trust(
+                    policy_cost=policy_cost_for_trust,
+                    raw_mppi_cost=raw_mppi_cost_for_trust,
+                    eval_episode_len=cfg.eval_ep_len,
+                    cfg=cfg,
+                )
+
             postfix = {
                 "mppi_cost": f"{mppi_cost:.2f}",
                 "loss": f"{loss:.3f}",
@@ -1064,6 +1172,8 @@ class MPPIGPS:
                 postfix["alpha"] = f"{alpha:.3f}"
             if use_kl_adaptive_this_iter:
                 postfix["kl"] = f"{kl_est_iter:.3f}"
+            if cfg.adaptive_policy_trust:
+                postfix["trust"] = f"{policy_trust_iter:.2f}→{self._policy_trust:.2f}"
             if do_eval:
                 postfix["eval_cost"] = f"{eval_cost:.2f}"
             outer_bar.set_postfix(**postfix)
@@ -1085,8 +1195,14 @@ class MPPIGPS:
                 base_line += f"  ema_drift={ema_drift:.4f}"
             if not self._deterministic and cfg.prev_iter_kl_coef > 0.0:
                 base_line += f"  prev_kl={prev_iter_kl_diag:.4f}"
+            if cfg.adaptive_policy_trust:
+                base_line += (
+                    f"  trust={policy_trust_iter:.3f}→{self._policy_trust:.3f}"
+                )
             if do_eval:
                 base_line += f"  eval_cost={eval_cost:8.2f}"
+                if not math.isnan(raw_mppi_eval_cost):
+                    base_line += f"  raw_mppi_cost={raw_mppi_eval_cost:8.2f}"
             tqdm.write(base_line)
 
             # ---- Crash-safe per-iter CSV row -------------------------------
@@ -1103,6 +1219,10 @@ class MPPIGPS:
                 row = {
                     "iter": iteration,
                     "alpha": float(alpha),
+                    "base_alpha": float(base_alpha),
+                    "policy_trust": float(policy_trust_iter),
+                    "policy_trust_next": float(self._policy_trust),
+                    "raw_mppi_eval_cost": raw_mppi_eval_cost,
                     "mppi_cost": mppi_cost,
                     "distill_loss": float(loss),
                     "kl_est": kl_est_iter,

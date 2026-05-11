@@ -60,6 +60,13 @@ def parse_args():
     p.add_argument("--deterministic", action="store_true",
                    help="Load into DeterministicPolicy. Auto-detected when the checkpoint "
                         "or sibling config.json records policy_class.")
+    p.add_argument("--disable-tanh", action="store_true",
+                   help="Force tanh squash OFF on the policy head, overriding "
+                        "whatever the run's config.json (or the current "
+                        "PolicyConfig default) says. Use when replaying a "
+                        "pre-tanh checkpoint whose config.json doesn't record "
+                        "tanh_squash — the fallback assumes False (legacy), "
+                        "so this flag is mostly a safety override.")
     p.add_argument("--video-out", default=None,
                    help="video path (default: <ckpt>_eval.mp4)")
     return p.parse_args()
@@ -103,6 +110,43 @@ def main():
     # trained with hidden_dims=(512, 512, 512) would fail to load into the
     # default (256, 256) net with a state_dict shape mismatch.
     policy_cfg = PolicyConfig.for_env(env_name)
+
+    # ---- Replay policy-architecture fields from config.json -------------
+    # We need to construct the policy with the SAME architecture it was
+    # trained under, otherwise we either get a state_dict shape mismatch
+    # (featurize="hand_crafted" changes the first layer's input dim on
+    # 4-D acrobot) or — worse — a silent behaviour change (tanh on/off
+    # is parameter-free, so the state_dict loads fine but the policy now
+    # squashes outputs that the training never expected).
+    #
+    # Fallback for legacy checkpoints with no config.json (or with a
+    # config from before these fields existed): assume the legacy
+    # architecture (no tanh, learned-norm input, dropout+layernorm).
+    # That's the architecture every pre-flip checkpoint was trained with.
+    #
+    # Lookup path: run_gps / run_dagger / test_sl all nest dataclass
+    # configs under the top-level "configs" key, so the PolicyConfig
+    # dict lives at `run_cfg["configs"]["policy"]`. A top-level "policy"
+    # key is also tolerated for forward compatibility.
+    run_policy_cfg = (
+        ((run_cfg or {}).get("configs") or {}).get("policy")
+        or (run_cfg or {}).get("policy")
+        or {}
+    )
+    LEGACY = {
+        "tanh_squash": False,
+        "featurize": "running_norm",
+        "use_dropout": True,
+        "use_layernorm": True,
+        "dropout_p": None,
+    }
+    for key, legacy_value in LEGACY.items():
+        # Prefer the value recorded at training time; fall back to legacy.
+        setattr(policy_cfg, key, run_policy_cfg.get(key, legacy_value))
+    # CLI override: --disable-tanh wins regardless of source.
+    if args.disable_tanh:
+        policy_cfg.tanh_squash = False
+
     bounds = env.action_bounds
     PolicyCls = DeterministicPolicy if use_deterministic else GaussianPolicy
     policy = PolicyCls(env.obs_dim, env.action_dim, policy_cfg,
@@ -126,7 +170,11 @@ def main():
         )
     policy.eval()
 
-    print(f"env={env_name}  device={device}  policy={PolicyCls.__name__}  ckpt={ckpt_path}")
+    print(
+        f"env={env_name}  device={device}  policy={PolicyCls.__name__}  "
+        f"tanh={policy_cfg.tanh_squash}  featurize={policy_cfg.featurize}  "
+        f"ckpt={ckpt_path}"
+    )
     if run_cfg:
         print(f"  from run: name={run_cfg.get('name')}  start_time={run_cfg.get('start_time')}  "
               f"best_iter={run_cfg.get('best_iter')}  best_cost={run_cfg.get('best_cost')}")

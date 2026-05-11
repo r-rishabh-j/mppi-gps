@@ -28,7 +28,12 @@
       <geom name="pointmass" type="sphere" size=".01" material="self" mass=".3"/>
     </body>
 
-    <geom name="target" pos="0 0 .01" material="target" type="sphere" size=".015"/>
+    <!-- Mocap target — position is set per-reset via data.mocap_pos[0].
+         No collision (contype=0/conaffinity=0); purely a goal indicator. -->
+    <body name="target_marker" mocap="true" pos="0 0 .01">
+      <geom name="target" material="target" type="sphere" size=".015"
+            contype="0" conaffinity="0"/>
+    </body>
   </worldbody>
 
   <tendon>

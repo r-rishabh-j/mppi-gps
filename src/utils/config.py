@@ -58,6 +58,53 @@ class PolicyConfig:
     obs_norm: bool = True
     log_sigma_min: float = -3.0
     log_sigma_max: float = 0.0
+    # ---- Output activation -----------------------------------------------
+    # When True (default), both `GaussianPolicy` and `DeterministicPolicy`
+    # apply `tanh` to the network output (Gaussian: to `mu` only — log_sigma
+    # keeps its clamp range; Deterministic: appended to the MLP). The
+    # network's output is then bounded to (-1, 1) in NORMALIZED action
+    # space; `_to_phys` denormalizes to physical. Matches `jaiselsingh1/
+    # mppi-gps`'s `DeterministicPolicy` (which always squashes) and the
+    # tanh-Gaussian variant common in SAC.
+    #
+    # Backward compat: pre-tanh checkpoints (those trained with this set
+    # to False) ARE state_dict-compatible (Tanh has no parameters), but
+    # loading them under `tanh_squash=True` would silently squash an
+    # output that the network never learned to expect → wrong actions.
+    # `eval_checkpoint`, `run_dagger`, `test_sl`, and `run_gps` all expose
+    # `--disable-tanh` to force this off; `eval_checkpoint` additionally
+    # reads `policy.tanh_squash` from the run dir's `config.json` when
+    # present, so a checkpoint trained under one setting replays under
+    # that setting regardless of the global default.
+    tanh_squash: bool = True
+    # ---- Input featurization --------------------------------------------
+    # "running_norm" (default): learned per-dim mean/var via `RunningNormalizer`.
+    #                           Backward-compatible with every existing
+    #                           checkpoint and env.
+    # "hand_crafted":           Use the env-aware feature transform in
+    #                           `src.policy.featurize_obs` (port of upstream
+    #                           `gaussian_policy.featurize_obs`). Currently
+    #                           supports 4-D acrobot (→ 6-D sin/cos +
+    #                           scaled vel) and 6-D point_mass (→ 6-D
+    #                           normalised delta + vel + goal). For unknown
+    #                           obs dims, falls back to identity (which is
+    #                           equivalent to "running_norm" with `obs_norm=False`).
+    #
+    # When "hand_crafted", `RunningNormalizer` is bypassed — the featurizer
+    # already produces a roughly unit-scaled, info-dense input.
+    featurize: str = "running_norm"
+    # ---- Regularisation toggles ------------------------------------------
+    # Default True preserves the current architecture (Dropout 0.2/0.1 +
+    # LayerNorm between hidden layers — biased toward robustness for high-DoF
+    # envs). For tiny tasks (point_mass, acrobot) the regularisation can
+    # over-smooth a 2-layer MLP fed by only 1k–10k pairs/iter — flip both
+    # off to match upstream's plain MLP + tanh setup.
+    use_dropout: bool = True
+    use_layernorm: bool = True
+    # Dropout probability (only used when `use_dropout=True`). Det uses 0.2,
+    # Gaussian uses 0.1 in the legacy stack — those are encoded in each
+    # class. This field overrides for both when set.
+    dropout_p: float | None = None
 
     @classmethod
     def for_env(cls, env_name: str) -> "PolicyConfig":
@@ -92,7 +139,7 @@ class GPSConfig:
     # see the schedule fields below and `mppi_gps_unified.schedule_alpha`.
     policy_augmented_alpha: float = 0.1
     distill_batch_size: int = 1024   # mini-batch size for policy distillation
-    distill_epochs: int = 30         # gradient epochs per GPS iteration
+    distill_epochs: int = 3         # gradient epochs per GPS iteration
     warm_start_policy: bool = False  # warm-start MPPI nominal U from policy rollout
     # NOTE: ``distill_loss`` is vestigial after the project-wide
     # "always NLL for Gaussian" sweep. Gaussian S-step always uses
@@ -291,6 +338,48 @@ class GPSConfig:
     # prior. 0 disables the floor (legacy behaviour: estimator clamps at
     # 1e-6 and returns near-pathological KL whenever ESS is low).
     kl_sigma_floor_frac: float = 0.5
+
+    # ---- Policy-trust α dampener (adapted from jaiselsingh1/mppi-gps `gps_train.py`)
+    #
+    # Multiplicative scale on whatever α the alpha schedule (or KL-adaptive
+    # rule) returns. The trust is recomputed each eval iter from the policy
+    # vs raw-MPPI cost gap so the prior gets *turned off* while the policy is
+    # bad (MPPI explores freely) and *ramps in* as the policy catches up to
+    # MPPI — exactly the behaviour upstream achieves with `lambda_track =
+    # lambda_policy_track * policy_trust`.
+    #
+    # Per eval iter:
+    #     j_policy = policy_eval_cost / eval_ep_len      (per-step)
+    #     j_mppi   = raw_mppi_eval_cost / eval_ep_len    (per-step)
+    #     j_bad    = policy_trust_bad_cost_per_step
+    #     quality  = clip((j_bad - j_policy) / max(j_bad - j_mppi, 1e-8), 0, 1)
+    #     trust    = policy_trust_min + (policy_trust_max - policy_trust_min) * quality
+    # Effective α for the *next* C-step is `trust * base_alpha`. Trust is
+    # frozen on non-eval iters.
+    #
+    # With `adaptive_policy_trust=False` (default), trust is pinned at
+    # `policy_trust_max` every iter — set `policy_trust_max=1.0` (default)
+    # for byte-identical legacy behaviour (no scaling at all).
+    adaptive_policy_trust: bool = False
+    # Bounds on the dual trust scalar. With adaptive disabled, trust ≡
+    # `policy_trust_max`. With adaptive enabled, trust is initialised at
+    # `policy_trust_min` (cold start — policy unproven, prior off) and
+    # interpolates toward `policy_trust_max` as the policy approaches raw
+    # MPPI performance.
+    policy_trust_min: float = 0.0
+    policy_trust_max: float = 1.0
+    # Per-step cost threshold above which the policy is treated as "as bad as
+    # no policy" (trust → min). Env-specific: set it a healthy margin above
+    # what raw MPPI averages so the linear interpolation has headroom. E.g.
+    # for point_mass on the tuned config raw MPPI is ~0.01/step, so 0.25
+    # (upstream default) keeps the schedule meaningful.
+    policy_trust_bad_cost_per_step: float = 0.25
+    # Number of raw-MPPI baseline episodes to run on each eval iter to feed
+    # the trust update. 0 disables the raw-MPPI eval — trust then collapses
+    # to `policy_trust_min` whenever adaptive is on. Each baseline episode
+    # runs `cfg.eval_ep_len` plan_step calls, so keep this small on
+    # expensive envs (e.g. 1 for adroit; 3–5 for point_mass / acrobot).
+    policy_trust_eval_mppi_eps: int = 1
 
     # PPO-style probability ratio clip for the Gaussian S-step surrogate
     # in `mppi_gps_unified._train_step_ppo_clip`. 0.0 = disabled (default;

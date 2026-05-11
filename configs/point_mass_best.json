@@ -1,0 +1,8 @@
+{
+  "K": 256,
+  "H": 32,
+  "noise_sigma": 0.5,
+  "lam": 0.0001,
+  "adaptive_lam": false,
+  "open_loop_steps": 3
+}

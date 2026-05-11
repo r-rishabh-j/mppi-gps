@@ -211,6 +211,76 @@ def parse_args():
                         "Ignored without --deterministic. Prefer --grad-clip-norm "
                         "unless you specifically want action-space (vs parameter-"
                         "space) trust-region semantics.")
+    # ---- Policy architecture knobs (port from upstream `gaussian_policy.py` /
+    # `deterministic_policy.py` — see PolicyConfig docstrings) ----
+    p.add_argument("--disable-tanh", action="store_true",
+                   help="Disable the default tanh squash on the policy's "
+                        "action head (Gaussian: tanh on mu; Deterministic: "
+                        "appended after the MLP). With tanh on (default), "
+                        "the network output is bounded to (-1, 1) in "
+                        "normalized action space and `_to_phys` denormalizes "
+                        "to physical bounds — matches upstream's "
+                        "`DeterministicPolicy`. Pass this to revert to the "
+                        "legacy unbounded head + `act_np` clamp behaviour "
+                        "(use when reproducing pre-tanh experiments).")
+    p.add_argument("--featurize", default=None,
+                   choices=["running_norm", "hand_crafted"],
+                   help="Input pre-processor for the policy. 'running_norm' "
+                        "(default) uses a learned per-dim RunningNormalizer; "
+                        "'hand_crafted' uses the env-aware feature transform "
+                        "in src.policy.featurize_obs — matches upstream's "
+                        "`featurize_obs`. Supports 4-D acrobot (→ sin/cos + "
+                        "scaled vel) and 6-D point_mass (→ delta-to-goal + "
+                        "vel + goal, all normalized to ~[-1, 1]). For other "
+                        "obs dims it's a no-op (identity).")
+    p.add_argument("--no-dropout", action="store_true",
+                   help="Disable Dropout between hidden layers of the policy. "
+                        "Default keeps dropout on (0.2 det, 0.1 gaussian) — "
+                        "useful for high-DoF envs. Flip off to match "
+                        "upstream's plain-MLP setup on tiny tasks like "
+                        "point_mass / acrobot where dropout over-smooths.")
+    p.add_argument("--no-layernorm", action="store_true",
+                   help="Disable LayerNorm between hidden layers of the "
+                        "policy. Default keeps layernorm on. Mirrors "
+                        "--no-dropout — together they reproduce upstream's "
+                        "plain MLP architecture.")
+    p.add_argument("--dropout-p", type=float, default=None,
+                   help="Override the dropout probability (only relevant "
+                        "when --no-dropout is not set). Default is 0.2 for "
+                        "DeterministicPolicy, 0.1 for GaussianPolicy.")
+    # ---- Policy-trust α dampener (port of upstream `gps_train.py`) ----
+    p.add_argument("--adaptive-policy-trust", action="store_true",
+                   help="Adaptively scale alpha by a `policy_trust` dual scalar that "
+                        "reflects how close the policy's eval cost is to raw MPPI's "
+                        "eval cost. Effective alpha = base_alpha * policy_trust; "
+                        "policy_trust starts at --policy-trust-min (cold start: prior "
+                        "off, MPPI explores freely) and ramps toward --policy-trust-max "
+                        "as the policy closes the gap to MPPI. Recomputed each eval "
+                        "iter; frozen between evals. Adapted from upstream's "
+                        "`compute_policy_trust`/`make_collection_bias` (where it scaled "
+                        "lambda_policy_track). With this flag OFF (default), trust ≡ "
+                        "--policy-trust-max (1.0 by default → no scaling at all). "
+                        "Composes multiplicatively with --kl-target (KL-adaptive α) "
+                        "and --alpha-schedule.")
+    p.add_argument("--policy-trust-min", type=float, default=None,
+                   help="Lower bound on the dual trust scalar (default 0.0 — bad policy "
+                        "shuts the prior off completely). Used as the cold-start value "
+                        "for adaptive trust.")
+    p.add_argument("--policy-trust-max", type=float, default=None,
+                   help="Upper bound on the dual trust scalar (default 1.0 — good policy "
+                        "passes the prior through unchanged). Trust converges here when "
+                        "the policy matches raw MPPI's per-step cost.")
+    p.add_argument("--policy-trust-bad-cost-per-step", type=float, default=None,
+                   help="Per-step cost threshold treated as 'as bad as no policy' (trust → "
+                        "min). Env-specific; pick a margin above raw MPPI's per-step cost "
+                        "so the linear interpolation has headroom. Default 0.25 (matches "
+                        "upstream's point_mass / acrobot default).")
+    p.add_argument("--policy-trust-eval-mppi-eps", type=int, default=None,
+                   help="Number of raw-MPPI baseline episodes evaluated on each eval iter "
+                        "to feed the trust update. 0 disables the baseline (under "
+                        "--adaptive-policy-trust, trust then pins at --policy-trust-min). "
+                        "Default 1. Each episode runs --eval-len plan_step calls — keep "
+                        "small on expensive envs (adroit), can bump on cheap ones.")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint (wrapped or raw state_dict) "
                         "to load into gps.policy before the training loop")
@@ -231,6 +301,19 @@ def main():
     # which would re-allocate every GPU buffer.
     mppi_cfg = MPPIConfig.load(args.env)
     policy_cfg = PolicyConfig.for_env(args.env)
+    # Policy-architecture overrides from CLI. Each only fires if the user
+    # actually set the flag, so the per-env defaults from `for_env(...)`
+    # are preserved otherwise.
+    if args.disable_tanh:
+        policy_cfg.tanh_squash = False
+    if args.featurize is not None:
+        policy_cfg.featurize = args.featurize
+    if args.no_dropout:
+        policy_cfg.use_dropout = False
+    if args.no_layernorm:
+        policy_cfg.use_layernorm = False
+    if args.dropout_p is not None:
+        policy_cfg.dropout_p = args.dropout_p
     gps_cfg = GPSConfig()
 
     if args.gps_iters is not None:
@@ -295,6 +378,16 @@ def main():
         gps_cfg.grad_clip_norm = args.grad_clip_norm
     if args.clip_eps is not None:
         gps_cfg.clip_eps = args.clip_eps
+    if args.adaptive_policy_trust:
+        gps_cfg.adaptive_policy_trust = True
+    if args.policy_trust_min is not None:
+        gps_cfg.policy_trust_min = args.policy_trust_min
+    if args.policy_trust_max is not None:
+        gps_cfg.policy_trust_max = args.policy_trust_max
+    if args.policy_trust_bad_cost_per_step is not None:
+        gps_cfg.policy_trust_bad_cost_per_step = args.policy_trust_bad_cost_per_step
+    if args.policy_trust_eval_mppi_eps is not None:
+        gps_cfg.policy_trust_eval_mppi_eps = args.policy_trust_eval_mppi_eps
 
     device = pick_device(args.device)
     print(f"policy device: {device}")
@@ -314,10 +407,21 @@ def main():
         )
     else:
         alpha_desc = f"alpha={gps_cfg.policy_augmented_alpha}"
+    trust_desc = ""
+    if gps_cfg.adaptive_policy_trust:
+        trust_desc = (
+            f", trust=adaptive["
+            f"{gps_cfg.policy_trust_min}, {gps_cfg.policy_trust_max}], "
+            f"j_bad={gps_cfg.policy_trust_bad_cost_per_step}, "
+            f"mppi_eps={gps_cfg.policy_trust_eval_mppi_eps}"
+        )
+    elif gps_cfg.policy_trust_max != 1.0:
+        trust_desc = f", trust=const({gps_cfg.policy_trust_max})"
     print(
         f"GPS: policy={policy_class}, "
         f"{alpha_desc}, "
         f"prior={gps_cfg.policy_prior_type}"
+        f"{trust_desc}"
     )
 
     # ---- Construct trainer (needed early so we can load --init-ckpt and

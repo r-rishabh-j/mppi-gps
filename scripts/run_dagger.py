@@ -128,6 +128,11 @@ def parse_args() -> argparse.Namespace:
     # > 0). Deterministic DAgger is always MSE — no σ to fit. Saved
     # `cfg.loss_type` field on legacy DAggerConfig instances is ignored
     # by `_train_step` if encountered.
+    p.add_argument("--disable-tanh", action="store_true",
+                   help="Disable the default tanh squash on the policy head "
+                        "(see PolicyConfig.tanh_squash). Use when reproducing "
+                        "pre-tanh experiments — the legacy path uses an "
+                        "unbounded head + `act_np` clamp instead.")
     p.add_argument("--exp-name", default="run",
                    help="Human-readable experiment name (used in the run dir name).")
     p.add_argument("--exp-dir", default="checkpoints/dagger",
@@ -187,6 +192,8 @@ def main() -> None:
     obs_dim = env.obs_dim
     act_dim = env.action_dim
     policy_cfg = PolicyConfig.for_env(args.env)
+    if args.disable_tanh:
+        policy_cfg.tanh_squash = False
     bounds = env.action_bounds
     if args.deterministic:
         policy = DeterministicPolicy(obs_dim, act_dim, policy_cfg,

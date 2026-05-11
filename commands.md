@@ -9,7 +9,7 @@ uv sync
 ## MPPI (open-loop control)
 
 ```bash
-python -m scripts.run_point_mass
+python -m scripts.run_point_mass            # 2D point mass to a random goal (resampled each episode)
 python -m scripts.run_acrobot
 python -m scripts.run_hopper
 python -m scripts.run_adroit_pen     # 24-DoF Shadow Hand pen reorientation
@@ -220,6 +220,61 @@ Flags:
 - `--exp-name`, `--exp-dir` — run-dir naming (parent defaults to `experiments/gps`).
 - `--device auto|cpu|mps|cuda` — policy training device (MPPI always runs on CPU).
 
+### α dampener: adaptive policy trust
+
+Port of upstream's `compute_policy_trust` / `make_collection_bias` from
+`jaiselsingh1/mppi-gps`'s `scripts/gps_train.py`. A *trust* scalar in
+`[policy_trust_min, policy_trust_max]` multiplicatively scales whatever α
+the schedule / KL-adaptive rule produces:
+
+```
+effective_alpha = base_alpha * policy_trust
+```
+
+The trust is recomputed each eval iter from how close the policy's eval
+cost is to raw MPPI's eval cost (per-step, length-invariant):
+
+```
+quality = clip((j_bad - j_policy) / (j_bad - j_mppi), 0, 1)
+trust   = policy_trust_min + (policy_trust_max - policy_trust_min) * quality
+```
+
+Interpretation: when `j_policy ≈ j_bad` (policy is "as bad as no policy"),
+trust → min and the prior is shut off (MPPI explores freely). When
+`j_policy ≈ j_mppi` (policy matches raw MPPI), trust → max and the prior
+passes through unscaled. Linear in between, clipped to the bounds.
+
+```bash
+# Adaptive trust, prior off at iter 0 (cold start), ramps in as policy improves.
+python -m scripts.run_gps --env point_mass --gps-iters 20 \
+    --adaptive-policy-trust \
+    --policy-trust-min 0.0 --policy-trust-max 1.0 \
+    --policy-trust-bad-cost-per-step 0.5 \
+    --policy-trust-eval-mppi-eps 1 \
+    --alpha 0.1 --device auto
+
+# Pair with the alpha schedule + KL-adaptive: trust composes multiplicatively
+# on top of both. With all three on, alpha = trust * kl_alpha (after warmup).
+python -m scripts.run_gps --env adroit_relocate --auto-reset \
+    --kl-target 1.5 --alpha 0.05 --alpha-warmup-iters 5 \
+    --adaptive-policy-trust --policy-trust-bad-cost-per-step 2.0 \
+    --gps-iters 40 --device auto --policy-prior mean_distance
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--adaptive-policy-trust` | off | enable trust adaptation. Off ⇒ trust ≡ `--policy-trust-max` (1.0 default → no-op vs legacy) |
+| `--policy-trust-min` | 0.0 | lower bound + cold-start value when adaptive |
+| `--policy-trust-max` | 1.0 | upper bound (trust converges here when policy = MPPI) |
+| `--policy-trust-bad-cost-per-step` | 0.25 | per-step cost treated as "no policy". Env-specific; set above raw MPPI's per-step cost for headroom |
+| `--policy-trust-eval-mppi-eps` | 1 | raw-MPPI baseline episodes per eval iter. 0 disables the baseline (and forces trust=min under adaptive). Logged as `raw_mppi_eval_cost` either way |
+
+Notes:
+- Trust is **frozen between eval iters** — it updates only when the policy eval and raw-MPPI eval both run (`(iter+1) % eval_every == 0` or last iter).
+- Per-iter `policy_trust`, `base_alpha`, `alpha`, `raw_mppi_eval_cost` all land in `gps_log.csv` so you can plot the dual variable's trajectory.
+- The `raw_mppi_eval_cost` baseline runs **even without `--adaptive-policy-trust`** as long as `--policy-trust-eval-mppi-eps > 0` (default 1). It's a useful free diagnostic. Pass `--policy-trust-eval-mppi-eps 0` to skip the baseline calls entirely.
+- Trust composes multiplicatively with both `--alpha-schedule` and `--kl-target`. With all three active: during warmup, `alpha = schedule_alpha(iter) * trust`; after warmup with `--kl-target > 0`, `alpha = kl_alpha * trust`.
+
 ### α tuning: schedule and KL-adaptive
 
 `--alpha` controls the policy-prior weight in MPPI's cost. Three modes for choosing it per-iter, in order of sophistication:
@@ -329,6 +384,7 @@ python -m scripts.run_sb3_baseline --env Hopper-v5 --algo SAC
 
 python -m scripts.tuning.tune_acrobot
 python -m scripts.tuning.tune_hopper
+python -m scripts.tuning.tune_point_mass
 
 python -m scripts.run_ablations --env acrobot
 python -m scripts.visualisation.plot_results --env acrobot
