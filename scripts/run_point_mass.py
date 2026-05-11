@@ -75,8 +75,15 @@ def main():
 
     if frames:
         import mediapy
-        mediapy.write_video("point_mass_mppi.mp4", frames, fps=30)
-        print("saved video → point_mass_mppi.mp4")
+        # fps = 1 / (env.dt) so the mp4 plays at sim wall-clock speed. With
+        # `fps=30` (the legacy hardcoded value) and the point_mass running
+        # at 50 Hz (timestep=0.02s, frame_skip=1), the video used to play at
+        # 30/50 = 0.6× real-time — matching `eval_checkpoint` and the other
+        # runners (`run_hopper`, `run_ur5`, `run_adroit_pen`) avoids that.
+        dt = env.model.opt.timestep * env._frame_skip
+        fps = int(round(1.0 / dt))
+        mediapy.write_video("point_mass_mppi.mp4", frames, fps=fps)
+        print(f"saved video → point_mass_mppi.mp4 (fps={fps})")
     env.close()
 
 

@@ -558,8 +558,12 @@ def main():
     video_path = None
     if gps_stats["frames"]:
         video_path = run_dir / f"{args.env}.mp4"
-        mediapy.write_video(str(video_path), gps_stats["frames"], fps=30)
-        print(f"\nsaved rollout video to {video_path}")
+        # Use the env's wall-clock dt so the saved video plays real-time —
+        # matches eval_checkpoint and the per-env runners.
+        dt = env.model.opt.timestep * env._frame_skip
+        fps = int(round(1.0 / dt))
+        mediapy.write_video(str(video_path), gps_stats["frames"], fps=fps)
+        print(f"\nsaved rollout video to {video_path} (fps={fps})")
 
     # ---- Finalize config.json ----
     update_config(run_dir, {
