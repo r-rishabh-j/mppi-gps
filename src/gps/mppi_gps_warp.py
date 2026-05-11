@@ -42,6 +42,7 @@ which look identical to the CPU path's output.
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 
 import mujoco
@@ -53,6 +54,7 @@ from src.envs.base import BaseEnv
 from src.gps.mppi_gps_unified import (
     GPSHistory,
     MPPIGPS,
+    compute_policy_trust,
     estimate_kl_p_to_policy,
     make_policy_prior,
     schedule_alpha,
@@ -262,16 +264,21 @@ class WarpMPPIGPS(MPPIGPS):
 
         outer_bar = tqdm(range(num_iterations), desc="GPS-warp", unit="iter")
         for iteration in outer_bar:
-            # ---- α schedule / KL-adaptive seed (same as MPPIGPS) ----
+            # ---- α resolution: schedule / KL-adaptive → base_α → × trust ----
             use_kl_adaptive_this_iter = (
                 kl_adaptive_enabled and iteration >= cfg.alpha_warmup_iters
             )
             if use_kl_adaptive_this_iter:
                 if self._kl_alpha is None:
                     self._kl_alpha = schedule_alpha(iteration, cfg)
-                alpha = self._kl_alpha
+                base_alpha = self._kl_alpha
             else:
-                alpha = schedule_alpha(iteration, cfg)
+                base_alpha = schedule_alpha(iteration, cfg)
+
+            # Policy-trust dampener (multiplicative on base_α). Constant
+            # `policy_trust_max` when adaptive is off (no-op when max == 1).
+            policy_trust_iter = float(self._policy_trust)
+            alpha = float(base_alpha) * policy_trust_iter
 
             # ---- Reset all N executors to initial conditions ----
             self._reset_all_to(initial_conditions)
@@ -456,6 +463,30 @@ class WarpMPPIGPS(MPPIGPS):
                 eval_cost = float(eval_stats["mean_cost"])
             history.iteration_eval_costs.append(eval_cost)
 
+            # Raw-MPPI baseline (no prior) — N parallel episodes via the
+            # batched executor, ~free given warp graph capture. Feeds the
+            # trust update and logs the policy↔MPPI gap. CLI flag
+            # `policy_trust_eval_mppi_eps` is treated as a binary switch
+            # here (>0 → run the baseline; 0 → skip) because the batched
+            # path already amortises N episodes per launch — running it
+            # more times would only smooth noise marginally.
+            raw_mppi_eval_cost: float = float("nan")
+            if do_eval and cfg.policy_trust_eval_mppi_eps > 0:
+                baseline_conditions = self._sample_initial_conditions(self.N)
+                self._reset_all_to(baseline_conditions)
+                self.mppi.reset()
+                per_cond_cost = np.zeros(self.N)
+                for _t in range(cfg.eval_ep_len):
+                    states_b, _ = self._get_states_obs()
+                    actions_b, _ = self.mppi.plan_step(states_b, prior=None)
+                    for n in range(self.N):
+                        _, _, cost_n = _step_one_data(
+                            self.env, self._batch_data[n], actions_b[n],
+                        )
+                        per_cond_cost[n] += cost_n
+                raw_mppi_eval_cost = float(per_cond_cost.mean())
+            history.iteration_raw_mppi_eval_cost.append(raw_mppi_eval_cost)
+
             if run_dir is not None:
                 iter_path = run_dir / f"iter_{iteration:03d}.pt"
                 save_checkpoint(
@@ -471,6 +502,24 @@ class WarpMPPIGPS(MPPIGPS):
                     history.best_iter = iteration
                     copy_as(iter_path, run_dir / "best.pt")
 
+            # Policy-trust update — after eval so next iter's C-step sees
+            # the refreshed dual. History records the trust *used this iter*.
+            history.iteration_policy_trust.append(policy_trust_iter)
+            if do_eval and cfg.adaptive_policy_trust:
+                policy_cost_for_trust = (
+                    eval_cost if not math.isnan(eval_cost) else None
+                )
+                raw_mppi_cost_for_trust = (
+                    raw_mppi_eval_cost
+                    if not math.isnan(raw_mppi_eval_cost) else None
+                )
+                self._policy_trust = compute_policy_trust(
+                    policy_cost=policy_cost_for_trust,
+                    raw_mppi_cost=raw_mppi_cost_for_trust,
+                    eval_episode_len=cfg.eval_ep_len,
+                    cfg=cfg,
+                )
+
             postfix = {
                 "mppi": f"{mppi_cost:.2f}",
                 "loss": f"{loss:.3f}",
@@ -478,6 +527,8 @@ class WarpMPPIGPS(MPPIGPS):
             }
             if use_kl_adaptive_this_iter:
                 postfix["kl"] = f"{kl_est_iter:.3f}"
+            if cfg.adaptive_policy_trust:
+                postfix["trust"] = f"{policy_trust_iter:.2f}→{self._policy_trust:.2f}"
             outer_bar.set_postfix(**postfix)
 
             line = (
@@ -486,7 +537,13 @@ class WarpMPPIGPS(MPPIGPS):
             )
             if use_kl_adaptive_this_iter:
                 line += f"  kl_est={kl_est_iter:7.4f}/tgt={cfg.kl_target:.3f}"
+            if cfg.adaptive_policy_trust:
+                line += (
+                    f"  trust={policy_trust_iter:.3f}→{self._policy_trust:.3f}"
+                )
             line += f"  eval_cost={eval_cost:8.2f}"
+            if not math.isnan(raw_mppi_eval_cost):
+                line += f"  raw_mppi_cost={raw_mppi_eval_cost:8.2f}"
             print(line)
 
         outer_bar.close()
