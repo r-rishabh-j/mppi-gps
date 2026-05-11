@@ -13,10 +13,10 @@ Variant of ``mppi_gps_clip.py`` for a non-stochastic student policy.
 * Distillation is always MSE on (obs, action_label) pairs aggregated
   across conditions / sub-episodes / (optionally) the cross-iter buffer.
 
-* Stabilisers retained: EMA shadow + hard-sync, Adam reset, replay buffer
-  (``distill_buffer_cap``), DAgger-style relabel (gated on ``alpha > 0``),
-  warm-start MPPI from the current policy, auto-reset on termination,
-  gradient-norm clipping inside the policy's mse_step.
+* Stabilisers retained: Adam reset, replay buffer (``distill_buffer_cap``),
+  DAgger-style relabel (gated on ``alpha > 0``), warm-start MPPI from the
+  current policy, auto-reset on termination, gradient-norm clipping inside
+  the policy's mse_step.
 """
 
 from __future__ import annotations
@@ -109,7 +109,6 @@ class GPSHistory:
     iteration_costs: list[float] = field(default_factory=list)
     iteration_eval_costs: list[float] = field(default_factory=list)
     distill_losses: list[float] = field(default_factory=list)
-    iteration_ema_drift: list[float] = field(default_factory=list)
     best_iter: int = -1
     best_cost: float = float("inf")
 
@@ -144,15 +143,9 @@ class MPPIGPSDet:
 
         self.mppi = MPPI(env, mppi_cfg)
 
-        # Cross-iteration episode replay buffer (rows-capped, FIFO eviction by
-        # whole episodes). Empty when distill_buffer_cap == 0.
+        # Cross-iteration episode replay buffer (rows-capped, FIFO whole
+        # episodes). Empty when distill_buffer_cap == 0.
         self._episode_buffer: list[dict] = []
-
-        # EMA shadow over trainable params. Eval and best.pt selection happen
-        # inside an ema_swapped_in() window, so the on-disk checkpoint matches
-        # the reported eval cost.
-        if gps_cfg.ema_decay > 0.0:
-            self.policy.attach_ema(gps_cfg.ema_decay)
 
     # ----- helpers ---------------------------------------------------------
 
@@ -365,14 +358,6 @@ class MPPIGPSDet:
 
             loss = self._distill_epoch(obs_flat, act_flat, w_flat)
 
-            # Diagnostic: post-distill EMA drift. Compute BEFORE any hard-sync
-            # so the diagnostic reflects how far theta actually moved this
-            # S-step (post-sync drift would always be 0).
-            ema_drift = self.policy.ema_l2_drift() if cfg.ema_decay > 0.0 else float("nan")
-
-            # End-of-S-step stabilisers: hard-sync first, then Adam reset.
-            if cfg.ema_decay > 0.0 and cfg.ema_hard_sync:
-                self.policy.ema_sync()
             if cfg.reset_optim_per_iter:
                 self.policy.reset_optimizer()
 
@@ -380,7 +365,6 @@ class MPPIGPSDet:
             mppi_cost = float(np.mean(condition_costs))
             history.iteration_costs.append(mppi_cost)
             history.distill_losses.append(loss)
-            history.iteration_ema_drift.append(ema_drift)
 
             # ========== Eval (drives best.pt) ==========
             eval_every = max(int(getattr(cfg, "eval_every", 1)), 1)
@@ -388,32 +372,30 @@ class MPPIGPSDet:
             do_eval = is_last or ((iteration + 1) % eval_every == 0)
 
             eval_cost = float("nan")
-            with self.policy.ema_swapped_in():
-                if do_eval:
-                    self.policy.eval()
-                    eval_stats = evaluate_policy(
-                        self.policy, self.env,
-                        n_episodes=cfg.n_eval_eps,
-                        episode_len=cfg.eval_ep_len,
-                        seed=iteration,
-                    )
-                    eval_cost = float(eval_stats["mean_cost"])
-                history.iteration_eval_costs.append(eval_cost)
+            if do_eval:
+                self.policy.eval()
+                eval_stats = evaluate_policy(
+                    self.policy, self.env,
+                    n_episodes=cfg.n_eval_eps,
+                    episode_len=cfg.eval_ep_len,
+                    seed=iteration,
+                )
+                eval_cost = float(eval_stats["mean_cost"])
+            history.iteration_eval_costs.append(eval_cost)
 
-                if run_dir is not None:
-                    iter_path = run_dir / f"iter_{iteration:03d}.pt"
-                    save_checkpoint(
-                        iter_path, self.policy,
-                        iteration=iteration,
-                        mppi_cost=mppi_cost,
-                        eval_cost=eval_cost,
-                        distill_loss=loss,
-                        ema_drift=ema_drift,
-                    )
-                    if do_eval and eval_cost < history.best_cost:
-                        history.best_cost = eval_cost
-                        history.best_iter = iteration
-                        copy_as(iter_path, run_dir / "best.pt")
+            if run_dir is not None:
+                iter_path = run_dir / f"iter_{iteration:03d}.pt"
+                save_checkpoint(
+                    iter_path, self.policy,
+                    iteration=iteration,
+                    mppi_cost=mppi_cost,
+                    eval_cost=eval_cost,
+                    distill_loss=loss,
+                )
+                if do_eval and eval_cost < history.best_cost:
+                    history.best_cost = eval_cost
+                    history.best_iter = iteration
+                    copy_as(iter_path, run_dir / "best.pt")
 
             postfix = {
                 "mppi_cost": f"{mppi_cost:.2f}",
@@ -433,8 +415,6 @@ class MPPIGPSDet:
                 n_eps = len(self._episode_buffer)
                 n_rows = sum(len(ep["obs"]) for ep in self._episode_buffer)
                 base_line += f"  buf={n_eps}eps/{n_rows}rows"
-            if cfg.ema_decay > 0.0:
-                base_line += f"  ema_drift={ema_drift:.4f}"
             if do_eval:
                 base_line += f"  eval_cost={eval_cost:8.2f}"
             tqdm.write(base_line)

@@ -81,16 +81,14 @@ def make_policy_prior(policy: GaussianPolicy, env: BaseEnv, alpha: float):
 
 @dataclass
 class GPSHistory:
-    """Training metrics collected during GPS, one entry per iteration."""
-    # Mean C-step MPPI rollout cost (teacher-under-policy-prior) — diagnostic only.
+    """Training metrics, one entry per iteration."""
+    # C-step MPPI rollout cost (teacher under policy prior) — diagnostic only.
     iteration_costs: list[float] = field(default_factory=list)
-    # Greedy-policy eval cost; NaN on iterations where evaluation was skipped.
-    # This is what `best.pt` is selected on.
+    # Greedy-policy eval cost; NaN on iters where eval was skipped. `best.pt`
+    # is selected on this.
     iteration_eval_costs: list[float] = field(default_factory=list)
-    distill_losses: list[float] = field(default_factory=list)    # last distillation loss
-    # Stabiliser diagnostics — NaN when the corresponding feature is off.
-    iteration_ema_drift: list[float] = field(default_factory=list)    # ||θ − θ_ema||₂ after S-step
-    iteration_prev_iter_kl: list[float] = field(default_factory=list) # E_obs[KL(π_new || π_prev)]
+    distill_losses: list[float] = field(default_factory=list)
+    iteration_prev_iter_kl: list[float] = field(default_factory=list)  # E_obs[KL(π_new || π_prev)]
     best_iter: int = -1
     best_cost: float = float("inf")
 
@@ -135,22 +133,10 @@ class MPPIGPS:
         # (we reset its nominal U between conditions).
         self.mppi = MPPI(env, mppi_cfg)
 
-        # Cross-iteration episode replay buffer. Each entry is one whole
-        # sub-episode (dict with 'obs', 'actions', 'weights'), physically
-        # contiguous (split at every `done` boundary during C-step). Empty
-        # and unused when `gps_cfg.distill_buffer_cap == 0`.
+        # Cross-iteration episode replay buffer. Each entry is one
+        # contiguous sub-episode (split at every `done`). Unused when
+        # `gps_cfg.distill_buffer_cap == 0`.
         self._episode_buffer: list[dict] = []
-
-        # ---- Stabilisers ----
-        # EMA of the trainable policy params — tracked by the policy itself so
-        # `train_weighted` / `mse_step` update the shadow after each Adam step
-        # without the trainer having to hook in per-batch.
-        if gps_cfg.ema_decay > 0.0:
-            self.policy.attach_ema(gps_cfg.ema_decay)
-
-        # `prev_iter_kl_coef` is applied inside the S-step via a deep-copied
-        # snapshot taken at the start of each iteration's distillation loop;
-        # no persistent state is needed here.
 
     # ----- helpers ---------------------------------------------------------
 
@@ -472,16 +458,9 @@ class MPPIGPS:
             # Multiple epochs of mini-batch gradient descent
             loss = self._distill_epoch(obs_flat, act_flat, w_flat, prev_policy=prev_policy)
 
-            # Diagnostics: post-distill EMA drift and KL to the pre-S-step
-            # policy. Both default to NaN when the corresponding stabiliser
-            # is disabled so plots show a clean "not tracked" signal.
-            #
-            # IMPORTANT ordering: compute BEFORE any hard-sync / optimizer
-            # reset so the diagnostic reflects how far θ actually moved this
-            # S-step. Post-sync, drift would always be 0 (θ == shadow).
-            ema_drift = self.policy.ema_l2_drift() if cfg.ema_decay > 0.0 else float("nan")
+            # Diagnostic: KL to the pre-S-step policy. Capped at 4096 obs
+            # rows to keep it cheap. NaN when no prev_policy snapshot.
             if prev_policy is not None and len(obs_flat) > 0:
-                # Use at most 4096 obs rows to keep the diagnostic cheap.
                 diag_n = min(len(obs_flat), 4096)
                 diag_idx = np.random.choice(len(obs_flat), size=diag_n, replace=False)
                 prev_iter_kl_diag = self.policy.kl_to_np(
@@ -490,17 +469,8 @@ class MPPIGPS:
             else:
                 prev_iter_kl_diag = float("nan")
 
-            # ========== End-of-S-step stabilisers ==========
-            # 1. Hard-sync: promote the smoothed shadow to the live weights
-            #    so the NEXT iteration's MPPI prior + S-step both start from
-            #    the stable policy, not the noisy training trajectory.
-            # 2. Adam reset: wipe m/v moments. Required for correctness after
-            #    a hard-sync (moments were tied to pre-sync θ) and useful
-            #    even without it — each GPS iter is a new supervised task,
-            #    and stale momentum fights the `prev_iter_kl_coef` TR penalty.
-            # Order matters: sync first so the reset targets the post-sync θ.
-            if cfg.ema_decay > 0.0 and cfg.ema_hard_sync:
-                self.policy.ema_sync()
+            # Wipe Adam moments at end of S-step — each GPS iter is a new
+            # supervised task and stale momentum fights `prev_iter_kl_coef`.
             if cfg.reset_optim_per_iter:
                 self.policy.reset_optimizer()
 
@@ -508,59 +478,45 @@ class MPPIGPS:
             mppi_cost = float(np.mean(condition_costs))
             history.iteration_costs.append(mppi_cost)
             history.distill_losses.append(loss)
-            history.iteration_ema_drift.append(ema_drift)
             history.iteration_prev_iter_kl.append(prev_iter_kl_diag)
 
-            # ========== Policy evaluation (drives best-checkpoint selection) ==========
-            # We evaluate the student policy on fresh env resets and use THAT cost
-            # to pick best.pt. The C-step rollout cost above is the MPPI teacher
-            # under a policy prior — not a faithful measure of the student.
-            #
-            # Both eval AND the per-iter checkpoint save live inside the EMA
-            # swap window, so:
-            #   - the reported eval_cost reflects the smoothed policy;
-            #   - iter_NNN.pt on disk contains the smoothed state_dict (what
-            #     was evaluated), which in turn becomes best.pt via copy.
-            # When EMA is disabled, ema_swapped_in() is a no-op context, so
-            # behaviour is bit-for-bit identical to the pre-feature code path.
+            # Policy eval drives best.pt selection — the C-step rollout
+            # cost is the MPPI teacher under prior, not a faithful measure
+            # of the student. NaN comparisons are false, so skipped-eval
+            # iters never overwrite best.pt.
             eval_every = max(int(getattr(cfg, "eval_every", 1)), 1)
             is_last = (iteration == num_iterations - 1)
             do_eval = is_last or ((iteration + 1) % eval_every == 0)
 
             eval_cost = float("nan")
-            with self.policy.ema_swapped_in():
-                if do_eval:
-                    was_training = self.policy.training
-                    self.policy.eval()
-                    eval_stats = evaluate_policy(
-                        self.policy, self.env,
-                        n_episodes=cfg.n_eval_eps,
-                        episode_len=cfg.eval_ep_len,
-                        seed=iteration,  # vary conditions across iters but deterministic per-iter
-                    )
-                    if was_training:
-                        self.policy.train()
-                    eval_cost = float(eval_stats["mean_cost"])
-                history.iteration_eval_costs.append(eval_cost)
+            if do_eval:
+                was_training = self.policy.training
+                self.policy.eval()
+                eval_stats = evaluate_policy(
+                    self.policy, self.env,
+                    n_episodes=cfg.n_eval_eps,
+                    episode_len=cfg.eval_ep_len,
+                    seed=iteration,
+                )
+                if was_training:
+                    self.policy.train()
+                eval_cost = float(eval_stats["mean_cost"])
+            history.iteration_eval_costs.append(eval_cost)
 
-                # ========== Checkpointing ==========
-                if run_dir is not None:
-                    iter_path = run_dir / f"iter_{iteration:03d}.pt"
-                    save_checkpoint(
-                        iter_path, self.policy,
-                        iteration=iteration,
-                        mppi_cost=mppi_cost,
-                        eval_cost=eval_cost,
-                        distill_loss=loss,
-                        ema_drift=ema_drift,
-                        prev_iter_kl=prev_iter_kl_diag,
-                    )
-                    # Best is selected on eval cost only (NaN comparisons are false,
-                    # so skipped-eval iters never overwrite best.pt).
-                    if do_eval and eval_cost < history.best_cost:
-                        history.best_cost = eval_cost
-                        history.best_iter = iteration
-                        copy_as(iter_path, run_dir / "best.pt")
+            if run_dir is not None:
+                iter_path = run_dir / f"iter_{iteration:03d}.pt"
+                save_checkpoint(
+                    iter_path, self.policy,
+                    iteration=iteration,
+                    mppi_cost=mppi_cost,
+                    eval_cost=eval_cost,
+                    distill_loss=loss,
+                    prev_iter_kl=prev_iter_kl_diag,
+                )
+                if do_eval and eval_cost < history.best_cost:
+                    history.best_cost = eval_cost
+                    history.best_iter = iteration
+                    copy_as(iter_path, run_dir / "best.pt")
 
             postfix = {
                 "mppi_cost": f"{mppi_cost:.2f}",
@@ -580,8 +536,6 @@ class MPPIGPS:
                 n_eps = len(self._episode_buffer)
                 n_rows = sum(len(ep["obs"]) for ep in self._episode_buffer)
                 base_line += f"  buf={n_eps}eps/{n_rows}rows"
-            if cfg.ema_decay > 0.0:
-                base_line += f"  ema_drift={ema_drift:.4f}"
             if cfg.prev_iter_kl_coef > 0.0:
                 base_line += f"  prev_kl={prev_iter_kl_diag:.4f}"
             if do_eval:

@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-
 import numpy as np
 import torch
 import torch.nn as nn
 
 from src.policy import USE_ACT_NORM, featurize_obs, featurized_dim
-from src.policy.ema import EMA
 from src.utils.config import PolicyConfig
 
 
@@ -73,7 +70,8 @@ class GaussianPolicy(nn.Module):
         activations = {"relu": nn.ReLU, "tanh": nn.Tanh}
         act_fn = activations[cfg.activation]
 
-        # ---- Input pre-processor (see DeterministicPolicy for rationale) ----
+        # Input pre-processor: hand-crafted featurization bypasses
+        # RunningNormalizer (already produces unit-scaled features).
         self._featurize_mode = getattr(cfg, "featurize", "running_norm")
         if self._featurize_mode == "hand_crafted":
             self.normalizer = None
@@ -82,12 +80,11 @@ class GaussianPolicy(nn.Module):
             self.normalizer = RunningNormalizer(obs_dim) if cfg.obs_norm else None
             mlp_in = obs_dim
 
-        # ---- MLP stack with optional reg toggles ----
         use_dropout = getattr(cfg, "use_dropout", True)
         use_layernorm = getattr(cfg, "use_layernorm", True)
         dropout_p = getattr(cfg, "dropout_p", None)
         if dropout_p is None:
-            dropout_p = 0.1   # legacy default for the Gaussian policy
+            dropout_p = 0.1
 
         layers = []
         in_dim = mlp_in
@@ -106,20 +103,13 @@ class GaussianPolicy(nn.Module):
         nn.init.zeros_(self.net[-1].bias[act_dim:])
 
         # Optional tanh on the mu head only. log_sigma stays unbounded
-        # (clamped to [log_sigma_min, log_sigma_max] in `_head`). When on,
-        # `mu` is in normalized action space (-1, 1) and `_to_phys` maps
-        # it to the physical range. NLL and PPO surrogates work unchanged
-        # — they read `mu` and `log_sigma` independently.
+        # (clamped in `_head`). With tanh on, mu lives in normalized
+        # action space (-1, 1) and `_to_phys` denormalizes.
         self._tanh_squash = bool(getattr(cfg, "tanh_squash", False))
 
-        # Bounds are used to clip at execution time (act_np). When the
-        # action-norm toggle is on, we additionally register a per-dim
-        # affine (_act_scale, _act_bias) so the network learns/predicts in
-        # normalized action space (~[-1, 1] per dim) and we denormalize at
-        # the boundary. See `src/policy/__init__.py` for the full rationale.
-        # `_has_act_norm` is the run-time check used by `_to_phys` /
-        # `_to_norm` — set only when both the toggle is on AND we have
-        # bounds to derive the affine from.
+        # Action bounds clamp at execution time. When USE_ACT_NORM is on,
+        # also register a per-dim affine so the head trains/predicts in
+        # normalized action space and we denormalize at the boundary.
         self._has_act_norm = False
         if action_bounds is not None:
             low, high = action_bounds
@@ -144,12 +134,6 @@ class GaussianPolicy(nn.Module):
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=cfg.lr)
 
-        # Optional EMA tracker over trainable parameters. Attached via
-        # `attach_ema(decay)` from the trainer; when set, `train_weighted`
-        # and `mse_step` call `ema.update(self)` after each Adam step so the
-        # shadow weights track the training weights with low-pass smoothing.
-        self.ema: EMA | None = None
-
     @property
     def device(self) -> torch.device:
         return self._device
@@ -159,31 +143,22 @@ class GaussianPolicy(nn.Module):
         self._device = next(self.parameters()).device
         return out
 
-    # ------------------------------------------------------------------
-    # Action-space (de)normalization helpers
-    # ------------------------------------------------------------------
-    # When the action-norm toggle is on, the network operates in the
-    # normalized action space (~[-1, 1] per dim) and these convert at
-    # the boundary. Both are no-ops when `_has_act_norm` is False, so
-    # the toggle off path is byte-identical to the pre-norm code.
+    # Action-space (de)normalization. No-ops when `_has_act_norm` is False.
 
     def _to_phys(self, normalized: torch.Tensor) -> torch.Tensor:
-        """Map normalized network output to physical action space."""
         if not self._has_act_norm:
             return normalized
         return normalized * self._act_scale + self._act_bias
 
     def _to_norm(self, physical: torch.Tensor) -> torch.Tensor:
-        """Map physical action to normalized action space."""
         if not self._has_act_norm:
             return physical
         return (physical - self._act_bias) / self._act_scale
 
     def _head(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply (featurize|normalizer) + MLP, return (mu, log_sigma) in
-        NORMALIZED action space when USE_ACT_NORM is on, otherwise in
-        physical space (legacy). When `tanh_squash` is on, `mu` is tanh-
-        squashed to (-1, 1) before returning."""
+        """(featurize|normalizer) + MLP → (mu, log_sigma). mu is in
+        NORMALIZED action space when USE_ACT_NORM is on (physical
+        otherwise); tanh-squashed when `tanh_squash` is True."""
         if self._featurize_mode == "hand_crafted":
             x = featurize_obs(obs)
         elif self.normalizer is not None:
@@ -198,26 +173,17 @@ class GaussianPolicy(nn.Module):
         return mu, log_sigma
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """obs: (B, obs_dim) → mu: (B, act_dim), log_sigma: (B, act_dim).
-
-        Returns the network-internal head — same as `_head`. Callers that
-        need the *physical* mean should use `action()` instead, which
-        passes through `_to_phys`.
-        """
+        """Returns the network-internal head — same as `_head`. Use
+        `action()` for a physical-space mean."""
         return self._head(obs)
 
     def log_prob(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """log π(actions | obs), shape (B,). Plain diagonal Gaussian.
+        """log π(actions | obs), shape (B,). Diagonal Gaussian.
 
-        ``actions`` is taken in PHYSICAL space (matches the rest of the
-        policy's external API and the action arrays MPPI hands in). When
-        the action-norm toggle is on, we normalize the actions before
-        evaluating the density against the network's normalized head; the
-        Jacobian of the affine ``a = scale·n + bias`` is a constant per
-        dim that cancels in any softmin / KL / gradient computation, so
-        we omit it. Absolute log-prob values across runs with different
-        toggle settings differ by `Σ log scale_i` — irrelevant for any
-        downstream use here (MPPI prior, KL drift, NLL loss).
+        `actions` is in PHYSICAL space; we normalize before evaluating
+        against the head. The Jacobian of the affine `a = scale·n + bias`
+        is constant per dim and cancels in any softmin / KL / gradient,
+        so we omit it.
         """
         actions = self._to_norm(actions)
         mu, log_sigma = self._head(obs)
@@ -240,27 +206,15 @@ class GaussianPolicy(nn.Module):
         prev_kl_coef: float = 0.0,
     ) -> float:
         """One gradient step of weighted NLL, optionally regularized by
-        KL(current || prev_policy).
+        KL(current || prev_policy). With uniform weights this reduces to
+        plain NLL (what GPS and BC use).
 
-        With uniform weights this reduces to plain NLL (what GPS and BC use).
-
-        Args:
-            prev_policy:   A frozen snapshot of this policy from the previous
-                           GPS iteration (a deep copy, typically). When given
-                           with `prev_kl_coef > 0`, the loss gains a term
-                           `prev_kl_coef * E_o[ KL(π_θ(·|o) || π_prev(·|o)) ]`,
-                           computed in closed form for two diagonal Gaussians.
-                           This is the trust-region-style regularizer that
-                           prevents the student from drifting too far from its
-                           previous-iteration self in one S-step — stabilises
-                           training when the C-step data shifts iter-to-iter.
-            prev_kl_coef:  Penalty weight. 0 disables the KL term (default).
+        When `prev_policy` is given with `prev_kl_coef > 0`, the loss
+        gains `prev_kl_coef * E_o[KL(π_θ || π_prev)]` — a trust-region
+        regularizer against the previous-iteration policy.
         """
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
-        # Labels arrive in physical action space (MPPI's executed actions).
-        # Move them into the network's space so the loss compares like to
-        # like. No-op when the toggle is off.
         act_t = self._to_norm(act_t)
         w_t = torch.as_tensor(weights, dtype=torch.float32, device=self._device)
 
@@ -285,26 +239,16 @@ class GaussianPolicy(nn.Module):
 
         self.optimizer.zero_grad()
         loss.backward()
-        # NaN-loss guard: a single batch containing NaN actions/obs
-        # (e.g., from a divergent MPPI rollout in GPS C-step) would
-        # otherwise produce NaN gradients on every parameter and
-        # permanently corrupt the policy in one optimizer step. Skip
-        # the step instead and surface NaN to the caller for logging.
+        # NaN guard: a NaN batch would corrupt every parameter via NaN
+        # gradients in one step. Skip and surface NaN to the caller.
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()
             return float("nan")
         self.optimizer.step()
-        if self.ema is not None:
-            self.ema.update(self)
         return loss.item()
 
     def action(self, obs: torch.Tensor) -> torch.Tensor:
-        """Deterministic action tensor (policy mean) in PHYSICAL space.
-
-        For MSE training / eval / mean-distance prior. Always returns a
-        physical-space mean — this is the user-facing boundary, so the
-        action-norm toggle is invisible to callers.
-        """
+        """Deterministic action (policy mean) in PHYSICAL space."""
         mu, _ = self.forward(obs)
         return self._to_phys(mu)
 
@@ -312,8 +256,6 @@ class GaussianPolicy(nn.Module):
         """One gradient step of MSE on the mean. log_sigma is not supervised."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
-        # Same normalization as `train_weighted`: labels into the network's
-        # space before the squared error, so per-dim contributions are equal.
         act_t = self._to_norm(act_t)
         if self.normalizer is not None:
             self.normalizer.update(obs_t)
@@ -321,14 +263,10 @@ class GaussianPolicy(nn.Module):
         loss = ((mu - act_t) ** 2).mean()
         self.optimizer.zero_grad()
         loss.backward()
-        # See train_weighted: skip the step on a NaN/Inf loss so a single
-        # bad batch can't corrupt every parameter via NaN gradients.
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()
             return float("nan")
         self.optimizer.step()
-        if self.ema is not None:
-            self.ema.update(self)
         return float(loss.item())
 
     # ------------------------------------------------------------------
@@ -344,14 +282,8 @@ class GaussianPolicy(nn.Module):
     ) -> torch.Tensor:
         """Mean KL(π_θ(·|o) || π_prev(·|o)) over the batch.
 
-        Closed-form KL for two diagonal Gaussians:
-
-            KL = Σ_d [ log(σ_p / σ_q)
-                     + (σ_q² + (μ_q − μ_p)²) / (2 σ_p²)
-                     - 0.5 ]
-
-        with subscript q = current policy, p = prev_policy. Per-dim sum,
-        then mean over the batch.
+        Closed-form for two diagonal Gaussians:
+            KL = Σ_d [log(σ_p/σ_q) + (σ_q² + (μ_q − μ_p)²)/(2 σ_p²) − 0.5]
         """
         with torch.no_grad():
             mu_p, log_sigma_p = prev_policy._head(obs_t)
@@ -370,63 +302,17 @@ class GaussianPolicy(nn.Module):
         obs: np.ndarray,
         prev_policy: "GaussianPolicy",
     ) -> float:
-        """Numpy-facing mean KL(self || prev_policy) over a batch of obs.
-
-        Useful for logging iter-to-iter drift without touching the loss path.
-        """
+        """Numpy-facing mean KL(self || prev_policy) over a batch of obs."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         mu_q, log_sigma_q = self._head(obs_t)
         return float(self._kl_to_diag_gaussian(obs_t, mu_q, log_sigma_q, prev_policy).item())
 
-    # ------------------------------------------------------------------
-    # EMA hooks
-    # ------------------------------------------------------------------
-
-    def attach_ema(self, decay: float) -> None:
-        """Start tracking an EMA of trainable parameters with given decay.
-
-        Idempotent in the sense that calling it again resets the shadow to
-        the current weights and switches to the new decay.
-        """
-        if decay <= 0.0:
-            self.ema = None
-            return
-        self.ema = EMA(self, decay=decay)
-
-    @contextmanager
-    def ema_swapped_in(self):
-        """Context manager: live params ← EMA shadow for the duration.
-
-        No-op (yields immediately) when EMA is not attached.
-        """
-        if self.ema is None:
-            yield
-            return
-        with self.ema.swapped_in(self):
-            yield
-
-    def ema_l2_drift(self) -> float:
-        """||θ - θ_ema||₂. Returns 0.0 when EMA is not attached."""
-        return self.ema.l2_drift(self) if self.ema is not None else 0.0
-
-    def ema_sync(self) -> None:
-        """Hard-sync: θ ← EMA shadow, in place. No-op if EMA not attached.
-
-        Meant for end-of-S-step promotion in GPS / DAgger loops. Strongly
-        recommended to follow this with `reset_optimizer()` so Adam's
-        running moments don't carry stale gradients from the pre-sync θ.
-        """
-        if self.ema is not None:
-            self.ema.sync_to(self)
-
     def reset_optimizer(self) -> None:
         """Recreate Adam with a fresh state (same lr). Clears m, v moments.
 
-        Useful at GPS iteration boundaries when the effective loss surface
-        shifts (new C-step data, new trust-region reference, a hard EMA
-        sync that moved θ non-trivially). The alternative — letting stale
-        momentum carry across iterations — fights the `prev_iter_kl_coef`
-        trust region and mismatches Adam's state after an `ema_sync()`.
+        Useful at GPS iteration boundaries — each iter is a new supervised
+        task (new C-step data + prior shift), and stale momentum can fight
+        the `prev_iter_kl_coef` trust region.
         """
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
 
@@ -438,13 +324,10 @@ class GaussianPolicy(nn.Module):
 
     @torch.no_grad()
     def act_np(self, obs: np.ndarray) -> np.ndarray:
-        """Mean action from numpy obs, clipped to action bounds if known.
+        """Mean action from numpy obs, clipped to action bounds.
 
-        Returns a physical-space action. Order: forward → denormalize →
-        clip. The clip is still useful as a safety net even when the
-        network was trained to output in [-1, 1] — the head is
-        unconstrained (no tanh) so it can over/undershoot, and a clip
-        keeps the env's `data.ctrl` in range.
+        Order: forward → denormalize → clip. The clip is still a useful
+        safety net when the head is unconstrained (no tanh).
         """
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         squeeze = obs_t.ndim == 1

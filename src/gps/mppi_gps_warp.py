@@ -35,7 +35,7 @@ Scope cuts vs. ``MPPIGPS``
 - ``open_loop_steps > 1`` ignored (BatchedMPPI forces 1).
 - ``adaptive_lam`` ignored (BatchedMPPI uses fixed λ).
 
-S-step (distillation) and EMA / KL-adaptive / eval are inherited from
+S-step (distillation) and KL-adaptive / eval are inherited from
 ``MPPIGPS`` unchanged — they operate on collected (obs, action) pairs,
 which look identical to the CPU path's output.
 """
@@ -114,8 +114,8 @@ class WarpMPPIGPS(MPPIGPS):
     (one per condition's executor) and uses ``BatchedMPPI`` for all
     MPPI rollouts.
 
-    Inherits S-step (`_distill_epoch`), eval, history, EMA stabilisers
-    from ``MPPIGPS`` unchanged.
+    Inherits S-step (`_distill_epoch`), eval, history from ``MPPIGPS``
+    unchanged.
     """
 
     def __init__(
@@ -133,9 +133,8 @@ class WarpMPPIGPS(MPPIGPS):
                 "(env._use_warp must be True). Use the CPU MPPIGPS otherwise."
             )
 
-        # ---- Reproduce MPPIGPS.__init__ minus the `self.mppi = MPPI(...)` line ----
-        # We don't use plain MPPI; we use BatchedMPPI. Everything else
-        # (policy, prior_type resolution, ema attach, replay buffer slot,
+        # Reproduce MPPIGPS.__init__ but swap MPPI for BatchedMPPI.
+        # Everything else (policy, prior_type, replay buffer slot,
         # KL-adaptive lazy field) is identical to the parent.
         self.env = env
         self.mppi_cfg = mppi_cfg
@@ -187,8 +186,6 @@ class WarpMPPIGPS(MPPIGPS):
         # Inherited bookkeeping
         self._episode_buffer: list[dict] = []
         self._kl_alpha: float | None = None
-        if gps_cfg.ema_decay > 0.0:
-            self.policy.attach_ema(gps_cfg.ema_decay)
 
         # Loud opt-out warnings for unsupported features.
         import warnings
@@ -394,10 +391,6 @@ class WarpMPPIGPS(MPPIGPS):
                 obs_flat, act_flat, w_flat, prev_policy=prev_policy,
             )
 
-            ema_drift = (
-                self.policy.ema_l2_drift() if cfg.ema_decay > 0.0 else float("nan")
-            )
-
             if (
                 prev_policy is not None
                 and not self._deterministic
@@ -412,8 +405,6 @@ class WarpMPPIGPS(MPPIGPS):
             else:
                 prev_iter_kl_diag = float("nan")
 
-            if cfg.ema_decay > 0.0 and cfg.ema_hard_sync:
-                self.policy.ema_sync()
             if cfg.reset_optim_per_iter:
                 self.policy.reset_optimizer()
 
@@ -430,22 +421,20 @@ class WarpMPPIGPS(MPPIGPS):
                         sigma_p_floor = self.mppi.sigma * cfg.kl_sigma_floor_frac
                 else:
                     sigma_p_floor = 1e-6
-                with self.policy.ema_swapped_in():
-                    self.policy.eval()
-                    kl_est_iter = estimate_kl_p_to_policy(
-                        np.stack(kl_obs_buf),
-                        np.stack(kl_mu_p_buf),
-                        np.stack(kl_var_p_buf),
-                        self.policy,
-                        sigma_p_floor_norm=sigma_p_floor,
-                    )
+                self.policy.eval()
+                kl_est_iter = estimate_kl_p_to_policy(
+                    np.stack(kl_obs_buf),
+                    np.stack(kl_mu_p_buf),
+                    np.stack(kl_var_p_buf),
+                    self.policy,
+                    sigma_p_floor_norm=sigma_p_floor,
+                )
                 self._kl_alpha = update_alpha_kl_adaptive(alpha, kl_est_iter, cfg)
 
             # ========== Logging ==========
             mppi_cost = float(np.mean(ep_costs))
             history.iteration_costs.append(mppi_cost)
             history.distill_losses.append(loss)
-            history.iteration_ema_drift.append(ema_drift)
             history.iteration_prev_iter_kl.append(prev_iter_kl_diag)
             history.iteration_alpha.append(float(alpha))
             history.iteration_kl_est.append(kl_est_iter)
@@ -456,33 +445,31 @@ class WarpMPPIGPS(MPPIGPS):
             do_eval = is_last or ((iteration + 1) % eval_every == 0)
 
             eval_cost = float("nan")
-            with self.policy.ema_swapped_in():
-                if do_eval:
-                    self.policy.eval()
-                    eval_stats = evaluate_policy(
-                        self.policy, self.env,
-                        n_episodes=cfg.n_eval_eps,
-                        episode_len=cfg.eval_ep_len,
-                        seed=iteration,
-                    )
-                    eval_cost = float(eval_stats["mean_cost"])
-                history.iteration_eval_costs.append(eval_cost)
+            if do_eval:
+                self.policy.eval()
+                eval_stats = evaluate_policy(
+                    self.policy, self.env,
+                    n_episodes=cfg.n_eval_eps,
+                    episode_len=cfg.eval_ep_len,
+                    seed=iteration,
+                )
+                eval_cost = float(eval_stats["mean_cost"])
+            history.iteration_eval_costs.append(eval_cost)
 
-                if run_dir is not None:
-                    iter_path = run_dir / f"iter_{iteration:03d}.pt"
-                    save_checkpoint(
-                        iter_path, self.policy,
-                        iteration=iteration,
-                        mppi_cost=mppi_cost,
-                        eval_cost=eval_cost,
-                        distill_loss=loss,
-                        ema_drift=ema_drift,
-                        prev_iter_kl=prev_iter_kl_diag,
-                    )
-                    if do_eval and eval_cost < history.best_cost:
-                        history.best_cost = eval_cost
-                        history.best_iter = iteration
-                        copy_as(iter_path, run_dir / "best.pt")
+            if run_dir is not None:
+                iter_path = run_dir / f"iter_{iteration:03d}.pt"
+                save_checkpoint(
+                    iter_path, self.policy,
+                    iteration=iteration,
+                    mppi_cost=mppi_cost,
+                    eval_cost=eval_cost,
+                    distill_loss=loss,
+                    prev_iter_kl=prev_iter_kl_diag,
+                )
+                if do_eval and eval_cost < history.best_cost:
+                    history.best_cost = eval_cost
+                    history.best_iter = iteration
+                    copy_as(iter_path, run_dir / "best.pt")
 
             postfix = {
                 "mppi": f"{mppi_cost:.2f}",

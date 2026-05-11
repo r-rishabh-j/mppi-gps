@@ -73,63 +73,38 @@ def parse_args():
                         "the per-iter constant.")
     p.add_argument("--alpha-schedule", default='smoothstep',
                    choices=["constant", "linear", "smoothstep", "cosine"],
-                   help="Per-iter α schedule. 'constant' (default) uses --alpha "
-                        "verbatim every iter. 'smoothstep' / 'cosine' / 'linear' "
-                        "ramp from --alpha-start to --alpha over the first "
-                        "--alpha-warmup-iters iterations and stay constant "
-                        "thereafter. Useful at iter 0 when the policy is "
-                        "untrained: starting α at 0 lets MPPI explore freely "
-                        "while the policy bootstraps, ramping the prior in "
-                        "later for on-policy state coverage.")
+                   help="Per-iter α schedule. 'constant' uses --alpha verbatim; "
+                        "other shapes ramp from --alpha-start to --alpha over "
+                        "--alpha-warmup-iters iters and hold.")
     p.add_argument("--alpha-warmup-iters", type=int, default=None,
-                   help="GPS iterations to ramp α from --alpha-start to "
-                        "--alpha (default 0 = schedule disabled). Ignored "
-                        "when --alpha-schedule is 'constant'.")
+                   help="Ramp duration; 0 disables. Ignored when --alpha-schedule "
+                        "is 'constant'.")
     p.add_argument("--alpha-start", type=float, default=0,
-                   help="Starting α value for the ramp (default 0.0). "
-                        "Ignored when --alpha-schedule is 'constant'.")
+                   help="Starting α for the ramp (default 0.0).")
     p.add_argument("--kl-target", type=float, default=None,
-                   help="MDGPS-style KL-adaptive α (Gaussian only). When > 0, "
-                        "α becomes a dual variable auto-adjusted each iter to "
-                        "drive E_state[KL(N(μ_p,σ_p²) ‖ π_θ)] toward this "
-                        "target. The schedule fields above are still used for "
-                        "the warmup window (alpha_warmup_iters); after that "
-                        "the adaptive rule takes over. Per-state KL is summed "
-                        "over action dims, so scale with act_dim — rule of "
-                        "thumb act_dim × 0.05 (e.g. ~0.1 for acrobot 2-D, "
-                        "~1.5 for adroit_relocate 30-D). 0 (default) disables "
-                        "and uses the schedule path.")
+                   help="KL-adaptive α (Gaussian only). When > 0, α is auto-"
+                        "adjusted each iter to drive E_state[KL(N(μ_p,σ_p²) ‖ π_θ)] "
+                        "toward this target. Schedule still drives the warmup window. "
+                        "KL is summed over action dims — scale ~act_dim × 0.05 "
+                        "(~0.1 acrobot, ~1.5 adroit_relocate). 0 disables.")
     p.add_argument("--kl-alpha-min", type=float, default=None,
-                   help="Lower bound on the KL-adaptive α (default 0.001). "
-                        "Allows multiplicative escape from a tight constraint.")
+                   help="Lower bound on KL-adaptive α (default 0.001).")
     p.add_argument("--kl-alpha-max", type=float, default=None,
-                   help="Upper bound on the KL-adaptive α (default 0.5). "
-                        "Prevents runaway when MPPI is far from policy. "
-                        "α ≫ 0.1 typically crushes MPPI's exploration "
-                        "regardless of the constraint, so growing past 0.5 "
-                        "is rarely productive.")
+                   help="Upper bound on KL-adaptive α (default 0.5). α ≫ 0.1 "
+                        "typically crushes MPPI exploration regardless of "
+                        "the constraint.")
     p.add_argument("--kl-step-rate", type=float, default=None,
-                   help="Multiplicative update rate for the dual α step "
-                        "(default 1.5). Larger = faster adaptation but more "
-                        "iter-to-iter oscillation; 2.0+ if you need to escape "
-                        "a sticky α regime quickly.")
+                   help="Multiplicative dual-α update rate (default 1.5).")
     p.add_argument("--kl-sigma-floor-frac", type=float, default=None,
-                   help="Per-dim floor on the local-policy std σ_p in the "
-                        "KL estimator, expressed as a fraction of MPPI's "
-                        "proposal std (default 0.5). Prevents log(σ_θ/σ_p) "
-                        "from exploding when MPPI's softmin concentrates "
-                        "onto a few samples and weighted-sample variance "
-                        "collapses toward zero. 0 disables the floor "
-                        "(legacy behaviour: clamps at 1e-6, biases kl_est "
-                        "upward by tens of nats per state).")
+                   help="Floor on σ_p in the KL estimator as a fraction of "
+                        "MPPI's proposal std (default 0.5). Prevents "
+                        "log(σ_θ/σ_p) blow-up when MPPI softmin concentrates. "
+                        "0 disables.")
     p.add_argument("--policy-prior", default=None,
                    choices=["nll", "mean_distance"],
-                   help="Policy prior shape used in the MPPI cost. Unset = "
-                        "auto: nll for Gaussian, mean_distance for "
-                        "--deterministic. Explicit values: 'nll' for "
-                        "-alpha*Σ log π (Gaussian only), 'mean_distance' for "
-                        "alpha*Σ‖a−π.action(o)‖² (works for both classes; the "
-                        "only choice for --deterministic).")
+                   help="Policy prior shape. Unset = auto (nll for Gaussian, "
+                        "mean_distance for --deterministic). 'nll' is "
+                        "Gaussian-only; 'mean_distance' works for both.")
     p.add_argument("--auto-reset", action="store_true",
                    help="On env termination during C-step rollout, reset to a fresh random "
                         "init and keep collecting until episode_length steps are taken for "
@@ -154,133 +129,67 @@ def parse_args():
                         "0/unset = no buffering. Sub-episodes split at each done boundary, "
                         "so lengths vary with --auto-reset. FIFO eviction — oldest WHOLE "
                         "episode popped first until total rows ≤ cap.")
-    p.add_argument("--ema-decay", type=float, default=0,
-    # p.add_argument("--ema-decay", type=float, default=0.99,
-                   help="Exponential moving average decay over policy trainable params "
-                        "(e.g. 0.999). 0 or unset disables EMA. Eval and best.pt selection "
-                        "use the EMA snapshot. Without --ema-hard-sync the shadow is purely "
-                        "passive; MPPI's prior keeps using fresh training weights.")
-    p.add_argument("--ema-hard-sync", action="store_true", default=True,
-                   help="At end of each S-step, copy EMA shadow into the live policy (θ ← EMA) "
-                        "so the next iteration's MPPI prior and S-step both start from the "
-                        "smoothed weights. No effect unless --ema-decay > 0. Recommended to "
-                        "pair with --reset-optim-per-iter for Adam-state consistency.")
     p.add_argument("--reset-optim-per-iter", action="store_true", default=True,
                    help="Recreate the policy's Adam optimizer at end of each GPS iteration, "
-                        "wiping m/v moments. Recommended with --ema-hard-sync (moments are "
-                        "stale after a hard-sync) and with --prev-iter-kl-coef (accumulated "
-                        "momentum can blow through the trust region on the first few steps).")
+                        "wiping m/v moments. Recommended with --prev-iter-kl-coef "
+                        "(accumulated momentum can blow through the trust region on the "
+                        "first few steps).")
     p.add_argument("--prev-iter-kl-coef", type=float, default=0,
-    # p.add_argument("--prev-iter-kl-coef", type=float, default=0.05,
-                   help="Trust-region-style KL penalty to the previous iteration's policy "
-                        "(Gaussian only — no policy distribution under --deterministic). "
-                        "Adds `coef * E_obs[KL(π_θ || π_prev)]` to the S-step loss. 0/unset "
-                        "disables. Typical small values (e.g. 0.01-0.1). Silently ignored "
-                        "with --deterministic.")
+                   help="Trust-region KL penalty to the previous iteration's "
+                        "policy (Gaussian only). Adds `coef * E_obs[KL(π_θ || "
+                        "π_prev)]` to the S-step loss. 0 disables.")
     p.add_argument("--dagger-relabel", action="store_true",
-                   help="DAgger-style decoupled relabel: per C-step timestep, run MPPI once "
-                        "WITH the policy prior (executor, steers the env) and a second time "
-                        "WITHOUT the prior (side-effect-free dry_run, its action is the "
-                        "training label). Removes the self-reinforcing loop where the "
-                        "executed MPPI action is already tilted toward the current policy. "
-                        "No-op when alpha == 0. Note: under open_loop_steps > 1 the label "
-                        "call forces a full rollout every step (cached chunk actions are "
-                        "prior-biased, so can't serve as plain labels) — wallclock per step "
-                        "becomes ~1 rollout instead of 1/N.")
+                   help="DAgger-style decoupled relabel: per C-step timestep, "
+                        "MPPI runs WITH the prior (executor) and WITHOUT it "
+                        "(dry_run, the label). No-op when alpha == 0. Under "
+                        "open_loop_steps > 1 the label call forces a full "
+                        "rollout every step.")
     p.add_argument("--deterministic", action="store_true",
-                   help="Use a DeterministicPolicy student. Forces MSE distillation "
-                        "(no NLL — there's no policy distribution). The policy prior "
-                        "is locked to 'mean_distance' (alpha * Σ‖a − π.action(o)‖²); "
-                        "--policy-prior nll raises if combined with this flag. "
-                        "--prev-iter-kl-coef is silently ignored (no distribution).")
+                   help="Use a DeterministicPolicy student (MSE distill, "
+                        "mean_distance prior).")
     p.add_argument("--grad-clip-norm", type=float, default=None,
-                   help="L2 gradient-norm clip applied inside the deterministic "
-                        "policy's MSE step (used by --deterministic / mppi_gps_det). "
-                        "Bounds per-update parameter movement directly — loss-"
-                        "agnostic, no biased estimator. 0 = disabled. Default 1.0 "
-                        "(see GPSConfig.grad_clip_norm). Sweep {0.5, 1.0, 5.0} if "
-                        "learning is too slow or loss spikes. Ignored without "
-                        "--deterministic.")
+                   help="L2 grad-norm clip in the deterministic policy's "
+                        "MSE step. 0 = disabled. Default 1.0. Ignored "
+                        "without --deterministic.")
     p.add_argument("--clip-eps", type=float, default=0.3,
-                   help="Action-space trust region for the deterministic S-step "
-                        "(--deterministic). At the start of each S-step the "
-                        "trainer snapshots the policy as π_old; per batch the "
-                        "MPPI label is clamped to [π_old.action(o) ± clip_eps] "
-                        "before the MSE loss. 0/unset = disabled (default). "
-                        "Typical 0.05–0.2. Mirrors mppi_gps_clip's MSE branch. "
-                        "Ignored without --deterministic. Prefer --grad-clip-norm "
-                        "unless you specifically want action-space (vs parameter-"
-                        "space) trust-region semantics.")
-    # ---- Policy architecture knobs (port from upstream `gaussian_policy.py` /
-    # `deterministic_policy.py` — see PolicyConfig docstrings) ----
+                   help="Action-space trust region for the deterministic "
+                        "S-step. Per batch, the MPPI label is clamped to "
+                        "[π_old.action(o) ± clip_eps] before MSE. 0 disables. "
+                        "Prefer --grad-clip-norm unless you specifically want "
+                        "action-space TR semantics.")
+    # ---- Policy architecture knobs (PolicyConfig fields) ----
     p.add_argument("--disable-tanh", action="store_true",
-                   help="Disable the default tanh squash on the policy's "
-                        "action head (Gaussian: tanh on mu; Deterministic: "
-                        "appended after the MLP). With tanh on (default), "
-                        "the network output is bounded to (-1, 1) in "
-                        "normalized action space and `_to_phys` denormalizes "
-                        "to physical bounds — matches upstream's "
-                        "`DeterministicPolicy`. Pass this to revert to the "
-                        "legacy unbounded head + `act_np` clamp behaviour "
-                        "(use when reproducing pre-tanh experiments).")
+                   help="Disable tanh squash on the policy head. Use for "
+                        "pre-tanh checkpoints (unbounded head + act_np clamp).")
     p.add_argument("--featurize", default=None,
                    choices=["running_norm", "hand_crafted"],
-                   help="Input pre-processor for the policy. 'running_norm' "
-                        "(default) uses a learned per-dim RunningNormalizer; "
-                        "'hand_crafted' uses the env-aware feature transform "
-                        "in src.policy.featurize_obs — matches upstream's "
-                        "`featurize_obs`. Supports 4-D acrobot (→ sin/cos + "
-                        "scaled vel) and 6-D point_mass (→ delta-to-goal + "
-                        "vel + goal, all normalized to ~[-1, 1]). For other "
-                        "obs dims it's a no-op (identity).")
+                   help="Input pre-processor. 'running_norm' (default) is the "
+                        "learned RunningNormalizer; 'hand_crafted' uses the "
+                        "env-aware transform in src.policy.featurize_obs "
+                        "(4-D acrobot, 6-D point_mass).")
     p.add_argument("--no-dropout", action="store_true",
-                   help="Disable Dropout between hidden layers of the policy. "
-                        "Default keeps dropout on (0.2 det, 0.1 gaussian) — "
-                        "useful for high-DoF envs. Flip off to match "
-                        "upstream's plain-MLP setup on tiny tasks like "
-                        "point_mass / acrobot where dropout over-smooths.")
+                   help="Disable Dropout between hidden layers (default: on).")
     p.add_argument("--no-layernorm", action="store_true",
-                   help="Disable LayerNorm between hidden layers of the "
-                        "policy. Default keeps layernorm on. Mirrors "
-                        "--no-dropout — together they reproduce upstream's "
-                        "plain MLP architecture.")
+                   help="Disable LayerNorm between hidden layers (default: on).")
     p.add_argument("--dropout-p", type=float, default=None,
-                   help="Override the dropout probability (only relevant "
-                        "when --no-dropout is not set). Default is 0.2 for "
-                        "DeterministicPolicy, 0.1 for GaussianPolicy.")
+                   help="Override dropout probability. Default 0.2 det, 0.1 gaussian.")
     # ---- Policy-trust α dampener (port of upstream `gps_train.py`) ----
     p.add_argument("--adaptive-policy-trust", action="store_true",
-                   help="Adaptively scale alpha by a `policy_trust` dual scalar that "
-                        "reflects how close the policy's eval cost is to raw MPPI's "
-                        "eval cost. Effective alpha = base_alpha * policy_trust; "
-                        "policy_trust starts at --policy-trust-min (cold start: prior "
-                        "off, MPPI explores freely) and ramps toward --policy-trust-max "
-                        "as the policy closes the gap to MPPI. Recomputed each eval "
-                        "iter; frozen between evals. Adapted from upstream's "
-                        "`compute_policy_trust`/`make_collection_bias` (where it scaled "
-                        "lambda_policy_track). With this flag OFF (default), trust ≡ "
-                        "--policy-trust-max (1.0 by default → no scaling at all). "
-                        "Composes multiplicatively with --kl-target (KL-adaptive α) "
-                        "and --alpha-schedule.")
+                   help="Scale α by a trust scalar that ramps with the "
+                        "policy↔raw-MPPI cost gap. Off (default) → trust ≡ "
+                        "--policy-trust-max (1.0 → no scaling). Composes "
+                        "multiplicatively with --kl-target and --alpha-schedule.")
     p.add_argument("--policy-trust-min", type=float, default=None,
-                   help="Lower bound on the dual trust scalar (default 0.0 — bad policy "
-                        "shuts the prior off completely). Used as the cold-start value "
-                        "for adaptive trust.")
+                   help="Trust lower bound (default 0.0 — bad policy → prior off).")
     p.add_argument("--policy-trust-max", type=float, default=None,
-                   help="Upper bound on the dual trust scalar (default 1.0 — good policy "
-                        "passes the prior through unchanged). Trust converges here when "
-                        "the policy matches raw MPPI's per-step cost.")
+                   help="Trust upper bound (default 1.0 — good policy → prior "
+                        "passes through).")
     p.add_argument("--policy-trust-bad-cost-per-step", type=float, default=None,
-                   help="Per-step cost threshold treated as 'as bad as no policy' (trust → "
-                        "min). Env-specific; pick a margin above raw MPPI's per-step cost "
-                        "so the linear interpolation has headroom. Default 0.25 (matches "
-                        "upstream's point_mass / acrobot default).")
+                   help="Per-step cost above which the policy is treated as "
+                        "'as bad as no policy'. Env-specific; default 0.25.")
     p.add_argument("--policy-trust-eval-mppi-eps", type=int, default=None,
-                   help="Number of raw-MPPI baseline episodes evaluated on each eval iter "
-                        "to feed the trust update. 0 disables the baseline (under "
-                        "--adaptive-policy-trust, trust then pins at --policy-trust-min). "
-                        "Default 1. Each episode runs --eval-len plan_step calls — keep "
-                        "small on expensive envs (adroit), can bump on cheap ones.")
+                   help="Number of raw-MPPI baseline episodes per eval iter "
+                        "(feeds the trust update). 0 disables. Default 1.")
     p.add_argument("--init-ckpt", default=None,
                    help="path to a policy checkpoint (wrapped or raw state_dict) "
                         "to load into gps.policy before the training loop")
@@ -295,15 +204,12 @@ def main():
     args = parse_args()
     seed_everything(args.seed)
 
-    # Load MPPI cfg + resolve final num_conditions BEFORE env construction:
-    # the warp env's nworld is pinned to N×K at build time. We can't move
-    # this after the gps_cfg overrides without re-instantiating the env,
-    # which would re-allocate every GPU buffer.
+    # Load MPPI cfg + resolve `num_conditions` BEFORE env construction —
+    # the warp env's `nworld = N × K` is pinned at build time.
     mppi_cfg = MPPIConfig.load(args.env)
     policy_cfg = PolicyConfig.for_env(args.env)
-    # Policy-architecture overrides from CLI. Each only fires if the user
-    # actually set the flag, so the per-env defaults from `for_env(...)`
-    # are preserved otherwise.
+    # Each CLI override fires only when the user set the flag; per-env
+    # defaults from `for_env(...)` are otherwise preserved.
     if args.disable_tanh:
         policy_cfg.tanh_squash = False
     if args.featurize is not None:
@@ -323,10 +229,7 @@ def main():
 
     env_kwargs: dict = {}
     if args.warp:
-        # Warp path: BatchedMPPI runs N=num_conditions control problems in
-        # parallel, K samples per condition → N*K mjw worlds total. The
-        # standalone CPU path (no --warp) doesn't need this — env stays
-        # single-condition and MPPI loops over conditions sequentially.
+        # Warp path: N conditions × K samples = N*K mjw worlds.
         env_kwargs.update(
             use_warp=True,
             nworld=gps_cfg.num_conditions * mppi_cfg.K,
@@ -364,10 +267,6 @@ def main():
         gps_cfg.eval_ep_len = args.eval_len
     if args.distill_buffer_cap is not None:
         gps_cfg.distill_buffer_cap = args.distill_buffer_cap
-    if args.ema_decay is not None:
-        gps_cfg.ema_decay = args.ema_decay
-    if args.ema_hard_sync:
-        gps_cfg.ema_hard_sync = True
     if args.reset_optim_per_iter:
         gps_cfg.reset_optim_per_iter = True
     if args.prev_iter_kl_coef is not None:
@@ -473,16 +372,13 @@ def main():
     history = gps.train(run_dir=run_dir)
 
     # ---- Save final checkpoint (wrapped) + copy to final.pt ----
-    # EMA-swap window so final.pt on disk matches the smoothed policy that
-    # best.pt was selected from. No-op when ema_decay == 0.
     final_path = run_dir / "final.pt"
-    with gps.policy.ema_swapped_in():
-        save_checkpoint(
-            final_path, gps.policy,
-            iteration=gps_cfg.num_iterations - 1,
-            mppi_cost=history.iteration_costs[-1] if history.iteration_costs else None,
-            eval_cost=history.iteration_eval_costs[-1] if history.iteration_eval_costs else None,
-        )
+    save_checkpoint(
+        final_path, gps.policy,
+        iteration=gps_cfg.num_iterations - 1,
+        mppi_cost=history.iteration_costs[-1] if history.iteration_costs else None,
+        eval_cost=history.iteration_eval_costs[-1] if history.iteration_eval_costs else None,
+    )
     print(f"\nsaved final policy checkpoint to {final_path}")
     if history.best_iter >= 0:
         print(
@@ -491,14 +387,13 @@ def main():
         )
 
     # ---- Save learning curves as JSON ----
-    # ema_drift / prev_iter_kl exist on some GPSHistory variants but not all;
-    # getattr lets a single curves.json schema cover all three trainer classes.
+    # prev_iter_kl exists on some GPSHistory variants but not all;
+    # getattr keeps the schema uniform across trainer classes.
     curves_path = run_dir / "curves.json"
     curves_path.write_text(json.dumps({
         "mppi_costs": history.iteration_costs,
         "eval_costs": history.iteration_eval_costs,
         "distill_loss": history.distill_losses,
-        "ema_drift": getattr(history, "iteration_ema_drift", []),
         "prev_iter_kl": getattr(history, "iteration_prev_iter_kl", []),
     }, indent=2))
     print(f"saved learning curves to {curves_path}")
@@ -522,19 +417,15 @@ def main():
     print(f"saved learning curve plot to {plot_path}")
 
     # ---- Evaluation: GPS policy vs MPPI baseline ----
-    # EMA-swap for the headline eval too — matches what best.pt / final.pt
-    # contain, and therefore the numbers the user will see when they reload
-    # the checkpoint later. No-op when ema_decay == 0.
     gps.policy.eval()
     print("\n--- Evaluating GPS policy ---")
-    with gps.policy.ema_swapped_in():
-        gps_stats = evaluate_policy(
-            gps.policy, env,
-            n_episodes=args.n_eval,
-            episode_len=args.eval_len,
-            seed=args.seed,
-            render=True,
-        )
+    gps_stats = evaluate_policy(
+        gps.policy, env,
+        n_episodes=args.n_eval,
+        episode_len=args.eval_len,
+        seed=args.seed,
+        render=True,
+    )
 
     print("--- Evaluating MPPI baseline ---")
     mppi = MPPI(env, mppi_cfg)

@@ -21,27 +21,17 @@ class MPPI:
         self.nu = env.action_dim
         self.act_low, self.act_high = env.action_bounds
 
-        # ---- Noise model ---------------------------------------------------
-        # Two modes:
-        #   * Diagonal (default, `cfg.noise_cov is None`): per-dim sigma from
-        #     `cfg.noise_sigma * env.noise_scale`. Existing path; broadcasts
-        #     cleanly with eps for fast sampling and a cheap diagonal IS
-        #     correction. Byte-identical to legacy behaviour.
-        #   * Full covariance (`cfg.noise_cov` provided): a (nu, nu) PSD
-        #     matrix used directly as Σ. Cholesky for sampling
-        #     `ε ~ N(0, Σ)`, precision for the IS correction
-        #     `u^T · Σ⁻¹ · ε`. `cfg.noise_sigma` and `env.noise_scale`
-        #     are ignored — caller is responsible for baking per-dim
-        #     scaling into the matrix.
-        # `_noise_diagonal` keeps the fast diagonal path when applicable
-        # (broadcast multiply vs einsum is ~30× faster for K·H·nu² flops).
+        # Noise model. Diagonal path (`cfg.noise_cov is None`): per-dim
+        # sigma `cfg.noise_sigma * env.noise_scale`, broadcast-cheap.
+        # Full-covariance path: (nu, nu) PSD matrix used directly as Σ
+        # (Cholesky for sampling, precision for IS correction);
+        # `noise_sigma` and `env.noise_scale` are ignored.
         self._noise_diagonal = cfg.noise_cov is None
         self.noise_cov, self._noise_chol, self._noise_precision = (
             self._build_noise_model(env, cfg)
         )
-        # `self.sigma` is the marginal per-dim std (sqrt of diagonal of Σ).
-        # In the diagonal path it is the full noise model; in the full-Σ
-        # path it is just for diagnostics / logging.
+        # Marginal per-dim std (sqrt of diag Σ). In the diagonal path
+        # this is the full model; in full-Σ it's diagnostic only.
         self.sigma = np.sqrt(np.diag(self.noise_cov))
 
         self.reset()
@@ -49,13 +39,11 @@ class MPPI:
         self._last_states = None
         self._last_actions = None
         self._last_weights = None
-        # Same K-vector as `_last_weights` but re-softmin'd over `S − track`
-        # — i.e. the weights MPPI WOULD have produced without the policy
-        # prior contribution. Used by GPS's KL-adaptive α to measure the
-        # gap between the *unbiased* teacher distribution and the global
-        # policy (the biased weights are a poor signal: they collapse to π
-        # by construction as α grows, so KL → 0 mechanically). When the
-        # call had no prior, this equals `_last_weights`.
+        # Re-softmin'd over `S − track`: the weights MPPI WOULD have
+        # produced WITHOUT the policy prior. Used by GPS KL-adaptive α
+        # to measure the unbiased teacher↔policy gap (biased weights
+        # collapse to π by construction as α grows). Equals
+        # `_last_weights` when no prior was passed.
         self._last_unbiased_weights = None
         self._last_costs = None
         self._last_sensordata = None
@@ -76,34 +64,22 @@ class MPPI:
     ) -> tuple[np.ndarray, dict]:
         """running one MPPI iteration
         state: current environment state
-        prior: this is an optional callable (states, actions) -> log_prob (K, )
-        dry_run: if True, compute and return the planned action WITHOUT mutating
-            any persistent MPPI state (`self.U`, `self._plan_cursor`, `self._last_*`,
-            `self.lam`). Used by GPS's DAgger-style relabel path to query a fresh
-            teacher action at a visited state without disturbing the executor's
-            nominal trajectory or the KL rollout cache. Always takes the full
-            replan path (ignores open-loop cadence) — a label call must reflect
-            THIS state, not a cached chunk action from a prior-biased plan.
+        prior: optional callable (states, actions, sensordata) → cost (K,)
+        dry_run: if True, compute the action WITHOUT mutating any persistent
+            MPPI state (`self.U`, `_plan_cursor`, `_last_*`, `self.lam`).
+            Always takes the full replan path (ignores open-loop cadence).
+            Used by GPS DAgger-style relabel to query a fresh teacher
+            action at a visited state without disturbing the executor.
+            Under `open_loop_steps > 1` you lose the open-loop speedup
+            on the label side (every dry_run forces a full rollout).
 
-            Works at any `_plan_cursor` value; dry_run neither reads nor advances
-            the cursor, so it coexists with an open-loop executor mid-chunk.
-            WARNING: under `open_loop_steps > 1`, the executor's non-replan
-            timesteps are cheap (cached action serving) but every dry_run label
-            call forces a full rollout. You lose the open-loop speedup on the
-            label side — wallclock per step becomes ~1 rollout instead of 1/N.
-            The combination is correct, just not faster than `open_loop_steps=1`.
-
-        Open-loop cadence: only every `open_loop_steps`-th call does a full MPPI
-        replan (sample/rollout/weights/update). Intermediate calls return the next
-        action from the already-planned nominal `U` and skip the expensive work.
-        When the chunk is exhausted, `U` is shifted left by `open_loop_steps` so
-        the next replan uses a correctly-aligned warm start.
+        Open-loop cadence: only every `open_loop_steps`-th call replans.
+        Intermediate calls serve the next action from nominal `U`. When
+        the chunk is exhausted, `U` is shifted left by `open_loop_steps`
+        so the next replan has a correctly-aligned warm start.
         """
-        # --- Open-loop follow-up: serve the next action from the current plan.
-        # No rollout, no weight update. `prior` is ignored on these calls since
-        # it's only meaningful during the weight computation of a replan.
-        # Skipped entirely on dry_run (which always does a fresh full replan).
-
+        # Open-loop follow-up: serve the next nominal action; skip rollout.
+        # `prior` is ignored here. dry_run always does a fresh replan.
         if self._plan_cursor > 0:
             action = self.U[self._plan_cursor].copy()
             self._plan_cursor += 1
@@ -114,9 +90,8 @@ class MPPI:
             info["replanned"] = False
             return action, info
 
-        # sample ε ~ N(0, Σ). Diagonal path uses broadcast multiply (~30×
-        # cheaper than einsum for the typical K·H·nu² flops); full-cov path
-        # uses Cholesky factor: ε = standard @ chol.T.
+        # Sample ε ~ N(0, Σ). Diagonal: broadcast multiply (~30× faster).
+        # Full-cov: ε = standard @ chol.T.
         if self._noise_diagonal:
             eps = np.random.randn(self.K, self.H, self.nu) * self.sigma
         else:
@@ -128,37 +103,22 @@ class MPPI:
             U_perturbed = self.U[None, :, :] + eps
         U_clipped = np.clip(U_perturbed, self.act_low, self.act_high)
 
-        # rollout
+        # Rollout. Sanitise NaN/Inf costs from diverged samples (contact
+        # spikes, singular poses) to a large finite value so MPPI ignores
+        # them rather than NaN-poisoning the whole batch.
         states, costs, sensordata = self.env.batch_rollout(state, U_clipped)
-        # Sanitise diverged-sample costs. A single sample whose batched
-        # rollout produces NaN/Inf states (contact spike, near-singular pose)
-        # would otherwise poison the WHOLE batch: NaN in costs → NaN in S →
-        # NaN weights → NaN U_updated → NaN action → MuJoCo writes NaN to
-        # data.ctrl on the next env.step and emits the "huge value in CTRL"
-        # warning every step from then on. Replacing with a large finite
-        # cost makes that sample's weight ≈ 0 (MPPI ignores it) without
-        # destabilising the rest of the batch. 1e12 << float32 max so
-        # exp(-S/λ) underflows cleanly to 0 instead of overflowing.
         costs = np.nan_to_num(costs, nan=1e12, posinf=1e12, neginf=1e12)
 
-        # assemble S_k components (paper's Algorithm 2, γ=λ, Σ=σ²I):
-        #    S_k = S_env + λ · Σ_t u_t · ε_{k,t}/σ² + (optional) λ_track · Σ_t ‖a-π‖²
+        # Assemble S_k (paper's Algorithm 2, γ=λ):
+        #    S_k = S_env + λ · Σ_t u_t · Σ⁻¹ ε_{k,t} + track
+        # `sensordata` is forwarded so priors using state_to_obs can reuse
+        # the rollout's sensor outputs instead of re-running mj_kinematics.
         lam = self.lam
         is_corr = self._is_correction(eps, lam)
-        # track = None
-        # Pass sensordata so priors that compute env.state_to_obs(...) can
-        # reuse the rollout's already-produced sensor outputs (e.g. adroit
-        # relocate in DAPG-obs mode needs palm site position, which lives
-        # in sensordata — without this it would re-run mj_kinematics K*H
-        # times per plan step).
         track = (
             prior(states, U_clipped, sensordata) if prior is not None else None
         )
         if track is not None:
-            # Same defense for the policy prior. NLL prior can blow up when
-            # log_sigma collapses, mean_distance prior gets NaN if the
-            # diverged states feed NaN obs → NaN policy mean. Either way,
-            # one bad sample shouldn't poison the batch.
             track = np.nan_to_num(track, nan=1e12, posinf=1e12, neginf=1e12)
         S = costs + is_corr + (track if track is not None else 0.0)
 
@@ -196,37 +156,25 @@ class MPPI:
         }
 
         if dry_run:
-            # Side-effect-free: no self.U / cursor / _last_* / _last_info writes.
-            # Caller gets the action + info; MPPI's persistent state is untouched
-            # so the next non-dry-run plan_step sees the same nominal as before.
+            # Side-effect-free: no writes to self.U / cursor / _last_*.
             return action, info
 
-        # --- Persist state for the non-dry-run path ---
+        # Persist state for the non-dry-run path.
         self.U = U_updated
-
-        # Store final (post-adaptation) weights so GPS KL estimation sees the
-        # same distribution MPPI actually used to update U.
         self._last_weights = weights
 
-        # Advance the cursor. If open_loop_steps == 1 this also triggers the
-        # (legacy) shift-by-1 so next replan's warm start is identical to the
-        # pre-open-loop behaviour. For open_loop_steps > 1, subsequent calls
-        # will serve U[1..N-1] before the shift-by-N fires.
+        # Advance the cursor. When open_loop_steps == 1 this immediately
+        # triggers the shift so next replan's warm start matches legacy.
         self._plan_cursor = 1
         if self._plan_cursor >= self.open_loop_steps:
             self._shift_horizon(self.open_loop_steps)
             self._plan_cursor = 0
 
-        # store for GPS
         self._last_states = states
         self._last_actions = U_clipped
         self._last_weights = weights
         # Unbiased weights: re-softmin without the prior contribution.
-        # `track` is the per-sample policy-prior cost (None when no prior was
-        # passed). Subtracting it from S recovers the cost-only posterior, so
-        # the weighted-sample mean/var consumers compute reflects the *true*
-        # MPPI teacher rather than its prior-pulled-toward-policy variant.
-        # Cheap: a single softmin over an existing K-vector (no rollouts).
+        # Cheap: one softmin over an existing K-vector.
         if track is not None:
             self._last_unbiased_weights, _ = self._softmin_weights(
                 S - track, lam,

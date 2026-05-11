@@ -1,40 +1,24 @@
 """2D point-mass goal-reaching task — random target each reset.
 
-Mirrors `jaiselsingh1/mppi-gps`'s point_mass env. Cost weights,
-observation shape, and goal workspace match upstream verbatim:
+Mirrors `jaiselsingh1/mppi-gps`'s point_mass env (cost weights, obs
+shape, goal workspace).
 
-* **Observation** (6-D): ``[qpos (2), qvel (2), goal (2)]`` — goal is
-  an explicit input, NOT folded into qpos. The policy learns
-  goal-conditioning from data rather than from a hard-baked delta.
-* **Random target**, sampled uniformly from the full arena
-  ``[-0.29, 0.29]²`` on each ``reset()``. Pushed to the scene's mocap
-  body so the goal indicator follows visually.
-* **Cost**:
+* Obs (6-D): `[qpos (2), qvel (2), goal (2)]`. Goal is an explicit
+  input — the policy learns goal-conditioning from data.
+* Random target sampled uniformly from `[-0.29, 0.29]²` per `reset()`,
+  pushed to the mocap body for visualisation.
+* Cost: `w_pos·‖qpos−goal‖² + w_vel·‖qvel‖² + w_ctrl·‖u‖²` running;
+  `20·‖qpos−goal‖² + 1·‖qvel‖²` terminal.
 
-      running   = w_pos · ‖qpos − goal‖²  +  w_vel · ‖qvel‖²  +  w_ctrl · ‖u‖²
-      terminal  = w_pos_T · ‖qpos − goal‖²  +  w_vel_T · ‖qvel‖²
-
-  The terminal-pos weight is 20× the running so MPPI pulls hard at the
-  horizon end; the terminal-vel weight asks it to land softly.
-
-Goal round-trip through ``get_state`` / ``set_state``
-------------------------------------------------------
-MuJoCo's ``mjSTATE_FULLPHYSICS`` bitfield in our version does NOT
-include ``mjSTATE_MOCAP_POS``, so a state captured by the parent
-``MuJoCoEnv.get_state()`` carries qpos / qvel but *not* the goal —
-restoring it would leave ``self._goal`` stale and the mocap marker
-reset to its XML default. This silently breaks the GPS C-step:
-``_sample_initial_conditions`` captures ``(state, goal_i)`` per
-condition, but at C-step time ``env.reset(state=ic_state)`` doesn't
-restore ``goal_i`` — every (obs, action) in n−1 of n conditions trains
-on the wrong goal, and BC learns garbage.
-
-Fix: ``get_state`` appends the 2-D goal to the FULLPHYSICS vector,
-``set_state`` peels it off and syncs ``self._goal`` + ``mocap_pos`` from
-the trailing 2 entries. ``batch_rollout`` strips the goal tail before
-handing the state to ``mujoco.rollout`` (which expects FULLPHYSICS-sized
-input). Cost / state_to_obs read ``self._goal`` directly — broadcast
-across all K rollouts (one MPPI call has one goal).
+Goal round-trip through `get_state`/`set_state`: `mjSTATE_FULLPHYSICS`
+does NOT include mocap_pos, so a state captured by the parent
+`MuJoCoEnv.get_state()` would lose the goal — restoring it would leave
+`self._goal` stale and break the GPS C-step (conditions captured with
+different goals would all restore to the env's last goal). We extend
+the state vector with the goal: `get_state` appends 2 floats,
+`set_state` peels them off and syncs `_goal` + `mocap_pos`, and
+`batch_rollout` strips them before mujoco.rollout (which expects
+FULLPHYSICS-shaped input).
 """
 
 import mujoco
@@ -79,10 +63,8 @@ class PointMass(MuJoCoEnv):
         self._ctrl_w = float(ctrl_cost_weight)
         self._nq = self.model.nq
         self._nv = self.model.nv
-        # Cached goal in [x, y]. Updated on every reset() and broadcast in
-        # `running_cost`/`terminal_cost`. Constant across one MPPI rollout
-        # (set before the first plan_step of the episode), so we don't need
-        # a per-state sensor for it.
+        # Goal in [x, y]. Constant across one MPPI rollout (one plan_step
+        # = one goal), so no per-state sensor needed.
         self._goal = np.zeros(2, dtype=np.float64)
 
     # ------------------------------------------------------------------
@@ -99,9 +81,8 @@ class PointMass(MuJoCoEnv):
         state: Float[ndarray, "state_dim"] | None = None,
     ) -> Float[ndarray, "4"]:
         if state is not None:
-            # State-restore path. Parent reset calls our overridden
-            # `set_state`, which unpacks the trailing goal entries from
-            # the extended state vector and syncs `self._goal` + mocap.
+            # Parent reset calls our `set_state`, which peels the goal
+            # off the state tail and syncs `_goal` + mocap_pos.
             return super().reset(state=state)
 
         mujoco.mj_resetData(self.model, self.data)
@@ -113,21 +94,15 @@ class PointMass(MuJoCoEnv):
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs()
 
-    # ------------------------------------------------------------------
-    # State capture/restore — extended with goal so condition-restore
-    # round-trips through MPPI / GPS / DAgger correctly. See module
-    # docstring for the bug this prevents.
-    # ------------------------------------------------------------------
+    # State capture/restore extended with goal. See module docstring.
 
     def get_state(self) -> np.ndarray:
         physics = super().get_state()                 # FULLPHYSICS-size
-        return np.concatenate([physics, self._goal])  # +2 dims for goal_xy
+        return np.concatenate([physics, self._goal])
 
     def set_state(self, state: np.ndarray) -> None:
-        # Last 2 entries are the goal; everything before is FULLPHYSICS.
-        # Accept both extended (state_dim) and raw (FULLPHYSICS) inputs so
-        # any legacy caller passing a plain mujoco state still works (the
-        # goal cache simply isn't updated — same as the previous behavior).
+        # Accept both extended (state_dim) and raw FULLPHYSICS — legacy
+        # callers pass plain states (goal cache stays as-is).
         if state.shape[-1] == self._nstate + 2:
             super().set_state(state[: self._nstate])
             goal = state[self._nstate : self._nstate + 2]
@@ -138,10 +113,6 @@ class PointMass(MuJoCoEnv):
 
     @property
     def state_dim(self) -> int:
-        # Honest accounting: FULLPHYSICS + goal_xy. Most consumers use
-        # MuJoCoEnv's `state_qpos` / `state_qvel` which index into the
-        # rollout output (FULLPHYSICS-sized, unaffected), but anyone
-        # allocating buffers from `state_dim` will get the right size.
         return self._nstate + 2
 
     def batch_rollout(
@@ -149,25 +120,17 @@ class PointMass(MuJoCoEnv):
         initial_state: np.ndarray,
         action_sequences: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # mujoco.rollout expects FULLPHYSICS-shaped initial states. When
-        # called by MPPI with a `get_state()` capture, strip the trailing
-        # goal entries first and broadcast the goal into `self._goal` so
-        # `running_cost` / `terminal_cost` / `state_to_obs` see the goal
-        # that was active when this state was captured. Idempotent on
-        # already-FULLPHYSICS input (legacy callers).
+        # Strip the trailing goal entries before mujoco.rollout (expects
+        # FULLPHYSICS-shaped input). Set `_goal` so the cost / state_to_obs
+        # see the goal that was active when this state was captured. MPPI
+        # always broadcasts ONE state per call, so one goal per call.
         initial_state = np.asarray(initial_state)
         if initial_state.shape[-1] == self._nstate + 2:
-            # 1-D state (single condition broadcast across K) or 2-D
-            # batched per-K (we still expect ONE goal across K — MPPI
-            # always broadcasts a single state). Take the first row.
             if initial_state.ndim == 1:
                 goal = initial_state[self._nstate : self._nstate + 2]
             else:
                 goal = initial_state[0, self._nstate : self._nstate + 2]
             self._goal = np.asarray(goal, dtype=np.float64).copy()
-            # Also sync the env's live mocap_pos for visualisation parity;
-            # mujoco.rollout uses pool mjData, so this is only for
-            # rendering from `env.data` after the call.
             self.data.mocap_pos[0, :2] = self._goal
             initial_state = initial_state[..., : self._nstate]
         return super().batch_rollout(initial_state, action_sequences)
@@ -225,19 +188,9 @@ class PointMass(MuJoCoEnv):
             + _TERMINAL_VEL_COST_WEIGHT * np.sum(qvel ** 2, axis=-1)
         )
 
-    # ------------------------------------------------------------------
-    # Observation — [qpos, qvel, goal] (6-D), matches upstream verbatim.
-    #
-    # Why explicit goal (vs delta-to-goal):
-    # * MPPI demos aren't *perfectly* translation-invariant — wall-
-    #   proximity effects + finite-K MPPI noise mean two states with the
-    #   same `qpos − goal` can map to slightly different optimal actions
-    #   in practice. With 4-D delta obs, BC sees those as label noise on
-    #   identical inputs and learns the average — a flatter policy.
-    # * The 6-D form lets the policy learn the relationship from data:
-    #   it can collapse to "act on (qpos − goal)" internally, or use qpos
-    #   and goal independently if wall proximity matters.
-    # ------------------------------------------------------------------
+    # Observation: `[qpos, qvel, goal]` (6-D). Explicit goal channel
+    # (rather than delta-to-goal) lets the policy learn the relationship
+    # from data and avoids label noise from wall-proximity effects.
 
     def _get_obs(self) -> Float[ndarray, "6"]:
         return np.concatenate([self.data.qpos, self.data.qvel, self._goal])
@@ -249,15 +202,11 @@ class PointMass(MuJoCoEnv):
     ) -> np.ndarray:
         qpos = self.state_qpos(states)
         qvel = self.state_qvel(states)
-        # Broadcast the env's current goal across the leading dims of
-        # `states` (K, H, ...). One MPPI rollout uses one goal — set on
-        # the env via `batch_rollout`'s tail-strip, or via `reset()` for
-        # closed-loop rollout. The goal stays the same across the
-        # batched K×H grid in either case.
+        # One MPPI rollout uses one goal — broadcast `_goal` across the
+        # leading dims (K, H, ...).
         goal = np.broadcast_to(self._goal, qpos.shape[:-1] + (2,))
         return np.concatenate([qpos, qvel, goal], axis=-1)
 
     @property
     def obs_dim(self) -> int:
-        # qpos (2) + qvel (2) + goal (2) = 6
         return self._nq + self._nv + 2

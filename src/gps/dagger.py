@@ -49,12 +49,6 @@ class DAggerTrainer:
         self._buf_act: list[np.ndarray] = []
         self._buf_round: list[np.ndarray] = []
 
-        # Optional EMA of policy weights. DAgger trains MSE-on-mean, so only
-        # the EMA stabiliser applies (no KL-to-prev: there's no policy
-        # distribution to constrain in the deterministic case).
-        if cfg.ema_decay > 0.0:
-            self.policy.attach_ema(cfg.ema_decay)
-
     # ---------- buffer ----------
     def buffer_size(self) -> int:
         return sum(len(o) for o in self._buf_obs)
@@ -318,8 +312,8 @@ class DAggerTrainer:
             return self._train_step_gaussian_ppo(obs, act, old_policy, clip_ratio)
 
         # Gaussian default: NLL via train_weighted with uniform weights.
-        # Reuses the GPS code path so any normalizer / EMA / NaN-guard
-        # fixes applied there carry over here automatically.
+        # Reuses the GPS code path so normalizer / NaN-guard logic stays
+        # in sync.
         weights = np.ones(len(obs), dtype=np.float32)
         return self.policy.train_weighted(obs, act, weights)
 
@@ -333,12 +327,8 @@ class DAggerTrainer:
         """PPO-style ratio-clipped surrogate for the Gaussian dagger fit.
 
         ``L = - E[ min(r, clip(r, 1-eps, 1+eps)) ]`` where
-        ``r = pi_theta(a|o) / pi_old(a|o)``. Mirrors the Gaussian branch of
-        ``mppi_gps_clip._train_step_clipped`` but with constant advantage 1
+        ``r = pi_theta(a|o) / pi_old(a|o)``. Constant advantage = 1
         (DAgger does not retain MPPI importance weights past collection).
-
-        Touches the same per-step machinery as ``GaussianPolicy.mse_step``:
-        normaliser update, optimizer.zero_grad/backward/step, EMA update.
         """
         device = self.policy.device
         o_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
@@ -351,37 +341,27 @@ class DAggerTrainer:
         with torch.no_grad():
             old_log_prob = old_policy.log_prob(o_t, a_t)
 
-        # Clamp log-ratio to prevent exp() overflow → 0·∞ NaN gradients
-        # via the torch.min autograd chain. See mppi_gps_unified for the
-        # full explanation; same pathology applies here.
+        # Clamp log-ratio so exp() can't overflow → 0·∞ NaN gradients
+        # via torch.min's autograd chain.
         log_ratio = torch.clamp(curr_log_prob - old_log_prob, min=-20.0, max=20.0)
         ratio = torch.exp(log_ratio)
-        # Uniform "advantage" = 1; min(...) caps boost at ratio = 1+clip_ratio.
         surr1 = ratio
         surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
         loss = -torch.min(surr1, surr2).mean()
 
         self.policy.optimizer.zero_grad()
         loss.backward()
-        # NaN-loss guard: same rationale as in GaussianPolicy.train_weighted.
         if not torch.isfinite(loss):
             self.policy.optimizer.zero_grad()
             return float("nan")
         self.policy.optimizer.step()
-        # EMA hook — `mse_step` does this; mirror so the EMA shadow stays
-        # in sync with the live policy across PPO updates too. (This is
-        # one consistency improvement over `mppi_gps_clip`'s Gaussian
-        # branch, which omits the EMA update.)
-        if self.policy.ema is not None:
-            self.policy.ema.update(self.policy)
         return float(loss.item())
 
     @torch.no_grad()
     def _eval_mse(self, obs: np.ndarray, act: np.ndarray, batch: int = 16384) -> float:
-        """Validation MSE in the policy's training-loss space — see
-        ``scripts.test_sl.eval_mse`` for the rationale. With output norm
-        on, ``mse_step`` works in normalized space; this matches it so
-        round-best selection / curve plotting are on a single scale.
+        """Validation MSE in the policy's training-loss space. With
+        output norm on, `mse_step` operates in normalized space; this
+        matches it so round-best selection / curves stay on one scale.
         Byte-identical to physical-space MSE when output norm is off.
         """
         device = self.policy.device
@@ -465,12 +445,8 @@ class DAggerTrainer:
         obs_r, act_r = self.collect_round(k)
         self.append(obs_r, act_r, round_idx=k)
         train_loss, val_mse = self.finetune(obs_r, act_r, round_idx=k)
-        # End-of-round stabilisers, mirroring MPPIGPS:
-        #  - ema_hard_sync: θ ← EMA so next round's rollouts run the smoothed policy.
-        #  - reset_optim_per_iter: wipe Adam moments so stale momentum doesn't
-        #    carry into the next round (especially important after a hard-sync).
-        if getattr(self.cfg, "ema_decay", 0.0) > 0.0 and getattr(self.cfg, "ema_hard_sync", False):
-            self.policy.ema_sync()
+        # Optionally wipe Adam moments at end of round — stale momentum
+        # can fight buffer-distribution shifts.
         if getattr(self.cfg, "reset_optim_per_iter", False):
             self.policy.reset_optimizer()
         return {

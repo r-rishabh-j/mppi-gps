@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-
 import numpy as np
 import torch
 import torch.nn as nn
 
 from src.policy import USE_ACT_NORM, featurize_obs, featurized_dim
-from src.policy.ema import EMA
 from src.policy.gaussian_policy import RunningNormalizer
 from src.utils.config import PolicyConfig
 
@@ -33,11 +30,7 @@ class DeterministicPolicy(nn.Module):
         activations = {"relu": nn.ReLU, "tanh": nn.Tanh}
         act_fn = activations[cfg.activation]
 
-        # ---- Input pre-processor ---------------------------------------
-        # "hand_crafted" featurization is env-aware (see src/policy/__init__.py).
-        # It already produces ~unit-scaled features, so we bypass
-        # RunningNormalizer in that mode. Effective input dim into the MLP
-        # is whatever `featurized_dim(obs_dim)` returns.
+        # Hand-crafted featurization bypasses RunningNormalizer.
         self._featurize_mode = getattr(cfg, "featurize", "running_norm")
         if self._featurize_mode == "hand_crafted":
             self.normalizer = None
@@ -46,17 +39,11 @@ class DeterministicPolicy(nn.Module):
             self.normalizer = RunningNormalizer(obs_dim) if cfg.obs_norm else None
             mlp_in = obs_dim
 
-        # ---- MLP stack -------------------------------------------------
-        # `use_dropout` / `use_layernorm` (PolicyConfig) toggle the per-
-        # hidden-layer regularisation. Default keeps both on (legacy
-        # behaviour, biased for high-DoF envs). Flip both off to match
-        # upstream's plain MLP + tanh setup for tiny tasks (point_mass,
-        # acrobot) where the regularisation over-smooths.
         use_dropout = getattr(cfg, "use_dropout", True)
         use_layernorm = getattr(cfg, "use_layernorm", True)
         dropout_p = getattr(cfg, "dropout_p", None)
         if dropout_p is None:
-            dropout_p = 0.2   # legacy default for the deterministic policy
+            dropout_p = 0.2
 
         layers = []
         in_dim = mlp_in
@@ -69,21 +56,14 @@ class DeterministicPolicy(nn.Module):
                 layers.append(nn.Dropout(dropout_p))
             in_dim = h
         layers.append(nn.Linear(in_dim, act_dim))
-        # Optional tanh on the output. When on, the network output is
-        # bounded to (-1, 1) in NORMALIZED action space and `_to_phys`
-        # denormalizes. The `act_np` clamp then becomes a safety net (it
-        # can still fire if tanh saturates exactly at ±1 and the affine
-        # is non-trivial, but it's a no-op in the typical case).
+        # Tanh squash: network output bounded to (-1, 1) in normalized
+        # action space; `_to_phys` denormalizes.
         self._tanh_squash = bool(getattr(cfg, "tanh_squash", False))
         if self._tanh_squash:
             layers.append(nn.Tanh())
         self.net = nn.Sequential(*layers)
 
-        # Action bounds + optional output-norm affine. See
-        # `src/policy/__init__.py` and the GaussianPolicy mirror of this
-        # block for the full rationale. `_has_act_norm` gates the
-        # `_to_phys` / `_to_norm` helpers — set only when both the toggle
-        # is on AND we have bounds to derive the affine from.
+        # Bounds + optional output-norm affine (mirrors GaussianPolicy).
         self._has_act_norm = False
         if action_bounds is not None:
             low, high = action_bounds
@@ -107,10 +87,6 @@ class DeterministicPolicy(nn.Module):
         self.to(self._device)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=cfg.lr)
 
-        # Optional EMA tracker — mirrors GaussianPolicy. KL-to-prev-iter is
-        # not meaningful here (no policy distribution), so only EMA is wired.
-        self.ema: EMA | None = None
-
     @property
     def device(self) -> torch.device:
         return self._device
@@ -120,9 +96,7 @@ class DeterministicPolicy(nn.Module):
         self._device = next(self.parameters()).device
         return out
 
-    # ------------------------------------------------------------------
-    # Action-space (de)normalization helpers (mirror GaussianPolicy)
-    # ------------------------------------------------------------------
+    # Action-space (de)normalization (mirror GaussianPolicy).
 
     def _to_phys(self, normalized: torch.Tensor) -> torch.Tensor:
         if not self._has_act_norm:
@@ -135,9 +109,9 @@ class DeterministicPolicy(nn.Module):
         return (physical - self._act_bias) / self._act_scale
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Network-internal output: NORMALIZED action space when the toggle
-        is on, physical space otherwise. Use `action()` for a physical-
-        space tensor at the user-facing boundary."""
+        """Network output in NORMALIZED action space when the affine
+        toggle is on, physical otherwise. Use `action()` at the user
+        boundary."""
         if self._featurize_mode == "hand_crafted":
             x = featurize_obs(obs)
         elif self.normalizer is not None:
@@ -156,17 +130,11 @@ class DeterministicPolicy(nn.Module):
         actions: np.ndarray,
         grad_clip_norm: float = 0.0,
     ) -> float:
-        """One MSE update step. When ``grad_clip_norm > 0``, the parameter
-        gradient is L2-norm-clipped to that bound between ``backward()`` and
-        ``optimizer.step()`` — a soft trust region on per-update parameter
-        movement that is independent of the loss magnitude or the residual
-        distribution. Loss-agnostic, dimension-aware, no biased estimator
-        (unlike target-clipping the labels)."""
+        """One MSE update. `grad_clip_norm > 0` activates an L2 grad-norm
+        clip between backward() and optimizer.step() — a loss-agnostic
+        bound on per-update parameter movement."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
-        # Move physical labels into the network's space so per-dim losses
-        # are equalized — see `src/policy/__init__.py`. No-op when the
-        # action-norm toggle is off.
         act_t = self._to_norm(act_t)
         if self.normalizer is not None:
             self.normalizer.update(obs_t)
@@ -174,47 +142,16 @@ class DeterministicPolicy(nn.Module):
         loss = ((pred - act_t) ** 2).mean()
         self.optimizer.zero_grad()
         loss.backward()
-        # NaN-loss guard: see GaussianPolicy.train_weighted. A single bad
-        # batch (NaN action target from a divergent MPPI rollout) would
-        # otherwise overwrite every parameter with NaN in one step.
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()
             return float("nan")
         if grad_clip_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip_norm)
         self.optimizer.step()
-        if self.ema is not None:
-            self.ema.update(self)
         return float(loss.item())
 
-    # ------------------------------------------------------------------
-    # EMA hooks (mirror GaussianPolicy)
-    # ------------------------------------------------------------------
-
-    def attach_ema(self, decay: float) -> None:
-        if decay <= 0.0:
-            self.ema = None
-            return
-        self.ema = EMA(self, decay=decay)
-
-    @contextmanager
-    def ema_swapped_in(self):
-        if self.ema is None:
-            yield
-            return
-        with self.ema.swapped_in(self):
-            yield
-
-    def ema_l2_drift(self) -> float:
-        return self.ema.l2_drift(self) if self.ema is not None else 0.0
-
-    def ema_sync(self) -> None:
-        """Hard-sync θ ← EMA shadow. See GaussianPolicy.ema_sync()."""
-        if self.ema is not None:
-            self.ema.sync_to(self)
-
     def reset_optimizer(self) -> None:
-        """Recreate Adam with a fresh state. See GaussianPolicy.reset_optimizer()."""
+        """Recreate Adam with fresh state. See GaussianPolicy.reset_optimizer."""
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
 
     @torch.no_grad()

@@ -58,15 +58,12 @@ def parse_args():
     p.add_argument("--device", default="auto", help="auto | cpu | mps | cuda")
     p.add_argument("--render", action="store_true", help="save mp4 of episode 0", default=True)
     p.add_argument("--deterministic", action="store_true",
-                   help="Load into DeterministicPolicy. Auto-detected when the checkpoint "
-                        "or sibling config.json records policy_class.")
+                   help="Load into DeterministicPolicy. Auto-detected from "
+                        "checkpoint or sibling config.json's policy_class.")
     p.add_argument("--disable-tanh", action="store_true",
-                   help="Force tanh squash OFF on the policy head, overriding "
-                        "whatever the run's config.json (or the current "
-                        "PolicyConfig default) says. Use when replaying a "
-                        "pre-tanh checkpoint whose config.json doesn't record "
-                        "tanh_squash — the fallback assumes False (legacy), "
-                        "so this flag is mostly a safety override.")
+                   help="Force tanh squash OFF, overriding the run's "
+                        "config.json. Mostly a safety override; the legacy "
+                        "fallback already assumes tanh=False.")
     p.add_argument("--video-out", default=None,
                    help="video path (default: <ckpt>_eval.mp4)")
     return p.parse_args()
@@ -105,29 +102,17 @@ def main():
     policy_class = blob.get("policy_class") or (run_cfg or {}).get("policy_class")
     use_deterministic = args.deterministic or (policy_class == "DeterministicPolicy")
 
-    # Use the SAME per-env config the trainers use (test_sl / run_dagger /
-    # run_gps all call PolicyConfig.for_env). Otherwise an adroit checkpoint
-    # trained with hidden_dims=(512, 512, 512) would fail to load into the
-    # default (256, 256) net with a state_dict shape mismatch.
+    # Use the per-env config the trainers use (`PolicyConfig.for_env`).
+    # An adroit checkpoint trained with hidden_dims=(512, 512, 512) would
+    # otherwise mis-load into the (256, 256) default.
     policy_cfg = PolicyConfig.for_env(env_name)
 
-    # ---- Replay policy-architecture fields from config.json -------------
-    # We need to construct the policy with the SAME architecture it was
-    # trained under, otherwise we either get a state_dict shape mismatch
-    # (featurize="hand_crafted" changes the first layer's input dim on
-    # 4-D acrobot) or — worse — a silent behaviour change (tanh on/off
-    # is parameter-free, so the state_dict loads fine but the policy now
-    # squashes outputs that the training never expected).
-    #
-    # Fallback for legacy checkpoints with no config.json (or with a
-    # config from before these fields existed): assume the legacy
-    # architecture (no tanh, learned-norm input, dropout+layernorm).
-    # That's the architecture every pre-flip checkpoint was trained with.
-    #
-    # Lookup path: run_gps / run_dagger / test_sl all nest dataclass
-    # configs under the top-level "configs" key, so the PolicyConfig
-    # dict lives at `run_cfg["configs"]["policy"]`. A top-level "policy"
-    # key is also tolerated for forward compatibility.
+    # Replay arch fields from config.json. Required so the policy is
+    # constructed with the SAME architecture it was trained under —
+    # otherwise state_dict shape mismatches (featurize="hand_crafted"
+    # changes input dim) or silent behaviour changes (tanh is parameter-
+    # free → squashes outputs the training never expected). Legacy
+    # fallback assumes pre-flip arch (no tanh, learned-norm, dropout+ln).
     run_policy_cfg = (
         ((run_cfg or {}).get("configs") or {}).get("policy")
         or (run_cfg or {}).get("policy")
@@ -141,9 +126,7 @@ def main():
         "dropout_p": None,
     }
     for key, legacy_value in LEGACY.items():
-        # Prefer the value recorded at training time; fall back to legacy.
         setattr(policy_cfg, key, run_policy_cfg.get(key, legacy_value))
-    # CLI override: --disable-tanh wins regardless of source.
     if args.disable_tanh:
         policy_cfg.tanh_squash = False
 
@@ -152,21 +135,18 @@ def main():
     policy = PolicyCls(env.obs_dim, env.action_dim, policy_cfg,
                        device=device, action_bounds=bounds)
     policy.load_state_dict(blob["state_dict"])
-    # Health check: a checkpoint with NaN/Inf weights silently produces
-    # NaN actions (clamp doesn't sanitize NaN), which then trip MuJoCo's
-    # "huge value in CTRL" warning at t=0 and freeze the hand at its
-    # reset pose. Catch it here with a clear error instead of letting
-    # the user chase the symptom through eval_policy → MuJoCo.
+    # Health check: NaN/Inf weights silently produce NaN actions (clamp
+    # doesn't sanitize NaN), tripping MuJoCo's "huge value in CTRL" at
+    # t=0 and freezing the hand. Catch it here with a clear error.
     bad = sorted(
         k for k, v in policy.state_dict().items() if not torch.isfinite(v).all()
     )
     if bad:
         raise ValueError(
             f"checkpoint {ckpt_path} has non-finite weights in {len(bad)} "
-            f"tensors (showing first 5: {bad[:5]}). The training run was "
-            f"poisoned by a NaN gradient — the checkpoint is unrecoverable. "
-            f"Delete the run dir and retrain (the MPPI/policy NaN guards in "
-            f"src/mppi/mppi.py and src/policy/*.py prevent recurrence)."
+            f"tensors (showing first 5: {bad[:5]}). The run was poisoned "
+            f"by a NaN gradient — unrecoverable. Delete the run dir and "
+            f"retrain (NaN guards in mppi/policy prevent recurrence)."
         )
     policy.eval()
 
