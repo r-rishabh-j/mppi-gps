@@ -1,67 +1,19 @@
-"""Evaluate every iter_*.pt checkpoint in a run dir and plot eval cost vs.
-true environment-physics steps consumed during training.
+"""Eval every iter_*.pt in a run dir; plot cost vs cumulative env steps.
 
-Walks a run directory like ``PAPER/hopper/gps-combined/`` and:
+For each checkpoint runs ``--n-eval`` episodes (mean ± std), overlays
+the MPPI baseline (``--n-mppi-eval``), and optionally overlays a BC run
+(``--bc-run-dir``). Both runs use the same eval args; each run's x-axis
+is computed from its own ``config.json``.
 
-  1. Discovers ``iter_000.pt … iter_NNN.pt``.
-  2. For each checkpoint, runs ``--n-eval`` policy episodes and records
-     mean ± std cost (mean used for the curve, std for an error band).
-  3. Runs the MPPI baseline ``--n-mppi-eval`` times and overlays the
-     mean as a horizontal dotted line.
-  4. Plots cost vs. cumulative env-physics steps.
+X-axis (per training iter):
+    GPS:    num_conditions * ceil(episode_length / open_loop_steps) * K * H
+    DAgger: rollouts_per_iter * episode_len * K * H
 
-Pass ``--bc-run-dir`` to overlay a behaviour-cloning run on the same
-plot. Both runs are evaluated with identical (``--n-eval``, ``--eval-len``,
-``--seed``) so the per-checkpoint comparison is apples-to-apples; each
-run's x-axis is computed from its OWN ``config.json`` (since BC and GPS
-typically use different ``num_conditions`` / open-loop budgets per iter).
+iter_k plotted at k · steps_per_iter (DAgger warmup is not added so
+per-iter shape stays comparable; warmup count printed for transparency).
 
-X-axis steps formula (per training iteration):
-
-    GPS:    steps_per_iter = num_conditions
-                           * ceil(episode_length / open_loop_steps)
-                           * K * H
-    DAgger: steps_per_iter = rollouts_per_iter * episode_len * K * H
-            (no /open_loop divisor — relabel forces a full rollout per
-            env step.)
-
-Checkpoint ``iter_k`` is plotted at ``k * steps_per_iter`` — so every
-curve starts at x=0 regardless of per-iter cost (e.g. DAgger's 82M
-per-iter on hopper vs GPS's 27M does not push DAgger right by 55M at
-iter 0). DAgger's ``warmup_rollouts`` phase (a one-time fixed offset)
-is also intentionally NOT added — it would visually push the whole
-DAgger curve to the right and obscure per-iter cost differences. The
-warmup count is still computed and printed in the per-run breakdown
-for transparency.
-
-CSV is intentionally NOT read — costs are recomputed live so this script
-is the source of truth for the curve.
-
-Caching:
-    Each run dir gets an ``eval_cache.json`` keyed on every parameter that
-    affects the result. Re-runs reuse cached values; only parameter changes
-    (or new checkpoints) trigger fresh evaluation. So if you eval at
-    ``--n-eval 5 --eval-len 1000 --seed 42``, then re-run with the same
-    args plus ``--n-mppi-eval 5``, only the MPPI baseline is recomputed.
-    Bump ``--n-eval`` and only the policy evals re-run. Add new
-    ``iter_*.pt`` files and only the new ones get evaluated. Use
-    ``--no-cache`` to bypass entirely or ``--clear-cache`` to wipe before
-    running.
-
-    Cache key for policy evals: (iter, n_eval, eval_len, seed).
-    Cache key for MPPI baseline: (mppi_config_dict, n_mppi_eval, eval_len, seed).
-    The MPPI key includes the full MPPIConfig (K, H, lam, noise_sigma,
-    noise_cov, open_loop_steps, …) so changing any of those forces a
-    fresh baseline.
-
-Examples:
-    # GPS only
-    python -m scripts.eval_run --run-dir PAPER/hopper/gps-combined \
-        --n-eval 5 --n-mppi-eval 3
-
-    # GPS + BC overlay
-    python -m scripts.eval_run --run-dir PAPER/hopper/gps-combined \
-        --bc-run-dir PAPER/hopper/BC --n-eval 5 --n-mppi-eval 3
+Caching: ``eval_cache.json`` per run dir, keyed on every parameter that
+affects the result; ``--no-cache`` / ``--clear-cache`` to bypass.
 """
 from __future__ import annotations
 
@@ -125,6 +77,13 @@ def parse_args() -> argparse.Namespace:
                    help="Policy episodes per checkpoint (applied to BOTH runs).")
     p.add_argument("--n-mppi-eval", type=int, default=3,
                    help="MPPI baseline episodes (set 0 to skip).")
+    p.add_argument("--mppi-baseline", type=float, default=None,
+                   help="Precomputed MPPI baseline cost. When set, skips the "
+                        "MPPI eval loop entirely and uses this value for the "
+                        "horizontal reference line / JSON dump. `--n-mppi-eval` "
+                        "is ignored. Use after a previous run already produced "
+                        "an MPPI baseline you want to reuse (cheaper than "
+                        "warming the cache, and works across run dirs).")
     p.add_argument("--eval-len", type=int, default=None,
                    help="Steps per episode. Defaults to gps.eval_ep_len from "
                         "config.json of --run-dir, or 500 if missing.")
@@ -220,11 +179,7 @@ def _lookup_mppi(cache: dict, mppi_cfg_dict: dict, n_mppi_eval: int,
 
 
 def _mppi_cfg_to_dict(cfg: MPPIConfig) -> dict:
-    """Convert MPPIConfig → plain dict for cache-key comparison.
-
-    `noise_cov` (a list of lists) is preserved verbatim. Field order is
-    fixed by the dataclass, so dict equality is well-defined.
-    """
+    """MPPIConfig → plain dict for cache-key compare."""
     return {
         "K": cfg.K,
         "H": cfg.H,
@@ -250,17 +205,7 @@ def _discover_checkpoints(run_dir: Path) -> list[tuple[int, Path]]:
 
 def _build_policy(env, env_name: str, blob: dict, run_cfg: dict | None,
                   device) -> torch.nn.Module:
-    """Mirror eval_checkpoint's class-resolution logic.
-
-    Backward-compat: if the checkpoint predates action normalization (no
-    `_act_scale` / `_act_bias` buffers in its state_dict) but the current
-    `USE_ACT_NORM=True` build registered those buffers, we disable
-    `_has_act_norm` for this policy instance so `_to_phys` / `_to_norm`
-    short-circuit and the network's outputs are treated as physical
-    actions (which is what they were trained to produce). Without this,
-    loading an old DAgger / pre-norm checkpoint would raise
-    "Missing key(s) ... _act_scale, _act_bias".
-    """
+    """Build + load the policy; auto-disables act-norm for pre-norm ckpts."""
     policy_class = blob.get("policy_class") or (run_cfg or {}).get("policy_class")
     use_det = policy_class == "DeterministicPolicy"
     PolicyCls = DeterministicPolicy if use_det else GaussianPolicy
@@ -272,12 +217,9 @@ def _build_policy(env, env_name: str, blob: dict, run_cfg: dict | None,
     sd = blob["state_dict"]
     has_norm_in_ckpt = "_act_scale" in sd and "_act_bias" in sd
     if not has_norm_in_ckpt and getattr(policy, "_has_act_norm", False):
-        # Old checkpoint: outputs are already in physical space.
+        # Old ckpt: outputs are already physical.
         policy._has_act_norm = False
-    # strict=False so the missing _act_scale/_act_bias don't raise; with
-    # _has_act_norm flipped above, those buffers are never read anyway.
     missing, unexpected = policy.load_state_dict(sd, strict=False)
-    # Anything other than the act-norm buffers is a real schema mismatch.
     real_missing = [k for k in missing if k not in ("_act_scale", "_act_bias")]
     if real_missing or unexpected:
         raise RuntimeError(
@@ -297,33 +239,11 @@ def _build_policy(env, env_name: str, blob: dict, run_cfg: dict | None,
 
 
 def _steps_per_iter(run_cfg: dict) -> tuple[int, int, dict]:
-    """Compute (steps_per_iter, warmup_steps, breakdown_dict) from training config.
+    """Compute (steps_per_iter, warmup_steps, breakdown).
 
-    Auto-detects GPS vs DAgger config shape:
-
-    * GPS (`configs.gps` block):
-        per_iter = num_conditions
-                   * ceil(episode_length / open_loop_steps)
-                   * K * H
-        warmup   = 0
-
-      MPPI does one K*H sample-and-rollout pass every `open_loop_steps`
-      env steps (intermediate steps replay cached actions).
-
-    * DAgger (`configs.dagger` block):
-        per_iter = rollouts_per_iter * episode_len * K * H
-        warmup   = warmup_rollouts * episode_len * K * H / open_loop_steps
-                   (only the warmup MPPI uses open-loop caching;
-                    DAgger relabels every visited state, so no divisor.)
-
-      DAgger's relabel call forces a full rollout per env step — the
-      open-loop cadence applies only to the warmup-phase pure-MPPI
-      rollouts, not to the per-step relabel afterwards.
-
-    Returns:
-        steps_per_iter: physics steps consumed by ONE training iter (after warmup).
-        warmup_steps:   one-time offset added to cumulative count at iter 0.
-        breakdown:      dict for printing/saving.
+    GPS:    num_conditions * ceil(ep_len / open_loop_steps) * K * H
+    DAgger: rollouts_per_iter * episode_len * K * H (relabel forces full
+            rollouts; open_loop only divides warmup_rollouts).
     """
     mppi_cfg = run_cfg["configs"]["mppi"]
     K = int(mppi_cfg["K"])
@@ -388,18 +308,7 @@ def _eval_one_run(
     label: str,
     no_cache: bool,
 ) -> dict[str, Any]:
-    """Evaluate every iter_*.pt in a run dir and return per-iter cost stats.
-
-    Same eval protocol as evaluate_policy: deterministic per-episode seed
-    (`seed + ep`), greedy policy actions, full episode_len rollouts. The
-    same `env` instance is reused for both runs in the multi-curve case
-    so cost comparisons aren't biased by env construction order.
-
-    Cache: per-(iter, n_eval, eval_len, seed) hits in <run_dir>/eval_cache.json
-    skip the policy build + episode rollouts. Misses recompute and append
-    to the cache; cache is flushed to disk after every miss so a Ctrl-C
-    halfway through doesn't lose work.
-    """
+    """Eval every iter_*.pt in ``run_dir``; per-iter stats + step cache."""
     cfg_path = run_dir / "config.json"
     if not cfg_path.exists():
         raise FileNotFoundError(
@@ -465,17 +374,11 @@ def _eval_one_run(
                 "std_cost": std_cost,
                 "per_ep_costs": per_ep,
             })
-            # Flush after every miss so a Ctrl-C doesn't waste work.
             _save_cache(run_dir, cache, no_cache=no_cache)
             n_misses += 1
             tag = "fresh "
 
-        # Plot iter k at `k * steps_per_iter` so every curve starts at x=0
-        # (iter 0 = "cost before any training steps were charged"). Previously
-        # this was `(k+1) * steps_per_iter`, which forced each curve's first
-        # point to its own per-iter cost and made methods with different
-        # per-iter budgets (e.g. DAgger 82M vs GPS 27M on hopper) look
-        # offset at the start. Warmup is still NOT added — see header.
+        # Plot iter k at k · steps_per_iter so every curve starts at x=0.
         steps = it_idx * steps_per_iter
         iter_indices.append(it_idx)
         cum_steps.append(steps)
@@ -597,7 +500,15 @@ def main() -> None:
     mppi_mean: float | None = None
     mppi_std: float | None = None
     mppi_per_ep: list[float] = []
-    if args.n_mppi_eval > 0:
+    if args.mppi_baseline is not None:
+        # User-supplied baseline — skip the eval loop entirely. No std /
+        # per_ep available; left at 0 / [] so the JSON schema is uniform.
+        mppi_mean = float(args.mppi_baseline)
+        mppi_std = 0.0
+        mppi_per_ep = []
+        print(f"[eval-run] MPPI baseline (user-supplied): cost = {mppi_mean:.2f} "
+              f"(skipping MPPI eval loop)")
+    elif args.n_mppi_eval > 0:
         try:
             mppi_cfg = MPPIConfig.load(args.mppi_config or env_name)
         except FileNotFoundError:

@@ -1,14 +1,4 @@
-"""Standalone MPPI runner for the UR5 push task.
-
-Mirrors the structure of ``run_hopper.py`` / ``run_adroit_pen.py``: reset
-the env, replan with MPPI each step, render to either an interactive
-viewer (``--live``) or a recorded MP4 (default).
-
-Optional policy prior — pass ``--policy-ckpt`` and ``--alpha > 0`` to
-visualise how a learned-policy-augmented MPPI rollout differs from
-vanilla MPPI (auto-detects Gaussian vs Deterministic from the
-checkpoint).
-"""
+"""Standalone MPPI runner for UR5 push (live viewer or recorded mp4)."""
 
 import argparse
 import time

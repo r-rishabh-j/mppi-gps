@@ -1,50 +1,24 @@
-"""GPU-backed `batch_rollout` for MuJoCo envs via NVIDIA Warp + mujoco_warp.
+"""GPU ``batch_rollout`` mixin via NVIDIA Warp + mujoco_warp (CUDA only).
 
-Drop-in mixin: any class inheriting `WarpRolloutMixin` alongside a
-`MuJoCoEnv`-shaped class can call `_init_warp(nworld=K)` after the parent
-`__init__`, then `_batch_rollout_warp(state, U)` returns the same
-`(states, costs, sensordata)` tuple as the CPU path.
+Mix into a ``MuJoCoEnv`` subclass; call ``_init_warp(nworld=K)`` after
+the parent ``__init__``, then dispatch ``batch_rollout`` to
+``_batch_rollout_warp``. Returns the same ``(states, costs, sensordata)``
+shape as the CPU path.
 
-Adapted from upstream `jaiselsingh1/mppi-gps/src/envs/mujoco_env.py`,
-generalized to support models with mocap bodies (Adroit's target).
+Constraints (asserted in ``_init_warp``):
+- ``model.na == 0`` (no muscle / state actuators).
+- ``nworld`` fixed at construction; to change K, reinstantiate.
+- ``H`` may change (buffers + CUDA graph re-captured); K may not.
+- CUDA only — graph capture/replay is the speedup. macOS / non-NVIDIA
+  hosts: use the default CPU rollout.
 
-----------------------------------------------------------------------
-Constraints (asserted in `_init_warp`)
-----------------------------------------------------------------------
-- ``model.na == 0`` — actuators with state (e.g. muscles) unsupported.
-  All envs in this repo (acrobot, hopper, adroit_pen, adroit_relocate)
-  satisfy this; muscles would need a separate path.
-- ``nworld`` is fixed at construction. To change MPPI's K, re-instantiate
-  the env. (mujoco_warp's per-world buffers are pre-allocated.)
-- ``(K, H)`` pairing is captured into a CUDA graph on the first call.
-  Changing H invalidates the graph; the mixin handles this by reallocating
-  buffers and re-capturing on the next call. K is fixed (see above).
-- Hardware: warp + mujoco_warp can theoretically run on CPU, but graph
-  capture / replay (the speedup) is **CUDA-only**. On macOS or any
-  non-NVIDIA host this path will either fall back to CPU (slow, no graph)
-  or fail at `wp.ScopedCapture` — use the default CPU rollout instead.
+State layout: ``(K, H, 1 + nq + nv) = [time=0, qpos, qvel]``. Matches
+``mj_getState(FULLPHYSICS)`` for ``na==0``; ``time`` is always 0 (warp
+loop doesn't track sim time; nothing here reads ``state[..., 0]``).
 
-----------------------------------------------------------------------
-State layout returned
-----------------------------------------------------------------------
-``states.shape == (K, H, 1 + nq + nv)``, layout ``[time=0, qpos, qvel]``.
-Identical to ``mj_getState(FULLPHYSICS)`` for envs with ``na==0`` (where
-time + qpos + qvel exhausts the FULLPHYSICS state). All `state_qpos` /
-`state_qvel` indexing in the codebase keeps working unchanged. The only
-divergence is ``time`` — the warp path doesn't track sim time, so it
-reports 0. None of our cost or obs functions read state[..., 0], so this
-is invisible.
-
-----------------------------------------------------------------------
-Mocap handling (Adroit-relevant)
-----------------------------------------------------------------------
-Mocap pose is **static during a rollout** — set by `env.reset()` and not
-updated during stepping (it's a configuration, not a state). Per rollout,
-we broadcast `data.mocap_pos` / `data.mocap_quat` from the CPU model to
-all `nworld` GPU worlds so collision geometry attached to mocap bodies
-(Adroit's target site, containment walls anchored to mocap) sees the
-right configuration. `mj_getState(FULLPHYSICS)` does NOT carry mocap, so
-this has to be re-broadcast on every `_batch_rollout_warp` call.
+Mocap is a configuration (set by reset, static during a rollout) and is
+NOT carried by FULLPHYSICS, so we re-broadcast ``data.mocap_pos/quat``
+from the CPU model to all worlds on every rollout.
 """
 from __future__ import annotations
 
@@ -52,23 +26,11 @@ import numpy as np
 
 
 class WarpRolloutMixin:
-    """Adds a Warp-backed `_batch_rollout_warp` to a MuJoCoEnv subclass.
+    """Warp-backed ``_batch_rollout_warp`` for a MuJoCoEnv subclass.
 
-    Subclass usage:
-        class MyEnvWarp(WarpRolloutMixin, MyEnv):
-            def __init__(self, nworld, **kw):
-                super().__init__(**kw)
-                self._init_warp(nworld=nworld)
-            def batch_rollout(self, state, actions):
-                return self._batch_rollout_warp(state, actions)
-
-    Inherits `self.model`, `self.data`, `self._frame_skip`,
-    `self.running_cost`, `self.terminal_cost` from the MuJoCoEnv parent.
+    Inherits ``model``, ``data``, ``_frame_skip``, ``running_cost``,
+    ``terminal_cost`` from the parent.
     """
-
-    # ------------------------------------------------------------------
-    # Setup
-    # ------------------------------------------------------------------
 
     def _init_warp(
         self,
@@ -76,24 +38,13 @@ class WarpRolloutMixin:
         njmax: int = 256,
         nconmax: int = 96,
     ) -> None:
-        """Initialize the Warp rollout side.
+        """Initialize the Warp side.
 
-        ``njmax`` / ``nconmax`` are **per-world** constraint / contact buffer
-        budgets passed into ``mjw.make_data``. They are NOT inherited from
-        the XML's ``<size njmax=… nconmax=…>`` — mujoco_warp maintains its
-        own per-world buffers separate from the CPU model's. Defaults are
-        tuned for Adroit grasping (which routinely sees 60+ constraint
-        rows when fingers + palm + table are all in contact). Bump if you
-        see "nefc overflow - please increase njmax to N" — pick a value
-        20-30% above the largest N reported, plus headroom for divergent
-        rollouts.
-
-        Memory cost: ``O(njmax * nworld * 8 bytes)`` per per-world buffer.
-        At ``njmax=256, nworld=1024`` that's a couple of MB total — safe
-        to crank well above the reported overflow.
+        ``njmax`` / ``nconmax`` are per-world buffer budgets for
+        ``mjw.make_data`` (not inherited from XML). Defaults sized for
+        Adroit grasping. Bump on "nefc overflow" — memory is cheap
+        (``O(njmax · nworld · 8)`` bytes).
         """
-        # Lazy import — warp / mujoco_warp aren't required for the CPU path.
-        # ImportError surfaces clearly to the user with an install hint.
         try:
             import warp as wp
             import mujoco_warp as mjw
@@ -109,36 +60,18 @@ class WarpRolloutMixin:
             "Position actuators are fine; muscles are not."
         )
 
-        # ---- Build a separate, unpatched model copy for mujoco_warp ----
-        # Deepcopy is defensive: mjw.put_model is logically read-only on
-        # the input, but isolating the warp side means we cannot
-        # accidentally affect the CPU executor's `self.model` /
-        # `self.data` even if a future mjw version mutates fields. The
-        # copy here is byte-equal to the CPU model — same noslip, same
-        # geom_margin, same everything. If `put_model` raises
-        # NotImplementedError on a model feature your mujoco_warp version
-        # doesn't support, call `self._patch_model_for_warp(warp_model)`
-        # before the put_model line below to disable that feature on the
-        # warp side ONLY (CPU executor stays consistent with the user's
-        # original tuning). The patches available are documented in
-        # `_patch_model_for_warp`. We don't auto-apply them: the
-        # planner/executor physics split they create is invisible most
-        # of the time but real, and silently disabling solver passes is
-        # not the kind of thing to do behind the user's back.
+        # Deepcopy isolates the warp model from the CPU executor's. If
+        # mjw rejects a model feature on your version, uncomment the
+        # patch line below (warp side only).
         import copy
         warp_model = copy.deepcopy(self.model)
-        # self._patch_model_for_warp(warp_model)   # ← uncomment if mjw rejects model
+        # self._patch_model_for_warp(warp_model)
 
         self._wp = wp
         self._mjw = mjw
         self._wm = mjw.put_model(warp_model)
 
-        # Try to pass njmax/nconmax explicitly; fall back to model-derived
-        # defaults if this mjw version doesn't accept the kwargs (very
-        # old/very new API drift). The TypeError path keeps the env
-        # constructor working with the default budget so the user gets a
-        # clear runtime error from mjw.step instead of a confusing kwarg
-        # mismatch at construction.
+        # Older mjw versions don't accept the budget kwargs.
         try:
             self._wd = mjw.make_data(
                 warp_model, nworld=nworld,
@@ -164,42 +97,14 @@ class WarpRolloutMixin:
         self._has_mocap = self.model.nmocap > 0
         self._use_warp = True
 
-    # ------------------------------------------------------------------
-    # Compatibility patches
-    # ------------------------------------------------------------------
-
     def _patch_model_for_warp(self, model=None) -> None:
-        """Disable model features that older mujoco_warp versions reject.
+        """Opt-in patches for older mjw versions that reject model features.
 
-        OPT-IN — not called automatically. Apply selectively if mjw raises
-        ``NotImplementedError`` on your version. Each patch emits a single
-        warning so the change is visible.
-
-        ``model`` (optional) — apply patches to a specific MjModel instance
-        (e.g. the warp-only deepcopy in ``_init_warp``). Defaults to
-        ``self.model`` if omitted, which would change physics for the CPU
-        executor too — generally NOT what you want when paired with the
-        deepcopy approach in ``_init_warp``. Pass the warp copy explicitly.
-
-        Patches:
-        - ``noslip_iterations``: zeroed. mujoco_warp historically doesn't
-          implement the noslip post-pass solver. Adroit's XML defaults to
-          20 iterations. Effect: slightly less accurate sliding-friction
-          handling. For grasp-style contacts (sticky, low slip) usually a
-          no-op. Newer mjw versions may support it — try without first.
-        - ``geom_margin`` / ``pair_margin``: zeroed where non-zero. Older
-          mjw rejects non-zero geom margins under MULTICCD. Adroit's XML
-          sets ``margin="0.0005"`` on every geom. Effect: contact
-          detection fires at actual penetration instead of within a
-          0.5 mm shell. Negligible for grasping. Recent mjw versions may
-          handle margins natively — try without first.
-
-        Usage from ``_init_warp`` if you need it (uncomment the line in
-        the constructor that calls this on ``warp_model``):
-
-            warp_model = copy.deepcopy(self.model)
-            self._patch_model_for_warp(warp_model)   # only the warp side
-            self._wm = mjw.put_model(warp_model)
+        Pass the warp deepcopy from ``_init_warp`` to keep CPU side
+        unchanged. Patches: zero ``noslip_iterations`` (sliding friction
+        slightly less accurate), zero ``geom_margin`` / ``pair_margin``
+        (contact detection at actual penetration). Each patch emits a
+        warning.
         """
         import warnings
         m = model if model is not None else self.model
@@ -233,12 +138,8 @@ class WarpRolloutMixin:
             )
             m.pair_margin[:] = 0.0
 
-    # ------------------------------------------------------------------
-    # Buffer / graph management
-    # ------------------------------------------------------------------
-
     def _ensure_warp_buffers(self, K: int, H: int) -> None:
-        """(Re)allocate (H, K, *) buffers; invalidate captured graph if H changed."""
+        """(Re)allocate (H, K, *) buffers; invalidate graph if H changed."""
         if K != self._warp_nworld:
             raise RuntimeError(
                 f"nworld fixed at construction ({self._warp_nworld}); got K={K}. "
@@ -248,18 +149,16 @@ class WarpRolloutMixin:
             return
         wp = self._wp
         m = self.model
-        # (H, K, *) so buf[h] is a (K, *) leading-axis subview wp.copy can target.
+        # (H, K, *): buf[h] is a (K, *) subview wp.copy can target.
         self._qpos_buf   = wp.zeros((H, K, m.nq),          dtype=wp.float32)
         self._qvel_buf   = wp.zeros((H, K, m.nv),          dtype=wp.float32)
         self._sensor_buf = wp.zeros((H, K, m.nsensordata), dtype=wp.float32)
         self._actions_wp = wp.zeros((H, K, m.nu),          dtype=wp.float32)
-        self._rollout_graph = None    # buffers changed → captured graph stale
+        self._rollout_graph = None
         self._warp_H = H
 
     def _run_rollout(self, H: int) -> None:
-        """Capture-safe inner loop. Each outer step copies the per-step ctrl
-        into `wd.ctrl`, runs `frame_skip` `mjw.step`s, and snapshots qpos /
-        qvel / sensordata for that boundary."""
+        """Capture-safe inner loop: copy ctrl, frame_skip × mjw.step, snapshot."""
         wp = self._wp
         for h in range(H):
             wp.copy(self._wd.ctrl, self._actions_wp[h])
@@ -274,48 +173,27 @@ class WarpRolloutMixin:
         initial_state: np.ndarray,
         per_world_mocap: np.ndarray | None = None,
     ) -> None:
-        """Seed the GPU world buffers with the per-world initial state.
+        """Seed GPU buffers with the initial state.
 
-        Two input shapes are accepted (overload-by-shape):
-          * ``initial_state.shape == (nstate,)`` — single FULLPHYSICS state
-            broadcast to all ``nworld`` GPU worlds. Mocap pose is read
-            from the CPU ``self.data`` (also broadcast). This is the
-            single-condition path used by the standalone MPPI controller.
-          * ``initial_state.shape == (nworld, nstate)`` — per-world initial
-            state (one row per GPU world). Used by ``BatchedMPPI`` where
-            ``nworld = N × K`` and rows are tiled so worlds 0..K-1 share
-            condition 0's state, K..2K-1 share condition 1's, etc. Mocap
-            broadcast falls back to the CPU ``self.data`` unless
-            ``per_world_mocap`` is supplied — see below.
+        ``initial_state`` shape:
+          * ``(nstate,)``           — broadcast to all worlds.
+          * ``(nworld, nstate)``    — per-world (used by BatchedMPPI).
 
-        ``per_world_mocap`` (optional, only used in the per-world path):
-          * ``None`` (default) — broadcast ``self.data.mocap_pos`` /
-            ``.mocap_quat`` to all worlds. Adequate when all conditions
-            share the same mocap (e.g. all conditions point at the same
-            relocate target). Most current usage hits this path.
-          * ``(nworld, nmocap, 3+4)`` packed as ``(pos, quat)`` — per-world
-            mocap. Use when conditions have *different* mocap targets
-            (e.g. randomized target per condition). Caller must build it.
-
-        Why FULLPHYSICS doesn't carry mocap: it's a configuration knob
-        (set by ``env.reset()`` before the rollout) rather than dynamic
-        state, so MuJoCo excludes it from the snapshot. We have to carry
-        it separately on each rollout call.
+        ``per_world_mocap`` (optional, ``(K, nmocap, 7)`` as ``[pos, quat]``):
+        used when conditions have different mocap targets. Default
+        broadcasts ``self.data.mocap_*`` to all worlds.
         """
         import mujoco
 
         K = self._warp_nworld
         nq, nv = self.model.nq, self.model.nv
 
-        # Single-state vs per-world via shape detection.
         is_per_world = (
             initial_state.ndim == 2 and initial_state.shape[0] == K
         )
         if is_per_world:
-            # Round-trip each row through self.data to extract qpos/qvel
-            # without re-implementing mj_setState. Cheap (only K calls,
-            # no rollouts), and keeps a single source of truth for the
-            # FULLPHYSICS → (qpos, qvel) layout.
+            # Round-trip each row through self.data to reuse mj_setState's
+            # FULLPHYSICS → (qpos, qvel) decoding (K calls, no rollouts).
             qpos0 = np.empty((K, nq), dtype=np.float32)
             qvel0 = np.empty((K, nv), dtype=np.float32)
             for k in range(K):
@@ -343,8 +221,6 @@ class WarpRolloutMixin:
         if self._has_mocap:
             nm = self.model.nmocap
             if per_world_mocap is not None:
-                # Caller-supplied per-world mocap. Expect (K, nm, 7) packed
-                # as [pos(3), quat(4)] per body. Split for the wd assignments.
                 pwm = np.asarray(per_world_mocap, dtype=np.float32)
                 if pwm.shape != (K, nm, 7):
                     raise ValueError(
@@ -354,9 +230,6 @@ class WarpRolloutMixin:
                 self._wd.mocap_pos.assign(pwm[..., :3].copy())
                 self._wd.mocap_quat.assign(pwm[..., 3:].copy())
             else:
-                # Broadcast self.data mocap to all worlds (single-target
-                # default; works for both per-world and single-state paths
-                # when conditions share a mocap target).
                 mp = np.broadcast_to(
                     self.data.mocap_pos.astype(np.float32), (K, nm, 3)
                 ).copy()
@@ -366,30 +239,19 @@ class WarpRolloutMixin:
                 self._wd.mocap_pos.assign(mp)
                 self._wd.mocap_quat.assign(mq)
 
-    # ------------------------------------------------------------------
-    # Rollout entry point
-    # ------------------------------------------------------------------
-
     def _batch_rollout_warp(
         self,
         initial_state: np.ndarray,
         action_sequences: np.ndarray,
         per_world_mocap: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Run B = nworld parallel rollouts of horizon H.
-
-        ``initial_state`` is either ``(nstate,)`` (broadcast to all worlds)
-        or ``(B, nstate)`` (per-world); see ``_seed_warp_state``.
-        ``action_sequences`` is always ``(B, H, nu)`` — caller flattens any
-        outer batching (e.g. (N, K) → B = N*K) before this call.
-        """
+        """B parallel rollouts of horizon H. ``action_sequences`` is (B, H, nu)."""
         wp = self._wp
         B, H, nu = action_sequences.shape
         self._ensure_warp_buffers(B, H)
         self._seed_warp_state(initial_state, per_world_mocap=per_world_mocap)
 
-        # (B, H, nu) → (H, B, nu): the inner loop indexes by h first so
-        # actions_wp[h] is a contiguous (B, nu) slice for wp.copy.
+        # (B, H, nu) → (H, B, nu) so actions_wp[h] is a contiguous (B, nu).
         self._actions_wp.assign(
             np.ascontiguousarray(
                 action_sequences.transpose(1, 0, 2).astype(np.float32)
@@ -406,8 +268,7 @@ class WarpRolloutMixin:
         qvel       = self._qvel_buf.numpy().transpose(1, 0, 2)
         sensordata = self._sensor_buf.numpy().transpose(1, 0, 2)
 
-        # Reconstruct FULLPHYSICS-layout states. time=0 since the GPU loop
-        # doesn't track sim time; nothing in this codebase reads state[..., 0].
+        # FULLPHYSICS-layout states; time=0 (warp doesn't track it).
         time_col = np.zeros((B, H, 1), dtype=np.float32)
         states = np.concatenate([time_col, qpos, qvel], axis=-1)
         c  = self.running_cost(states, action_sequences, sensordata)   # (B, H)

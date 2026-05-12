@@ -1,10 +1,8 @@
-"""Hopper env — contact-rich locomotion task.
+"""Hopper locomotion env.
 
-Supports two running-cost modes:
-  - ``v1``: the original Gymnasium-style additive forward reward + alive bonus
-    with quadratic control penalty.
-  - ``v2``: a dm_control-style multiplicative hop reward. The hopper only gets
-    rewarded for moving quickly when it is also standing tall.
+Two cost modes:
+  ``v1``: Gymnasium-style additive forward reward + alive bonus + ctrl cost.
+  ``v2``: dm_control-style multiplicative ``standing * hopping`` reward.
 """
 
 import mujoco
@@ -17,9 +15,7 @@ from src.envs.mujoco_env import MuJoCoEnv
 
 _XML = str(Path(__file__).resolve().parents[2] / "assets" / "hopper.xml")
 
-# Healthy bounds — the hopper is considered "fallen" (done=True) if
-# z position drops below _Z_MIN or torso angle exceeds _ANGLE_MAX.
-# These values match Gymnasium's Hopper-v5 defaults.
+# Healthy bounds (matches Gymnasium Hopper-v5).
 _Z_MIN = 0.2
 _ANGLE_MAX = 1
 _VALID_COST_MODES = {"v1", "v2"}
@@ -48,10 +44,8 @@ class Hopper(MuJoCoEnv):
             )
         self._cost_mode = cost_mode
 
-        # Sensor layout from assets/hopper.xml:
-        #   torso_pos          framepos(body=torso)         -> 3 floats
-        #   foot_pos           framepos(body=foot)          -> 3 floats
-        #   torso_subtreelinvel subtreelinvel(body=torso)   -> 3 floats
+        # Sensor layout (assets/hopper.xml): torso_pos, foot_pos,
+        # torso_subtreelinvel — 3 floats each.
         self._torso_pos_slice = slice(0, 3)
         self._foot_pos_slice = slice(3, 6)
         self._torso_linvel_slice = slice(6, 9)
@@ -62,13 +56,9 @@ class Hopper(MuJoCoEnv):
         state: Float[ndarray, "state_dim"] | None = None,
     ) -> np.ndarray:
         if state is not None:
-            # Deterministic reset to a captured state (used by GPS to
-            # replay the same initial condition across iterations).
             return super().reset(state=state)
 
         obs = super().reset()
-        # Small random perturbation around the default standing pose
-        # to diversify initial conditions.
         self.data.qpos[:] += np.random.uniform(-0.005, 0.1, size=self._nq)
         self.data.qvel[:] += np.random.uniform(-0.005, 0.2, size=self._nv)
         mujoco.mj_forward(self.model, self.data)
@@ -76,13 +66,7 @@ class Hopper(MuJoCoEnv):
 
     def _is_healthy(self, qpos_z: np.ndarray, qpos_angle: np.ndarray,
                     obs: np.ndarray | None = None) -> np.ndarray:
-        """Vectorised health check.  Works for both scalar and batched inputs.
-
-        The hopper is "healthy" when:
-          - z position (rootz) is above _Z_MIN  (hasn't fallen)
-          - torso angle (rooty) is within [-_ANGLE_MAX, _ANGLE_MAX]  (upright)
-          - all observation values are finite and within (-100, 100)
-        """
+        """Healthy iff z > _Z_MIN, |angle| < _ANGLE_MAX, and obs finite & |·|<100."""
         z_ok = qpos_z > _Z_MIN
         angle_ok = np.abs(qpos_angle) < _ANGLE_MAX
         healthy = z_ok & angle_ok
@@ -99,7 +83,7 @@ class Hopper(MuJoCoEnv):
         sigmoid: str = "gaussian",
         value_at_margin: float = 0.1,
     ) -> np.ndarray:
-        """Minimal copy of dm_control's tolerance helper for Hopper reward terms."""
+        """dm_control-style tolerance for v2 reward."""
         lower, upper = bounds
         in_bounds = (lower <= x) & (x <= upper)
         if margin == 0.0:
@@ -151,11 +135,8 @@ class Hopper(MuJoCoEnv):
         reward = standing * hopping
         return -reward
 
-    def _public_sensordata(
-        self,
-        sensordata: np.ndarray,
-    ) -> np.ndarray:
-        """Hide dm_control-style reward sensors from external callers."""
+    def _public_sensordata(self, sensordata: np.ndarray) -> np.ndarray:
+        """Strip reward-only sensors from external returns."""
         return sensordata[..., :self._public_sensor_dim]
 
     def running_cost(
@@ -164,7 +145,6 @@ class Hopper(MuJoCoEnv):
         actions: Float[Array, "K H nu"],
         sensordata: Float[Array, "K H nsensor"] | None = None,
     ) -> Float[Array, "K H"]:
-        """Vectorised per-step cost for K×H (sample, horizon) grid."""
         if self._cost_mode == "v1":
             return self._running_cost_v1(states, actions)
         return self._running_cost_v2(sensordata)
@@ -174,7 +154,6 @@ class Hopper(MuJoCoEnv):
         states: Float[Array, "K nstate"],
         sensordata: Float[Array, "K nsensor"] | None = None,
     ) -> Float[Array, "K"]:
-        # Both Hopper cost modes are fully specified by the running cost.
         return np.zeros(states.shape[0])
 
     def batch_rollout(
@@ -182,11 +161,7 @@ class Hopper(MuJoCoEnv):
         initial_state: np.ndarray,
         action_sequences: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Run Hopper rollouts while keeping reward-only sensors private.
-
-        The v2 cost uses extra MuJoCo sensors internally, but callers still see
-        the pre-v2 public sensor payload (empty for Hopper).
-        """
+        """Rollout, then strip reward-only sensors from the public return."""
         actions_expanded = np.repeat(action_sequences, self._frame_skip, axis=1)
         states_full, sensordata_full = self._rollout_ctx.rollout(
             self.model,
@@ -205,26 +180,15 @@ class Hopper(MuJoCoEnv):
         return states, costs, public_sensordata
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
-        """Single environment step with termination on unhealthy state.
-
-        Unlike running_cost (which never terminates, for MPPI planning),
-        this method returns done=True when the hopper falls.
-        """
+        """Step with done=True when the hopper falls (unlike MPPI rollout)."""
         obs, cost, _, info = super().step(action)
         z = self.data.qpos[1]
         angle = self.data.qpos[2]
-        done = not self._is_healthy(
-            np.array(z), np.array(angle), obs
-        ).item()
+        done = not self._is_healthy(np.array(z), np.array(angle), obs).item()
         return obs, cost, done, info
 
     def _get_obs(self) -> np.ndarray:
-        """Policy observation: qpos[1:] (skip root x) + clipped qvel.
-
-        Root x is excluded because it grows unboundedly — the policy
-        should be translation-invariant.  Velocities are clipped to [-10, 10]
-        to prevent outlier observations from destabilising training.
-        """
+        """qpos[1:] (skip root x; translation-invariant) + qvel clipped to ±10."""
         return np.concatenate([
             self.data.qpos[1:],
             np.clip(self.data.qvel, -10.0, 10.0),
@@ -235,17 +199,10 @@ class Hopper(MuJoCoEnv):
         states: np.ndarray,
         sensordata: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Convert batched full physics states to policy observations.
-
-        Mirrors _get_obs() but works on (..., nstate) arrays from batch_rollout.
-        Uses state_qpos / state_qvel which handle the time-offset in the
-        full physics state vector [time, qpos, qvel, act, ...].
-        """
-        qpos = self.state_qpos(states)[..., 1:]  # skip root x
+        qpos = self.state_qpos(states)[..., 1:]
         qvel = np.clip(self.state_qvel(states), -10.0, 10.0)
         return np.concatenate([qpos, qvel], axis=-1)
 
     @property
     def obs_dim(self) -> int:
-        # 5 qpos (skip root x) + 6 qvel = 11
         return (self._nq - 1) + self._nv

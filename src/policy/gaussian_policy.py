@@ -11,11 +11,8 @@ from src.utils.config import PolicyConfig
 
 
 class RunningNormalizer(nn.Module):
-    """Running mean/var over inputs. Buffers save via state_dict.
+    """Running mean/var. ``update()`` explicit; ``forward()`` uses frozen stats."""
 
-    update() is explicit: only the supervised training path calls it.
-    forward() always normalizes with the current frozen stats.
-    """
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -25,7 +22,7 @@ class RunningNormalizer(nn.Module):
 
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> None:
-        # Welford parallel merge of batch stats into running stats.
+        # Welford parallel merge of batch into running stats.
         x = x.reshape(-1, x.shape[-1])
         batch_count = x.shape[0]
         if batch_count == 0:
@@ -70,8 +67,7 @@ class GaussianPolicy(nn.Module):
         activations = {"relu": nn.ReLU, "tanh": nn.Tanh}
         act_fn = activations[cfg.activation]
 
-        # Input pre-processor: hand-crafted featurization bypasses
-        # RunningNormalizer (already produces unit-scaled features).
+        # hand_crafted features bypass RunningNormalizer.
         self._featurize_mode = getattr(cfg, "featurize", "running_norm")
         if self._featurize_mode == "hand_crafted":
             self.normalizer = None
@@ -99,17 +95,14 @@ class GaussianPolicy(nn.Module):
         layers.append(nn.Linear(in_dim, 2 * act_dim))
         self.net = nn.Sequential(*layers)
 
-        # Init log_sigma head bias to 0 → sigma ≈ 1 at start.
+        # log_sigma bias 0 → σ ≈ 1 at init.
         nn.init.zeros_(self.net[-1].bias[act_dim:])
 
-        # Optional tanh on the mu head only. log_sigma stays unbounded
-        # (clamped in `_head`). With tanh on, mu lives in normalized
-        # action space (-1, 1) and `_to_phys` denormalizes.
+        # tanh on the mu head only; log_sigma stays unbounded (clamped in _head).
         self._tanh_squash = bool(getattr(cfg, "tanh_squash", False))
 
-        # Action bounds clamp at execution time. When USE_ACT_NORM is on,
-        # also register a per-dim affine so the head trains/predicts in
-        # normalized action space and we denormalize at the boundary.
+        # Action bounds clamp; when USE_ACT_NORM, head trains in
+        # normalized space and we denormalize at the boundary.
         self._has_act_norm = False
         if action_bounds is not None:
             low, high = action_bounds
@@ -143,8 +136,6 @@ class GaussianPolicy(nn.Module):
         self._device = next(self.parameters()).device
         return out
 
-    # Action-space (de)normalization. No-ops when `_has_act_norm` is False.
-
     def _to_phys(self, normalized: torch.Tensor) -> torch.Tensor:
         if not self._has_act_norm:
             return normalized
@@ -156,9 +147,7 @@ class GaussianPolicy(nn.Module):
         return (physical - self._act_bias) / self._act_scale
 
     def _head(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(featurize|normalizer) + MLP → (mu, log_sigma). mu is in
-        NORMALIZED action space when USE_ACT_NORM is on (physical
-        otherwise); tanh-squashed when `tanh_squash` is True."""
+        """obs → (mu, log_sigma). mu in normalized space when USE_ACT_NORM."""
         if self._featurize_mode == "hand_crafted":
             x = featurize_obs(obs)
         elif self.normalizer is not None:
@@ -173,17 +162,14 @@ class GaussianPolicy(nn.Module):
         return mu, log_sigma
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns the network-internal head — same as `_head`. Use
-        `action()` for a physical-space mean."""
+        """Same as ``_head``; use ``action()`` for a physical-space mean."""
         return self._head(obs)
 
     def log_prob(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """log π(actions | obs), shape (B,). Diagonal Gaussian.
+        """log π(actions | obs), diagonal Gaussian.
 
-        `actions` is in PHYSICAL space; we normalize before evaluating
-        against the head. The Jacobian of the affine `a = scale·n + bias`
-        is constant per dim and cancels in any softmin / KL / gradient,
-        so we omit it.
+        ``actions`` are PHYSICAL; normalized before evaluation. The
+        constant per-dim Jacobian cancels in softmin / KL / gradient.
         """
         actions = self._to_norm(actions)
         mu, log_sigma = self._head(obs)
@@ -205,14 +191,7 @@ class GaussianPolicy(nn.Module):
         prev_policy: "GaussianPolicy | None" = None,
         prev_kl_coef: float = 0.0,
     ) -> float:
-        """One gradient step of weighted NLL, optionally regularized by
-        KL(current || prev_policy). With uniform weights this reduces to
-        plain NLL (what GPS and BC use).
-
-        When `prev_policy` is given with `prev_kl_coef > 0`, the loss
-        gains `prev_kl_coef * E_o[KL(π_θ || π_prev)]` — a trust-region
-        regularizer against the previous-iteration policy.
-        """
+        """Weighted NLL gradient step + optional ``KL(π_θ || π_prev)`` penalty."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
         act_t = self._to_norm(act_t)
@@ -221,7 +200,7 @@ class GaussianPolicy(nn.Module):
         if self.normalizer is not None:
             self.normalizer.update(obs_t)
 
-        # Single forward pass — reuse mu/log_sigma for both log_prob and KL.
+        # Single forward — reuse mu/log_sigma for log_prob and KL.
         mu, log_sigma = self._head(obs_t)
         sigma = log_sigma.exp()
         lp = -0.5 * (
@@ -239,8 +218,7 @@ class GaussianPolicy(nn.Module):
 
         self.optimizer.zero_grad()
         loss.backward()
-        # NaN guard: a NaN batch would corrupt every parameter via NaN
-        # gradients in one step. Skip and surface NaN to the caller.
+        # NaN guard: skip the step rather than poison every parameter.
         if not torch.isfinite(loss):
             self.optimizer.zero_grad()
             return float("nan")
@@ -248,12 +226,12 @@ class GaussianPolicy(nn.Module):
         return loss.item()
 
     def action(self, obs: torch.Tensor) -> torch.Tensor:
-        """Deterministic action (policy mean) in PHYSICAL space."""
+        """Mean action in PHYSICAL space."""
         mu, _ = self.forward(obs)
         return self._to_phys(mu)
 
     def mse_step(self, obs: np.ndarray, actions: np.ndarray) -> float:
-        """One gradient step of MSE on the mean. log_sigma is not supervised."""
+        """MSE-on-mean gradient step (log_sigma not supervised)."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
         act_t = self._to_norm(act_t)
@@ -269,10 +247,6 @@ class GaussianPolicy(nn.Module):
         self.optimizer.step()
         return float(loss.item())
 
-    # ------------------------------------------------------------------
-    # KL helpers
-    # ------------------------------------------------------------------
-
     def _kl_to_diag_gaussian(
         self,
         obs_t: torch.Tensor,
@@ -280,11 +254,7 @@ class GaussianPolicy(nn.Module):
         log_sigma_q: torch.Tensor,
         prev_policy: "GaussianPolicy",
     ) -> torch.Tensor:
-        """Mean KL(π_θ(·|o) || π_prev(·|o)) over the batch.
-
-        Closed-form for two diagonal Gaussians:
-            KL = Σ_d [log(σ_p/σ_q) + (σ_q² + (μ_q − μ_p)²)/(2 σ_p²) − 0.5]
-        """
+        """Mean ``KL(π_θ || π_prev)`` over the batch (diag-Gaussian closed form)."""
         with torch.no_grad():
             mu_p, log_sigma_p = prev_policy._head(obs_t)
         var_q = torch.exp(2.0 * log_sigma_q)
@@ -302,18 +272,13 @@ class GaussianPolicy(nn.Module):
         obs: np.ndarray,
         prev_policy: "GaussianPolicy",
     ) -> float:
-        """Numpy-facing mean KL(self || prev_policy) over a batch of obs."""
+        """numpy-facing mean ``KL(self || prev_policy)``."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         mu_q, log_sigma_q = self._head(obs_t)
         return float(self._kl_to_diag_gaussian(obs_t, mu_q, log_sigma_q, prev_policy).item())
 
     def reset_optimizer(self) -> None:
-        """Recreate Adam with a fresh state (same lr). Clears m, v moments.
-
-        Useful at GPS iteration boundaries — each iter is a new supervised
-        task (new C-step data + prior shift), and stale momentum can fight
-        the `prev_iter_kl_coef` trust region.
-        """
+        """Fresh Adam (same lr); clears m, v moments."""
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
 
     @torch.no_grad()
@@ -324,11 +289,7 @@ class GaussianPolicy(nn.Module):
 
     @torch.no_grad()
     def act_np(self, obs: np.ndarray) -> np.ndarray:
-        """Mean action from numpy obs, clipped to action bounds.
-
-        Order: forward → denormalize → clip. The clip is still a useful
-        safety net when the head is unconstrained (no tanh).
-        """
+        """Mean action (numpy), clipped to bounds. forward → denorm → clip."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         squeeze = obs_t.ndim == 1
         if squeeze:

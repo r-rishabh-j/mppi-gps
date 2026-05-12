@@ -1,4 +1,4 @@
-"""Deterministic MLP policy: regresses actions directly (no mu/sigma head)."""
+"""Deterministic MLP policy (regresses actions; no mu/sigma head)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from src.utils.config import PolicyConfig
 
 
 class DeterministicPolicy(nn.Module):
-    """obs → action. MSE regression target, no log_prob."""
+    """obs → action; MSE-trained, no ``log_prob``."""
 
     def __init__(
         self,
@@ -56,14 +56,13 @@ class DeterministicPolicy(nn.Module):
                 layers.append(nn.Dropout(dropout_p))
             in_dim = h
         layers.append(nn.Linear(in_dim, act_dim))
-        # Tanh squash: network output bounded to (-1, 1) in normalized
-        # action space; `_to_phys` denormalizes.
+        # tanh squash: head outputs in normalized space; _to_phys rescales.
         self._tanh_squash = bool(getattr(cfg, "tanh_squash", False))
         if self._tanh_squash:
             layers.append(nn.Tanh())
         self.net = nn.Sequential(*layers)
 
-        # Bounds + optional output-norm affine (mirrors GaussianPolicy).
+        # Bounds + optional output-norm affine.
         self._has_act_norm = False
         if action_bounds is not None:
             low, high = action_bounds
@@ -96,8 +95,6 @@ class DeterministicPolicy(nn.Module):
         self._device = next(self.parameters()).device
         return out
 
-    # Action-space (de)normalization (mirror GaussianPolicy).
-
     def _to_phys(self, normalized: torch.Tensor) -> torch.Tensor:
         if not self._has_act_norm:
             return normalized
@@ -109,9 +106,7 @@ class DeterministicPolicy(nn.Module):
         return (physical - self._act_bias) / self._act_scale
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Network output in NORMALIZED action space when the affine
-        toggle is on, physical otherwise. Use `action()` at the user
-        boundary."""
+        """Output in normalized space when USE_ACT_NORM, else physical."""
         if self._featurize_mode == "hand_crafted":
             x = featurize_obs(obs)
         elif self.normalizer is not None:
@@ -121,7 +116,7 @@ class DeterministicPolicy(nn.Module):
         return self.net(x)
 
     def action(self, obs: torch.Tensor) -> torch.Tensor:
-        """Deterministic action tensor in PHYSICAL space."""
+        """Action tensor in PHYSICAL space."""
         return self._to_phys(self.forward(obs))
 
     def mse_step(
@@ -130,9 +125,7 @@ class DeterministicPolicy(nn.Module):
         actions: np.ndarray,
         grad_clip_norm: float = 0.0,
     ) -> float:
-        """One MSE update. `grad_clip_norm > 0` activates an L2 grad-norm
-        clip between backward() and optimizer.step() — a loss-agnostic
-        bound on per-update parameter movement."""
+        """One MSE update; ``grad_clip_norm > 0`` activates L2 clip."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         act_t = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
         act_t = self._to_norm(act_t)
@@ -151,12 +144,12 @@ class DeterministicPolicy(nn.Module):
         return float(loss.item())
 
     def reset_optimizer(self) -> None:
-        """Recreate Adam with fresh state. See GaussianPolicy.reset_optimizer."""
+        """Fresh Adam (same lr); clears m, v moments."""
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.lr)
 
     @torch.no_grad()
     def act_np(self, obs: np.ndarray) -> np.ndarray:
-        """Physical-space action. Order: forward → denormalize → clip."""
+        """Physical-space action; forward → denorm → clip."""
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         squeeze = obs_t.ndim == 1
         if squeeze:

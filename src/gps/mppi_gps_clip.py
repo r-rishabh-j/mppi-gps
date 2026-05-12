@@ -104,25 +104,20 @@ class MPPIGPS:
         clip_ratio: float = 0.2,
         clip_eps: float = 0.1
     ) -> float:
-        """Trust-region update for the S-Step (student policy)."""
+        """Trust-region update: PPO-clip (Gaussian) or label-clip MSE (Det.)."""
         device = self.policy.device
-        
-        # Always NLL for Gaussian; MSE only for Deterministic.
-        # (As of the project-wide "always NLL for Gaussian" sweep, the
-        # legacy ``distill_loss == "mse"`` opt-out for Gaussian is gone.
-        # Falling through to MSE only fires when the policy lacks
-        # ``log_prob`` — i.e. DeterministicPolicy.)
+
         if not hasattr(self.policy, "log_prob"):
-            # --- Deterministic Policy / MSE Path ---
+            # Deterministic: clamp the label around the old policy's mean.
             with torch.no_grad():
                 o_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
                 old_pred = old_policy.action(o_t).cpu().numpy()
 
             clipped_actions = np.clip(actions, old_pred - clip_eps, old_pred + clip_eps)
             return self.policy.mse_step(obs, clipped_actions)
-            
+
         else:
-            # --- Gaussian Policy / Weighted MLE Path ---
+            # Gaussian: PPO-clipped weighted log-ratio.
             o_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
             a_t = torch.as_tensor(actions, dtype=torch.float32, device=device)
             w_t = torch.as_tensor(weights, dtype=torch.float32, device=device)
@@ -135,12 +130,8 @@ class MPPIGPS:
                 old_log_prob = old_policy.log_prob(o_t, a_t)
 
             ratio = torch.exp(curr_log_prob - old_log_prob)
-            
-            # PPO-style clipping weighted by the MPPI importance weights
             surr1 = ratio * w_t
             surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * w_t
-            
-            # Loss matches train_weighted: negative sum normalized by total weight
             loss = -torch.min(surr1, surr2).sum() / w_t.sum().clamp(min=1e-8)
 
             self.policy.optimizer.zero_grad()
@@ -154,16 +145,15 @@ class MPPIGPS:
         actions: np.ndarray,
         weights: np.ndarray,
     ) -> float:
-        """Run multiple mini-batch gradient steps to distill MPPI into the policy."""
+        """Mini-batch S-step using ``_train_step_clipped`` (snapshots old policy)."""
         cfg = self.gps_cfg
         N = len(obs)
         indices = np.arange(N)
         last_loss = 0.0
-        
-        # Snapshot the old policy for clipping
+
         old_policy = copy.deepcopy(self.policy)
         old_policy.eval()
-        
+
         clip_ratio = getattr(cfg, "clip_ratio", 0.2)
         clip_eps = getattr(cfg, "clip_eps", 0.1)
 
@@ -171,8 +161,6 @@ class MPPIGPS:
             np.random.shuffle(indices)
             for start in range(0, N, cfg.distill_batch_size):
                 batch = indices[start : start + cfg.distill_batch_size]
-                
-                # Replace the simple unconstrained step with the clipped step
                 last_loss = self._train_step_clipped(
                     obs[batch], 
                     actions[batch], 

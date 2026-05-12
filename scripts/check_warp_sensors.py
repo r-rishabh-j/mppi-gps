@@ -1,14 +1,6 @@
-"""Locate where the ball position diverges between CPU and warp.
+"""Diagnostic: print ball/palm/fingertip positions on CPU vs warp.
 
-The previous run showed obj_pos norm differing by 0.17 m while palm and
-fingertips agree to sub-mm. Hand kinematics are fine; ball-specific
-integration / contact / sensor-frame is not. This script prints actual
-3D positions at h=0 (one control step into rollout) and h=H-1 (end of
-rollout) for both paths so we can see WHERE the ball ends up and whether
-the divergence is initial-condition or accumulated-during-rollout.
-
-Usage:
-    uv run python -m scripts.check_warp_sensors
+Run as ``uv run python -m scripts.check_warp_sensors``.
 """
 from __future__ import annotations
 

@@ -1,26 +1,12 @@
 """Unified MPPI-GPS for GaussianPolicy and DeterministicPolicy students.
 
-Subsumes ``mppi_gps_clip.py`` (Gaussian, NLL distill, optional PPO clip) and
-``mppi_gps_det.py`` (Deterministic, MSE distill, grad-norm clip). The C-step
-rollout, replay buffer, sub-episode flush, Adam-reset, dagger-relabel,
-warm-start, auto-reset, and eval window are all shared. Policy-class-
-specific branches:
-
-* **Policy prior** (``GPSConfig.policy_prior_type``):
-    - ``"auto"`` (default) → resolves to ``"nll"`` for Gaussian,
-      ``"mean_distance"`` for Deterministic.
-    - ``"nll"``: ``prior(s, a) = -alpha * Σ_t log π(a_t | o_t)``.
-      Gaussian-only — needs ``log_prob``; raises for Deterministic.
-    - ``"mean_distance"``: ``prior(s, a) = alpha * Σ_t ‖a_t − π.action(o_t)‖²``.
-      Uses ``policy.action(...)`` which returns the mean for both classes.
-
-* **Distill loss** is implicit in the policy class:
-    - DeterministicPolicy → MSE always (``mse_step`` with optional
-      ``grad_clip_norm``). ``cfg.distill_loss`` is ignored.
-    - GaussianPolicy → weighted NLL (``train_weighted``) with optional
-      ``cfg.prev_iter_kl_coef`` trust region. When ``cfg.clip_ratio > 0``,
-      the per-batch surrogate switches to the PPO ratio-clipped form
-      (mirroring ``mppi_gps_clip._train_step_clipped``'s Gaussian branch).
+Policy-class branches:
+  * Prior (``GPSConfig.policy_prior_type``):
+      - ``"auto"`` → ``"nll"`` (Gaussian), ``"mean_distance"`` (Det.).
+      - ``"nll"``: ``-α · Σ_t log π(a_t|o_t)`` (Gaussian only).
+      - ``"mean_distance"``: ``α · Σ_t ‖a_t − π.action(o_t)‖²``.
+  * Distill loss: Deterministic → MSE; Gaussian → NLL with optional
+    ``prev_iter_kl_coef`` trust region or ``clip_ratio`` PPO surrogate.
 """
 
 from __future__ import annotations
@@ -47,17 +33,10 @@ from src.utils.evaluation import evaluate_mppi, evaluate_policy
 from src.utils.experiment import copy_as, save_checkpoint
 
 
-# α=0 rollout cache (BC-seed compatible h5). Only fires on iters where
-# the resolved α == 0. Schema mirrors `scripts/collect_bc_demos.py` so
-# the file plugs into DAgger `--seed-from`, test_sl `--demos`, and
-# `--init-h5` consumers — when α is held at 0 for a whole run, the
-# C-step is just MPPI demo collection.
-#
-# Datasets (resizable on M):
-#   states (M, T, obs_dim), actions (M, T, act_dim), costs (M, T),
-#   sensordata (M, T, nsensor)   (only when env exposes sensors)
-# Attrs: env, M, T, obs_dim, act_dim, source="run_gps_alpha0".
-# Crash-safe via `h5_file.flush()` after each iter's append.
+# α=0 rollout cache: BC-seed-compatible h5 written on iters where the
+# resolved α is 0. Schema matches `scripts/collect_bc_demos.py`
+# (states (M, T, obs_dim), actions (M, T, act_dim), costs (M, T),
+# sensordata if present). Flushed after each iter's append.
 
 def _try_capture_sensordata(env) -> np.ndarray | None:
     """Return `env.data.sensordata` snapshot or None for envs without it."""
@@ -75,12 +54,11 @@ def _try_capture_sensordata(env) -> np.ndarray | None:
 # ---------------------------------------------------------------------------
 
 def schedule_alpha(iteration: int, cfg: GPSConfig) -> float:
-    """Per-iteration α for the policy-prior weight.
+    """Per-iteration α.
 
-    "constant" (or warmup<=0) → fixed `policy_augmented_alpha`. Otherwise
-    ramp from `alpha_start` to `policy_augmented_alpha` over the first
-    `alpha_warmup_iters` iters, then hold. Shapes (x clipped to [0,1]):
-      linear: x  ·  smoothstep: x²(3−2x)  ·  cosine: 0.5(1−cos πx)
+    "constant" → fixed ``policy_augmented_alpha``. Otherwise ramp from
+    ``alpha_start`` over ``alpha_warmup_iters``: linear / smoothstep
+    (x²(3-2x)) / cosine (0.5(1-cos πx)).
     """
     if cfg.alpha_schedule == "constant" or cfg.alpha_warmup_iters <= 0:
         return cfg.policy_augmented_alpha
@@ -113,17 +91,12 @@ def estimate_kl_p_to_policy(
     policy: GaussianPolicy,
     sigma_p_floor_norm: float | np.ndarray = 0.05,
 ) -> float:
-    """E_state[KL(N(μ_p, σ_p²) ‖ π_θ(·|s))] over visited states.
+    """E_state[KL(N(μ_p, σ_p²) ‖ π_θ(·|s))], diagonal Gaussian.
 
-    `(μ_p, σ_p²)` are the weighted mean/var of MPPI's first-step actions
-    in PHYSICAL space. The policy head outputs in NORMALIZED space when
-    USE_ACT_NORM is on, so we move μ_p / σ_p into normalized before the
-    closed-form Gaussian KL (same reason the distill loss normalizes).
-
-    `sigma_p_floor_norm` bounds σ_p from below. When MPPI's softmin is
-    near-one-hot (low ESS) the weighted variance crashes toward zero and
-    log(σ_θ/σ_p) explodes regardless of mean alignment — biasing kl_est
-    by tens of nats per state. Diagonal-Gaussian assumption.
+    ``(μ_p, σ_p²)`` are the weighted mean/var of MPPI's first-step
+    actions in PHYSICAL space; converted to NORMALIZED space when
+    USE_ACT_NORM is on. ``sigma_p_floor_norm`` bounds σ_p from below to
+    keep ``log(σ_θ/σ_p)`` finite when MPPI's softmin is near-one-hot.
     """
     obs_t = torch.as_tensor(obs, dtype=torch.float32, device=policy.device)
     with torch.no_grad():
@@ -140,9 +113,7 @@ def estimate_kl_p_to_policy(
         mu_p = mu_p_phys
         var_p = var_p_phys
 
-    # Floor on σ_p prevents a near-one-hot MPPI weight distribution from
-    # collapsing weighted-sample variance to ~0 (would otherwise blow up
-    # log(σ_θ/σ_p)). 1e-12 → tens of nats per dim of bias — see docstring.
+    # σ_p floor: guard against near-one-hot MPPI weights collapsing var.
     floor = np.asarray(sigma_p_floor_norm, dtype=var_p.dtype) ** 2
     sigma_p = np.sqrt(np.maximum(var_p, floor))
 
@@ -168,21 +139,11 @@ def compute_policy_trust(
     eval_episode_len: int,
     cfg: GPSConfig,
 ) -> float:
-    """Map (policy_cost, raw_mppi_cost) → trust scalar in [min, max].
+    """Trust ∈ [min, max] from per-step (policy_cost, raw_mppi_cost).
 
-    Mirrors upstream's `compute_policy_trust` semantics: linearly interpolate
-    between `policy_trust_min` (policy is "as bad as no policy") and
-    `policy_trust_max` (policy is as good as raw MPPI), clipped to the
-    bounds. The interpolation is in **per-step** cost space so the result is
-    invariant to changes in `eval_ep_len`.
-
-    Behaviour:
-    * Adaptive disabled → always returns `policy_trust_max` (constant).
-    * Adaptive enabled but a cost is missing (e.g. no raw-MPPI baseline)
-      → returns `policy_trust_min` (defensive: don't trust the policy
-      without a comparable baseline).
-    * Adaptive enabled with both costs → linear interpolation per the
-      `quality` formula in `GPSConfig`.
+    Linear interpolation in per-step cost space (so invariant to
+    ``eval_ep_len``). Adaptive disabled → ``policy_trust_max``. Cost
+    missing → ``policy_trust_min`` (defensive).
     """
     if not cfg.adaptive_policy_trust:
         return float(cfg.policy_trust_max)
@@ -205,12 +166,11 @@ def update_alpha_kl_adaptive(
     kl_est: float,
     cfg: GPSConfig,
 ) -> float:
-    """Multiplicative dual update on α (inverted vs vanilla MDGPS).
+    """Multiplicative α update (inverted vs vanilla MDGPS).
 
-    `kl_est = E_state[KL(p_unbiased ‖ π_θ)]` — gap between the unbiased
-    MPPI teacher and the policy. Large kl_est → policy bad → SHRINK α
-    so MPPI explores freely. Small kl_est → policy reliable → GROW α.
-    Clipped to [kl_alpha_min, kl_alpha_max].
+    Large kl_est → policy bad → shrink α (let MPPI explore).
+    Small kl_est → policy reliable → grow α. Clipped to
+    [kl_alpha_min, kl_alpha_max].
     """
     if kl_est > cfg.kl_target:
         new = alpha / cfg.kl_step_rate
@@ -228,12 +188,9 @@ def make_mean_distance_prior(
     env: BaseEnv,
     alpha: float,
 ) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
-    """`prior(s, a) = alpha * Σ_t ‖(a_t − π.action(o_t)) / scale‖²`.
+    """``prior(s, a) = α · Σ_t ‖(a_t − π.action(o_t)) / scale‖²``.
 
-    Works for any policy with `action(obs_tensor) -> (B, act_dim)`.
-    `1/scale = 1/noise_scale` equalizes per-dim contribution (so a 0.2 m
-    arm slide doesn't get drowned out by 2.0 rad finger joints). No-op
-    for envs whose `noise_scale` defaults to ones.
+    ``1/scale = 1/env.noise_scale`` equalizes per-dim contribution.
     """
     device = policy._device
     inv_scale = 1.0 / np.asarray(env.noise_scale, dtype=np.float64)
@@ -264,11 +221,9 @@ def make_nll_prior(
     env: BaseEnv,
     alpha: float,
 ) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
-    """`prior(s, a) = -alpha * Σ_t log π(a_t | o_t)`. GaussianPolicy only.
+    """``prior(s, a) = -α · Σ_t log π(a_t | o_t)``. GaussianPolicy only.
 
-    Sigma-aware NLL: low-σ regions weight residuals more. The diagonal
-    Gaussian already normalizes per-dim by σ_i², so no extra per-dim
-    weighting (unlike `mean_distance`).
+    Sigma-aware: diagonal Gaussian normalizes per-dim by σ_i² already.
     """
     if not isinstance(policy, GaussianPolicy):
         raise TypeError(
@@ -300,9 +255,7 @@ def make_policy_prior(
     alpha: float,
     prior_type: str,
 ) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
-    """Dispatch to the requested prior. Caller is responsible for resolving
-    ``"auto"`` to a concrete type (the trainer does this in ``__init__`` so
-    incompatible combinations raise eagerly)."""
+    """Dispatch to the requested prior. Caller resolves ``"auto"``."""
     if prior_type == "mean_distance":
         return make_mean_distance_prior(policy, env, alpha)
     if prior_type == "nll":
@@ -325,7 +278,7 @@ class GPSHistory:
     distill_losses: list[float] = field(default_factory=list)
     iteration_prev_iter_kl: list[float] = field(default_factory=list)
     iteration_alpha: list[float] = field(default_factory=list)
-    iteration_kl_est: list[float] = field(default_factory=list)   # KL(p ‖ π_θ); NaN when adaptive α is off
+    iteration_kl_est: list[float] = field(default_factory=list)   # NaN when adaptive α off
     iteration_policy_trust: list[float] = field(default_factory=list)
     iteration_raw_mppi_eval_cost: list[float] = field(default_factory=list)
     best_iter: int = -1
@@ -337,11 +290,10 @@ class GPSHistory:
 # ---------------------------------------------------------------------------
 
 class MPPIGPS:
-    """Unified MPPI-GPS trainer for both Gaussian and Deterministic policies.
+    """Unified MPPI-GPS trainer.
 
-    Construct with ``deterministic=True`` to use a ``DeterministicPolicy``;
-    default is ``GaussianPolicy``. The prior shape and distill loss are
-    derived from the policy class plus ``GPSConfig.policy_prior_type``.
+    ``deterministic=True`` → DeterministicPolicy + MSE; default → GaussianPolicy
+    + NLL. Prior derived from policy + ``GPSConfig.policy_prior_type``.
     """
 
     def __init__(
@@ -388,18 +340,13 @@ class MPPIGPS:
         self._prior_type = prior_type
 
         self.mppi = MPPI(env, mppi_cfg)
-        # Cross-iteration episode replay buffer (rows-capped, FIFO eviction
-        # by whole episodes). Empty when distill_buffer_cap == 0.
+        # Cross-iter replay (FIFO row-capped). Empty when cap == 0.
         self._episode_buffer: list[dict] = []
 
-        # KL-adaptive α (MDGPS dual variable). Lazily seeded from the
-        # schedule on the first iter that the adaptive rule activates;
-        # carried iter-to-iter once active. None means "schedule path".
+        # KL-adaptive α (MDGPS dual). None → schedule path.
         self._kl_alpha: float | None = None
 
-        # Policy-trust dual scalar (multiplicative α dampener). Cold-start:
-        # `policy_trust_min` under adaptive (policy unproven → prior off),
-        # else `policy_trust_max` (constant; max == 1.0 → no scaling).
+        # Policy-trust dampener. Adaptive cold-start at min; else constant max.
         self._policy_trust: float = (
             float(gps_cfg.policy_trust_min)
             if gps_cfg.adaptive_policy_trust
@@ -422,14 +369,8 @@ class MPPIGPS:
         weights: np.ndarray,
         prev_policy=None,
     ) -> float:
-        """Mini-batch distillation. Loss type derived from policy class.
-
-        Deterministic → MSE via `mse_step` (+ optional `grad_clip_norm`,
-        + optional `clip_eps` label clamp around `old_policy.action`).
-        Gaussian → weighted NLL via `train_weighted` (+ optional
-        `prev_iter_kl_coef` trust region). When `clip_ratio > 0`, the
-        Gaussian path uses a PPO ratio-clipped surrogate per batch.
-        """
+        """Distill: Det → MSE (+ grad clip / label clamp); Gauss → NLL
+        (+ prev-iter KL trust region) or PPO clip when ``clip_ratio > 0``."""
         cfg = self.gps_cfg
         N = len(obs)
         indices = np.arange(N)
@@ -583,9 +524,7 @@ class MPPIGPS:
             run_dir = Path(run_dir)
             run_dir.mkdir(parents=True, exist_ok=True)
 
-        # Per-iter CSV log (crash-safe). flush + fsync per row so a hard
-        # kill during iter N+1 still leaves rows 0..N readable. Uniform
-        # schema (NaN for inactive cols) for pd.read_csv across runs.
+        # Per-iter CSV log (flushed per row so a hard kill keeps prior rows).
         csv_columns = [
             "iter", "alpha", "base_alpha", "policy_trust", "policy_trust_next",
             "raw_mppi_eval_cost",
@@ -604,10 +543,8 @@ class MPPIGPS:
             csv_writer.writeheader()
             csv_file.flush()
 
-        # ---- α=0 rollout h5 cache (lazy-initialised on first α=0 iter) ----
-        # Probe sensordata once to decide whether to allocate per-step
-        # sensor buffers (envs without MuJoCo-style sensors get None and
-        # the dataset is omitted from the file, matching collect_bc_demos).
+        # α=0 rollout h5 cache; lazy-init on first α=0 iter. Sensors
+        # dataset omitted when the env exposes none (matches collect_bc_demos).
         h5_file: h5py.File | None = None
         h5_cache_path = run_dir / "mppi_rollouts.h5" if run_dir is not None else None
         nsensor = 0
@@ -617,20 +554,15 @@ class MPPIGPS:
 
         initial_conditions = self._sample_initial_conditions(cfg.num_conditions)
 
-        # KL-adaptive α activates only for Gaussian policies — needs σ for
-        # the closed-form Gaussian KL. Deterministic falls back to schedule.
+        # KL-adaptive α: Gaussian only (needs σ for closed-form KL).
         kl_adaptive_enabled = (
             cfg.kl_target > 0.0 and not self._deterministic
         )
 
         outer_bar = tqdm(range(num_iterations), desc="GPS", unit="iter")
         for iteration in outer_bar:
-            # Pick α for this iter:
-            #  * during warmup (or when adaptive disabled): use the schedule
-            #  * after warmup (when adaptive enabled): use the dual variable
-            #    self._kl_alpha, which is initialized lazily from the
-            #    schedule on the first adaptive iter and updated at the end
-            #    of each iter via dual gradient ascent.
+            # α: schedule during warmup / when adaptive off; dual var
+            # ``self._kl_alpha`` after warmup if adaptive on.
             use_kl_adaptive_this_iter = (
                 kl_adaptive_enabled and iteration >= cfg.alpha_warmup_iters
             )
@@ -641,12 +573,7 @@ class MPPIGPS:
             else:
                 base_alpha = schedule_alpha(iteration, cfg)
 
-            # Policy-trust dampener (multiplicative on top of the schedule /
-            # KL-adaptive α). With `adaptive_policy_trust=False` this is a
-            # constant `policy_trust_max` (default 1.0 → no-op). With
-            # adaptive, it gets recomputed at each eval iter and frozen
-            # between evals. Effective α drives MPPI prior strength, the
-            # α=0 rollout cache gate, and all alpha logging.
+            # Multiplicative policy-trust dampener on top of α.
             policy_trust_iter = float(self._policy_trust)
             alpha = float(base_alpha) * policy_trust_iter
 
@@ -655,15 +582,13 @@ class MPPIGPS:
             all_weights: list[np.ndarray] = []
             condition_costs: list[float] = []
 
-            # KL-adaptive accumulator: per plan_step (obs, μ_p, σ_p²).
-            # Empty when adaptive is disabled.
+            # KL-adaptive: (obs, μ_p, σ_p²) per plan_step. Empty if disabled.
             kl_obs_buf: list[np.ndarray] = []
             kl_mu_p_buf: list[np.ndarray] = []
             kl_var_p_buf: list[np.ndarray] = []
 
             # ========== C-STEP ==========
-            # eval() so prior_fn's forward is deterministic — Dropout in
-            # train mode would inject noise into MPPI's cost.
+            # eval() so prior_fn's forward is deterministic (no Dropout).
             self.policy.eval()
 
             c_step_total = cfg.num_conditions * cfg.episode_length
@@ -674,10 +599,7 @@ class MPPIGPS:
                 leave=False,
             )
 
-            # α=0 rollout cache: contribute to the h5 only when the
-            # prior is inactive (so executor MPPI ≡ plain MPPI). Pre-
-            # allocate fixed-shape buffers for cheap indexed assigns;
-            # appended to the h5 once after the C-step.
+            # α=0 → executor MPPI ≡ plain MPPI; cache to the h5.
             cache_iter = (alpha == 0.0) and (run_dir is not None)
             if cache_iter:
                 iter_states = np.zeros(
@@ -702,8 +624,7 @@ class MPPIGPS:
                 iter_states = iter_actions = iter_costs = iter_sensors = None
 
             for ic_idx, ic_state in enumerate(initial_conditions):
-                # Fresh prior closure each condition (captures current
-                # policy weights + α).
+                # Fresh prior closure (captures current policy weights + α).
                 if alpha > 0.0:
                     prior_fn = make_policy_prior(
                         self.policy, self.env, alpha, self._prior_type,
@@ -718,8 +639,7 @@ class MPPIGPS:
 
                 self.env.reset(state=ic_state)
 
-                # Sub-episodes split at every `done` boundary so a single
-                # condition with auto_reset=True yields multiple entries.
+                # Sub-episodes split at every `done`.
                 condition_sub_episodes: list[dict] = []
                 cur_obs: list[np.ndarray] = []
                 cur_actions: list[np.ndarray] = []
@@ -740,20 +660,17 @@ class MPPIGPS:
                     state = self.env.get_state()
                     obs = self.env._get_obs()
 
-                    # α=0 cache: capture sensordata BEFORE plan_step so
-                    # the row stays aligned with pre-action `env.data`.
+                    # Capture sensordata BEFORE plan_step (row alignment).
                     if cache_iter and iter_sensors is not None:
                         sd = _try_capture_sensordata(self.env)
                         if sd is not None:
                             iter_sensors[ic_idx, t] = sd
 
-                    # Executor: MPPI with the policy prior. Steers the env.
+                    # Executor (MPPI with prior).
                     action_exec, _info = self.mppi.plan_step(state, prior=prior_fn)
 
-                    # KL-adaptive: snapshot per-state (μ_p, σ_p²) from
-                    # MPPI's first-step samples, weighted by the UNBIASED
-                    # (cost-only) posterior. Only on full-replan steps
-                    # (open-loop follow-ups don't refresh _last_*).
+                    # KL-adaptive snapshot from unbiased posterior;
+                    # full-replan steps only (open-loop skips _last_*).
                     if use_kl_adaptive_this_iter and _info.get("replanned", True):
                         ws = self.mppi._last_unbiased_weights
                         first_actions = self.mppi._last_actions[:, 0, :]   # (K, act_dim)
@@ -765,9 +682,7 @@ class MPPIGPS:
                         kl_mu_p_buf.append(mu_p)
                         kl_var_p_buf.append(var_p)
 
-                    # DAgger-style relabel: prior-free MPPI dry_run gives
-                    # the training label without disturbing the executor.
-                    # No-op when alpha == 0 (label == exec already).
+                    # DAgger relabel: prior-free dry_run; no-op when α==0.
                     if cfg.dagger_relabel and alpha > 0.0:
                         action_label, _ = self.mppi.plan_step(
                             state, prior=None, dry_run=True,
@@ -781,8 +696,6 @@ class MPPIGPS:
                     _, cost, done, _ = self.env.step(action_exec)
                     episode_cost += cost
 
-                    # α=0 cache: row-aligned with sensordata above.
-                    # Action stored is the executed one (= label when α=0).
                     if cache_iter:
                         iter_states[ic_idx, t] = obs
                         iter_actions[ic_idx, t] = action_exec
@@ -801,7 +714,6 @@ class MPPIGPS:
 
                 _flush_sub_episode()
 
-                # Route into either the cross-iter buffer or per-iter lists.
                 if cfg.distill_buffer_cap > 0:
                     for sub_ep in condition_sub_episodes:
                         self._episode_buffer.append(sub_ep)
@@ -823,8 +735,7 @@ class MPPIGPS:
                 )
             c_bar.close()
 
-            # α=0 rollout cache append (lazy create on first α=0 iter
-            # to avoid empty files when α is never 0).
+            # α=0 rollout cache append (lazy-create on first α=0 iter).
             if cache_iter:
                 T = cfg.episode_length
                 M_iter = cfg.num_conditions
@@ -883,8 +794,7 @@ class MPPIGPS:
                 act_flat = np.concatenate(all_actions, axis=0)
                 w_flat = np.concatenate(all_weights, axis=0)
 
-            # Pre-S-step snapshot for the prev-iter KL penalty.
-            # Gaussian-only; silently skipped for deterministic.
+            # Pre-S-step snapshot for prev-iter KL (Gaussian-only).
             prev_policy = None
             if (
                 not self._deterministic
@@ -897,7 +807,7 @@ class MPPIGPS:
 
             loss = self._distill_epoch(obs_flat, act_flat, w_flat, prev_policy=prev_policy)
 
-            # prev-iter KL diagnostic — Gaussian only, capped at 4096 rows.
+            # Diagnostic prev-iter KL, capped at 4096 rows.
             if (
                 prev_policy is not None
                 and not self._deterministic
@@ -915,9 +825,7 @@ class MPPIGPS:
             if cfg.reset_optim_per_iter:
                 self.policy.reset_optimizer()
 
-            # KL-adaptive α update (MDGPS dual ascent): estimate KL(p ‖ π_θ)
-            # from C-step data, then dual gradient step on α to drive KL
-            # toward kl_target.
+            # MDGPS dual ascent on α toward kl_target.
             kl_est_iter = float("nan")
             if use_kl_adaptive_this_iter and kl_obs_buf:
                 # σ_p floor in NORMALIZED action space. MPPI's per-dim
@@ -971,8 +879,7 @@ class MPPIGPS:
                 eval_cost = float(eval_stats["mean_cost"])
             history.iteration_eval_costs.append(eval_cost)
 
-            # Raw-MPPI baseline (no prior) — feeds the trust update and
-            # logs the policy↔MPPI gap. Recorded even when adaptive is off.
+            # Raw-MPPI baseline (no prior); feeds the trust update.
             if do_eval and cfg.policy_trust_eval_mppi_eps > 0:
                 mppi_stats = evaluate_mppi(
                     self.env, self.mppi,
@@ -998,9 +905,7 @@ class MPPIGPS:
                     history.best_iter = iteration
                     copy_as(iter_path, run_dir / "best.pt")
 
-            # Policy-trust update — after eval so next iter sees the new
-            # dual. On non-eval iters the previous trust carries over.
-            # History records the trust *used this iter*, not post-update.
+            # Trust update post-eval; history logs trust USED this iter.
             history.iteration_policy_trust.append(policy_trust_iter)
             if do_eval and cfg.adaptive_policy_trust:
                 policy_cost_for_trust = (
@@ -1060,7 +965,7 @@ class MPPIGPS:
                     base_line += f"  raw_mppi_cost={raw_mppi_eval_cost:8.2f}"
             tqdm.write(base_line)
 
-            # Crash-safe per-iter CSV row. Uniform schema: NaN for inactive cols.
+            # Per-iter CSV row (NaN for inactive cols).
             if csv_writer is not None:
                 if cfg.distill_buffer_cap > 0:
                     n_eps = len(self._episode_buffer)

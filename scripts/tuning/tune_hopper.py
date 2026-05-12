@@ -1,17 +1,4 @@
-"""Optuna-based hyperparameter tuning for MPPI on the Hopper environment.
-
-Searches over noise_sigma and lambda (temperature) while keeping K and H
-fixed.  Uses median pruning to early-stop unpromising trials.
-
-The objective is the mean total cost across N_SEEDS episodes.  If the hopper
-falls (done=True), we penalise the remaining steps to discourage configs
-that lead to instability.
-
-Usage:
-    python scripts/tuning/tune_hopper.py
-
-Best parameters are saved to configs/hopper_best.json.
-"""
+"""Optuna tuning for MPPI on Hopper (noise_sigma, lambda); writes hopper_best.json."""
 
 import json
 from pathlib import Path
@@ -29,21 +16,16 @@ BEST_PARAMS_PATH = Path(__file__).resolve().parents[2] / "configs" / "hopper_bes
 
 
 class FixedConfig(NamedTuple):
-    """Non-tuned parameters that stay fixed across all trials."""
-    n_startup_trials = 5    # random trials before GP kicks in
-    EVAL_STEPS = 500        # steps per evaluation episode
-    N_SEEDS = 5             # episodes per trial (averaged for objective)
-    K = 512                 # MPPI sample count (fixed — not tuned)
-    H = 64                  # planning horizon (fixed — not tuned)
+    """Non-tuned constants."""
+    n_startup_trials = 5
+    EVAL_STEPS = 500
+    N_SEEDS = 5
+    K = 512
+    H = 64
 
 
 def objective(trial: optuna.Trial, config: FixedConfig) -> float:
-    """Optuna objective: mean cost across N_SEEDS episodes.
-
-    Tuned parameters:
-      - noise_sigma: exploration noise std in [0.05, 1.0] (log scale)
-      - lam: MPPI temperature in [0.01, 10.0] (log scale)
-    """
+    """Mean cost across N_SEEDS episodes (tuning noise_sigma + lam)."""
     noise_sigma = trial.suggest_float("noise_sigma", 0.05, 1.0, log=True)
     lam = trial.suggest_float("lam", 0.01, 10.0, log=True)
 

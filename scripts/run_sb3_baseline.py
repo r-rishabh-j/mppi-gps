@@ -1,22 +1,4 @@
-"""Train SAC/PPO baselines via stable-baselines3 for comparison with GPS.
-
-The purpose of this script is to answer: how does a policy learned from
-scratch by model-free RL compare to one distilled from MPPI via GPS?
-
-GPS has the advantage of a model-based "teacher" (MPPI with MuJoCo) but
-is limited by the quality of that teacher and the distillation process.
-SAC/PPO learn directly from environment interaction without a model.
-
-Usage:
-    # Train SAC on Hopper-v5 for 500k steps
-    python scripts/run_sb3_baseline.py --env Hopper-v5 --algo SAC
-
-    # Train PPO on Hopper-v5 for 1M steps
-    python scripts/run_sb3_baseline.py --env Hopper-v5 --algo PPO --total-timesteps 1000000
-
-Results (mean reward/cost) are saved to checkpoints/sb3/<algo>_<env>_results.json.
-Cost = -reward so that the comparison with MPPI/GPS (which minimise cost) is direct.
-"""
+"""SAC / PPO baselines via stable-baselines3 (cost = −reward for compare)."""
 
 import argparse
 import json
@@ -42,11 +24,7 @@ def parse_args():
 
 
 def evaluate(model, env_id: str, n_episodes: int, episode_len: int, seed: int) -> dict:
-    """Evaluate a trained SB3 model on the given environment.
-
-    Uses deterministic actions (no exploration) and reports both reward
-    (native Gymnasium convention) and cost (-reward, for MPPI/GPS comparison).
-    """
+    """Eval an SB3 model deterministically. Reports reward + cost (−reward)."""
     env = gym.make(env_id)
     returns = []
     for ep in range(n_episodes):

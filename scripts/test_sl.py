@@ -1,30 +1,8 @@
-"""Pure supervised BC on cached MPPI rollouts.
+"""Pure BC on cached MPPI rollouts (baseline for DAgger / GPS).
 
-Fits a `GaussianPolicy` (MSE on mean, default) or `DeterministicPolicy`
-(direct action regression, via `--deterministic`) on (obs, action) pairs
-loaded from an h5 produced by `collect_bc_demos.py`. Baseline for DAgger /
-GPS — no policy-in-the-loop, no expert relabeling.
-
-Creates a run dir `experiments/bc/<timestamp>_<env>_<name>/` containing:
-    config.json        CLI args + dataclass configs + metadata
-    iter_<k:03d>.pt    per-epoch wrapped checkpoints (kept only every
-                       --ckpt-every epochs; always kept for the best epoch)
-    best.pt / final.pt copies of best-by-val-mse / last epoch
-    bc_log.csv         per-epoch train/val MSE (+ eval cost at eval epochs)
-    loss.png           train/val curve
-    <env>.mp4          rollout of the best policy with env-appropriate camera
-
-Example:
-    # 1. collect demos (cached — rerunning is a no-op unless --force)
-    python -m scripts.collect_bc_demos --env acrobot
-
-    # 2. train BC
-    python -m scripts.test_sl --env acrobot --device auto
-    python -m scripts.test_sl --env hopper --deterministic --device auto
-
-    # warm-start from a prior checkpoint and continue training
-    python -m scripts.test_sl --env acrobot --device auto \\
-        --init-ckpt experiments/bc/<run>/best.pt --num-epochs 30
+Writes ``experiments/bc/<timestamp>_<env>_<name>/`` with config.json,
+``iter_<k>.pt`` (every ``--ckpt-every``, always at best), best.pt /
+final.pt, ``bc_log.csv``, ``loss.png``, and a rollout mp4.
 """
 from __future__ import annotations
 
@@ -116,15 +94,7 @@ def parse_args() -> argparse.Namespace:
 def load_demos(
     path: Path,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    """Returns ``(states, actions, sensordata)``.
-
-    Shapes: ``states (M, T, obs_dim)``, ``actions (M, T, act_dim)``,
-    ``sensordata (M, T, nsensor)`` or ``None`` for legacy datasets that
-    pre-date sensordata capture.
-
-    Trajectory-preserving so we can split train/val by trajectory before
-    flattening.
-    """
+    """Load (states, actions, sensordata|None) trajectory-preserving."""
     with h5py.File(path, "r") as f:
         states = f["states"][:].astype(np.float32)
         actions = f["actions"][:].astype(np.float32)
@@ -146,12 +116,7 @@ def split_and_flatten(
     int,
     int,
 ]:
-    """Split-by-trajectory then flatten to (N, *) per side.
-
-    If ``sensordata`` is provided, it's split + flattened on the same
-    trajectory permutation so each row stays aligned with its (state,
-    action). Returned as ``None`` per side when not provided.
-    """
+    """Split by trajectory; return ((tr, va), n_train, n_val)."""
     M = states.shape[0]
     perm = rng.permutation(M)
     n_val = max(1, int(M * val_frac))
@@ -172,15 +137,7 @@ def split_and_flatten(
 
 @torch.no_grad()
 def eval_mse(policy, obs: np.ndarray, actions: np.ndarray, batch: int = 16384) -> float:
-    """Validation MSE in the policy's training-loss space.
-
-    When the action-norm toggle is on, ``mse_step`` normalizes labels and
-    computes MSE in the network's [-1, 1]-ish space; we mirror that here
-    so val_mse stays interpretable as a fixed reference metric (the loss
-    sense, ``best.pt`` is selected on the same objective being optimized).
-    With the toggle off (`policy._has_act_norm = False`) this is byte-
-    identical to physical-space MSE — the rescale is a no-op.
-    """
+    """Validation MSE in the policy's training-loss space (matches mse_step)."""
     device = policy.device
     total, n = 0.0, 0
     for s in range(0, len(obs), batch):

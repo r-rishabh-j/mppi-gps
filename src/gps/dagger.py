@@ -1,14 +1,10 @@
-"""DAgger-style distillation of MPPI into a GaussianPolicy.
+"""DAgger distillation of MPPI into a GaussianPolicy / DeterministicPolicy.
 
-Per iteration:
-  1. Roll out the current policy (with β probability of executing MPPI instead).
-  2. At every visited full state, query MPPI as the expert and record (obs, a*).
-  3. Append to an aggregating buffer.
-  4. Finetune the policy on the buffer with MSE-on-mean.
+Per iteration: roll out the current policy (β-mixed with MPPI), query
+MPPI as the expert at every visited state, append to an aggregating
+buffer, and finetune.
 
-MPPI runs on CPU (numpy/MuJoCo). Policy training lives on whatever device
-the policy was constructed with (cpu/mps/cuda). The numpy↔torch boundary
-is kept at the trainer methods so callers don't have to think about it.
+MPPI on CPU; policy training on the policy's device.
 """
 from __future__ import annotations
 
@@ -44,12 +40,10 @@ class DAggerTrainer:
         self.obs_dim = policy.obs_dim
         self.act_dim = policy.act_dim
 
-        # growing buffer — flat rows of (obs, a*)
         self._buf_obs: list[np.ndarray] = []
         self._buf_act: list[np.ndarray] = []
         self._buf_round: list[np.ndarray] = []
 
-    # ---------- buffer ----------
     def buffer_size(self) -> int:
         return sum(len(o) for o in self._buf_obs)
 
@@ -76,7 +70,7 @@ class DAggerTrainer:
         return obs, act, rnd
 
     def seed_from_h5(self, path) -> None:
-        """Optional: warm-start the buffer from an existing BC dataset."""
+        """Warm-start the buffer from an existing BC dataset."""
         import h5py
 
         with h5py.File(path, "r") as f:
@@ -84,12 +78,11 @@ class DAggerTrainer:
             a = f["actions"][:].astype(np.float32)  # (M, T, act_dim)
         self.append(s.reshape(-1, s.shape[-1]), a.reshape(-1, a.shape[-1]), round_idx=-1)
 
-    # ---------- rollout + relabel ----------
     def beta(self, k: int) -> float:
         K = self.cfg.dagger_iters
         if self.cfg.beta_schedule == "constant_zero":
             return 0.0
-        # linear: 1.0 at k=0, 0.0 at k>=K/2
+        # Linear: 1.0 at k=0, 0.0 at k≥K/2.
         half = max(1, K // 2)
         return max(0.0, 1.0 - k / half)
 
@@ -101,8 +94,7 @@ class DAggerTrainer:
         episode_len: int | None = None,
         progress_label: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Roll out `n_rollouts` episodes under the given β and return flat
-        (obs, expert_actions). Always queries MPPI for the relabel target."""
+        """Roll out under β, return flat (obs, expert_actions)."""
         ep_len = episode_len if episode_len is not None else self.cfg.episode_len
         obs_rows: list[np.ndarray] = []
         act_rows: list[np.ndarray] = []
@@ -137,12 +129,8 @@ class DAggerTrainer:
                     _, _, done, _ = self.env.step(exec_action)
                     pbar.update(1)
                     if done:
-                        # auto_reset → keep collecting until ep_len so the
-                        # progress bar / per-episode budget aren't wasted on
-                        # an early termination (matters for terminating envs
-                        # like hopper). Otherwise break — terminating mid-
-                        # episode produces a shorter trajectory which is the
-                        # honest signal for non-auto-reset envs.
+                        # auto_reset: keep collecting up to ep_len (for
+                        # terminating envs). Otherwise break.
                         if auto_reset:
                             self.env.reset()
                             self.mppi.reset()
@@ -156,7 +144,7 @@ class DAggerTrainer:
         return obs_arr, act_arr
 
     def collect_round(self, k: int) -> tuple[np.ndarray, np.ndarray]:
-        """Roll out N_roll trajectories with β-mixing and relabel every state."""
+        """Roll out ``rollouts_per_iter`` trajs with β-mix; relabel every state."""
         return self._collect(
             n_rollouts=self.cfg.rollouts_per_iter,
             beta=self.beta(k),
@@ -170,24 +158,11 @@ class DAggerTrainer:
         epochs: int,
         cache_path: "Path | str | None" = None,
     ) -> list[float]:
-        """Pre-train the policy on pure-MPPI rollouts before the DAgger loop.
+        """Pre-train on pure-MPPI rollouts; appends with round_idx=-1.
 
-        Appends to the aggregate buffer with round_idx=-1 so warmup data is
-        reused across subsequent finetune() calls. Returns per-epoch train MSE.
-
-        If `cache_path` is given:
-          - and the file exists: load flat (states, actions) from it and skip
-            the (expensive) MPPI rollout collection. Trajectory-shaped arrays
-            from a BC-style h5 (M, T, dim) are auto-flattened, so a
-            `collect_bc_demos.py` dataset works here too.
-          - otherwise: collect fresh, then save to `cache_path` using the same
-            schema as `collect_bc_demos.py` so the file is reusable both ways.
-        If `cache_path` is None, nothing is read or written — this is the
-        default; pass a path only when you explicitly want to persist.
-
-        The BC training epochs always run — we only cache the collection step,
-        which is where the wall-clock cost lives. To invalidate a stale cache,
-        delete the file or pass a new path.
+        ``cache_path`` (optional) loads if present (auto-flattens BC-style
+        ``(M, T, dim)`` h5), else collects + saves with the
+        ``collect_bc_demos`` schema. Returns per-epoch train losses.
         """
         if n_rollouts <= 0 or epochs <= 0:
             return []
@@ -204,8 +179,7 @@ class DAggerTrainer:
                 act_r = f["actions"][:].astype(np.float32)
                 cached_n = int(f.attrs.get("n_rollouts", -1))
                 cached_len = int(f.attrs.get("episode_len", -1))
-            # BC-style caches are (M, T, dim); warmup-native caches are (N, dim).
-            # Flatten either to (N, dim) so the buffer gets consistent rows.
+            # Flatten BC-style (M, T, dim) → (N, dim).
             if obs_r.ndim == 3:
                 obs_r = obs_r.reshape(-1, obs_r.shape[-1])
                 act_r = act_r.reshape(-1, act_r.shape[-1])
@@ -222,7 +196,7 @@ class DAggerTrainer:
         else:
             obs_r, act_r = self._collect(
                 n_rollouts=n_rollouts, beta=1.0,
-                seed_base=self.cfg.seed + 999_000,  # distinct from any round seed
+                seed_base=self.cfg.seed + 999_000,  # distinct from round seeds
                 progress_label="warmup rollout",
             )
             if cache_path is not None:
@@ -246,8 +220,7 @@ class DAggerTrainer:
         idx = np.arange(N)
         losses: list[float] = []
         grad_clip_norm = float(getattr(self.cfg, "grad_clip_norm", 0.0))
-        # Warmup never runs the Gaussian PPO clip — random-init policy gives
-        # a meaningless ratio. Deterministic grad-norm clip is fine here.
+        # PPO clip skipped here — random-init ratio is meaningless.
         epoch_bar = tqdm(
             range(epochs),
             desc="warmup fit",
@@ -268,7 +241,6 @@ class DAggerTrainer:
             epoch_bar.set_postfix(train_loss=f"{loss:.4f}")
         return losses
 
-    # ---------- training ----------
     def _train_step(
         self,
         obs: np.ndarray,
@@ -277,33 +249,18 @@ class DAggerTrainer:
         old_policy: "GaussianPolicy | None" = None,
         clip_ratio: float = 0.2,
     ) -> float:
-        """One distillation step. Two policy-class-specific paths:
+        """One distillation step.
 
-        * Deterministic: MSE on the policy mean. ``grad_clip_norm > 0``
-          activates an L2 gradient-norm clip inside ``DeterministicPolicy.
-          mse_step`` (between backward and the Adam step).
-        * Gaussian + ``old_policy`` + ``clip_ratio > 0``: PPO-style ratio
-          clip surrogate, mirroring ``mppi_gps_clip._train_step_clipped``.
-          Takes priority over plain NLL.
-        * Gaussian default: full diagonal-Gaussian NLL via
-          ``GaussianPolicy.train_weighted`` with uniform weights. Both
-          ``mu`` AND ``log_sigma`` heads are trained — σ shrinks/widens to
-          reflect expert action variance. Same code path GPS uses for its
-          Gaussian S-step (``train_weighted`` with uniform weights → NLL).
-
-        NOTE: as of the project-wide "always NLL for Gaussian" sweep,
-        the historical MSE-on-mean default is gone. Existing Gaussian
-        checkpoints trained under MSE still load (head shapes match);
-        they just had a frozen log_sigma. Re-training under NLL updates
-        log_sigma alongside the mean.
+        - Deterministic: MSE on the mean (``grad_clip_norm`` activates L2 clip).
+        - Gaussian + ``old_policy`` + ``clip_ratio > 0``: PPO-clip surrogate.
+        - Gaussian default: full-diagonal NLL via ``train_weighted`` with
+          uniform weights (trains both mu and log_sigma).
         """
-        # Deterministic path -------------------------------------------------
         if isinstance(self.policy, DeterministicPolicy):
             if grad_clip_norm > 0.0:
                 return self.policy.mse_step(obs, act, grad_clip_norm=grad_clip_norm)
             return self.policy.mse_step(obs, act)
 
-        # Gaussian + PPO clip ------------------------------------------------
         if (
             isinstance(self.policy, GaussianPolicy)
             and old_policy is not None
@@ -311,9 +268,6 @@ class DAggerTrainer:
         ):
             return self._train_step_gaussian_ppo(obs, act, old_policy, clip_ratio)
 
-        # Gaussian default: NLL via train_weighted with uniform weights.
-        # Reuses the GPS code path so normalizer / NaN-guard logic stays
-        # in sync.
         weights = np.ones(len(obs), dtype=np.float32)
         return self.policy.train_weighted(obs, act, weights)
 
@@ -324,11 +278,10 @@ class DAggerTrainer:
         old_policy: GaussianPolicy,
         clip_ratio: float,
     ) -> float:
-        """PPO-style ratio-clipped surrogate for the Gaussian dagger fit.
+        """PPO ratio-clip surrogate, advantage=1.
 
-        ``L = - E[ min(r, clip(r, 1-eps, 1+eps)) ]`` where
-        ``r = pi_theta(a|o) / pi_old(a|o)``. Constant advantage = 1
-        (DAgger does not retain MPPI importance weights past collection).
+        ``L = -E[min(r, clip(r, 1-ε, 1+ε))]``,
+        ``r = π_θ(a|o) / π_old(a|o)``.
         """
         device = self.policy.device
         o_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
@@ -341,8 +294,7 @@ class DAggerTrainer:
         with torch.no_grad():
             old_log_prob = old_policy.log_prob(o_t, a_t)
 
-        # Clamp log-ratio so exp() can't overflow → 0·∞ NaN gradients
-        # via torch.min's autograd chain.
+        # Clamp log-ratio so exp() can't overflow into NaN gradients.
         log_ratio = torch.clamp(curr_log_prob - old_log_prob, min=-20.0, max=20.0)
         ratio = torch.exp(log_ratio)
         surr1 = ratio
@@ -359,11 +311,8 @@ class DAggerTrainer:
 
     @torch.no_grad()
     def _eval_mse(self, obs: np.ndarray, act: np.ndarray, batch: int = 16384) -> float:
-        """Validation MSE in the policy's training-loss space. With
-        output norm on, `mse_step` operates in normalized space; this
-        matches it so round-best selection / curves stay on one scale.
-        Byte-identical to physical-space MSE when output norm is off.
-        """
+        """Validation MSE in the policy's training-loss space (normalized
+        when output norm is on; physical otherwise)."""
         device = self.policy.device
         total, n = 0.0, 0
         for s in range(0, len(obs), batch):
@@ -383,18 +332,15 @@ class DAggerTrainer:
         latest_act: np.ndarray,
         round_idx: int | None = None,
     ) -> tuple[float, float]:
-        """Finetune on the full aggregated buffer. Validation uses a held-out
-        slice of the most-recent round to catch covariate shift."""
-        # held-out val from most-recent round
+        """Finetune on the full buffer; val uses a slice of the latest round."""
         n_latest = len(latest_obs)
         perm = self.rng.permutation(n_latest)
         n_val = max(1, int(n_latest * self.cfg.val_frac))
         val_idx, train_idx = perm[:n_val], perm[n_val:]
         va_o, va_a = latest_obs[val_idx], latest_act[val_idx]
 
-        # full training set: buffer minus the val slice from latest round
+        # Full training set = buffer minus the val slice from latest round.
         all_o, all_a, _ = self.flat_buffer()
-        # latest round is the last appended chunk; compute its bounds
         n_before_latest = self.buffer_size() - n_latest
         latest_train_o = latest_obs[train_idx]
         latest_train_a = latest_act[train_idx]
@@ -407,9 +353,7 @@ class DAggerTrainer:
         grad_clip_norm = float(getattr(self.cfg, "grad_clip_norm", 0.0))
         clip_ratio = float(getattr(self.cfg, "clip_ratio", 0.0))
 
-        # Pre-finetune snapshot for the Gaussian PPO clip. Frozen, eval mode,
-        # no grad. Skipped for deterministic policy or when clip_ratio == 0
-        # (avoid the deepcopy + per-batch forward when not in use).
+        # Pre-finetune snapshot for the PPO clip (Gaussian + clip_ratio>0).
         old_policy = None
         if isinstance(self.policy, GaussianPolicy) and clip_ratio > 0.0:
             old_policy = copy.deepcopy(self.policy)
@@ -440,13 +384,10 @@ class DAggerTrainer:
             epoch_bar.set_postfix(train_loss=f"{last_train:.4f}", val_mse=f"{last_val:.4f}")
         return last_train, last_val
 
-    # ---------- full iteration ----------
     def step(self, k: int) -> dict:
         obs_r, act_r = self.collect_round(k)
         self.append(obs_r, act_r, round_idx=k)
         train_loss, val_mse = self.finetune(obs_r, act_r, round_idx=k)
-        # Optionally wipe Adam moments at end of round — stale momentum
-        # can fight buffer-distribution shifts.
         if getattr(self.cfg, "reset_optim_per_iter", False):
             self.policy.reset_optimizer()
         return {
@@ -454,12 +395,8 @@ class DAggerTrainer:
             "beta": self.beta(k),
             "new_samples": len(obs_r),
             "buffer_size": self.buffer_size(),
-            # `train_loss` is the per-step training loss returned by
-            # `_train_step` — NLL for Gaussian (default since the
-            # always-NLL sweep), MSE-on-mean for Deterministic, PPO-clip
-            # surrogate when `clip_ratio > 0`. `val_mse` is the held-out
-            # MSE-on-mean from `_eval_mse` regardless of training loss
-            # type, so it stays comparable across runs / policy classes.
+            # train_loss in the policy's training-loss space (NLL / MSE /
+            # PPO-clip); val_mse always MSE-on-mean for cross-run compare.
             "train_loss": train_loss,
             "val_mse": val_mse,
         }

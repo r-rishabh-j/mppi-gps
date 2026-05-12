@@ -1,10 +1,4 @@
-"""Shared evaluation helpers for policy and MPPI controllers.
-
-Both GPS training (run_gps.py) and behaviour cloning (test_sl.py) need to
-evaluate a trained policy and compare it against the MPPI baseline on
-identical initial conditions.  This module provides those two functions
-so that evaluation is consistent across all scripts.
-"""
+"""Shared eval helpers (policy + MPPI on identical seeds for comparison)."""
 
 import numpy as np
 import torch
@@ -24,51 +18,28 @@ def evaluate_policy(
     render: bool = False,
     camera: str | int | None = None,
 ) -> dict:
-    """Roll out a trained policy for n_episodes and collect cost statistics.
+    """Mean-mode policy rollout, ``n_episodes`` × ``episode_len``.
 
-    Each episode uses a deterministic seed (seed + ep) so that the initial
-    conditions are reproducible and directly comparable with evaluate_mppi().
-
-    The policy is used in mean-mode (no sampling noise): we take the mean
-    of the Gaussian output as the action.
-
-    Args:
-        policy:      Trained GaussianPolicy network (should be in eval mode).
-        env:         Environment instance.
-        n_episodes:  Number of evaluation episodes.
-        episode_len: Maximum steps per episode.
-        seed:        Base seed — episode i uses seed + i.
-        render:      If True, capture frames from episode 0 for video export.
-    Returns:
-        Dict with keys: mean_cost, std_cost, per_ep (list), frames (list).
+    Episode i uses ``seed + i`` (matches ``evaluate_mppi`` for fair compare).
+    Returns dict: mean_cost, std_cost, per_ep, frames (ep 0 only when render).
     """
     returns: list[float] = []
     frames: list[np.ndarray] = []
-    # Only create a renderer if the env has a MuJoCo model (not all BaseEnv do)
     renderer = None
     if render and hasattr(env, 'model'):
         renderer = mujoco.Renderer(env.model, height=480, width=640)
 
     for ep in range(n_episodes):
-        # Seed before each episode so env.reset() produces a deterministic
-        # initial condition that matches evaluate_mppi's episode i.
         np.random.seed(seed + ep)
         env.reset()
 
         ep_cost = 0.0
         for t in range(episode_len):
-            # IMPORTANT: act_np (NOT policy.action) — act_np clips to the
-            # env's actuator ctrlrange before returning. policy.action returns
-            # the raw network mean which can sit well outside [low, high]
-            # early in training. Writing those raw values into data.ctrl
-            # used to trip MuJoCo's "huge value in CTRL" stability watchdog
-            # on every eval step (in run_gps's per-iter eval especially)
-            # and produced misleading eval costs that didn't reflect what
-            # MPPI/DAgger see at execution time (both of which DO clip).
+            # act_np (not policy.action) clips to env ctrlrange — raw means
+            # can otherwise trip MuJoCo's "huge CTRL" watchdog early on.
             obs = env._get_obs()
             action = policy.act_np(obs)
             if np.isnan(action).any():
-                # Diagnostic: figure out which input went bad.
                 obs_nan = bool(np.isnan(obs).any())
                 bad_params = [
                     k for k, v in policy.state_dict().items()
@@ -86,18 +57,13 @@ def evaluate_policy(
                       f"normalizer_bad={norm_bad}  "
                       f"params_with_nan={bad_params[:3]}{'...' if len(bad_params) > 3 else ''}  "
                       f"(total {len(bad_params)} bad params)")
-                # First-step diagnostic only — break out so we don't spam.
                 if t == 0 and ep == 0:
                     raise RuntimeError(
-                        "NaN action on the very first eval step. See diagnostic above. "
-                        "If params_with_nan is non-empty, the checkpoint is dead; "
-                        "if obs_has_nan is True, the env is in a NaN state already; "
-                        "if both are False, run forward manually to find which layer NaNs."
+                        "NaN action on first eval step. See diagnostic above."
                     )
             _, cost, done, _ = env.step(action)
             ep_cost += cost
 
-            # Capture video frames from the first episode only
             if renderer is not None and ep == 0:
                 if camera is not None:
                     renderer.update_scene(env.data, camera=camera)
@@ -105,8 +71,7 @@ def evaluate_policy(
                     renderer.update_scene(env.data)
                 frames.append(renderer.render().copy())
 
-            # if done:
-            #     break
+            # NB: we intentionally don't break on done — see evaluate_mppi.
         returns.append(ep_cost)
 
     arr = np.array(returns)
@@ -125,26 +90,12 @@ def evaluate_mppi(
     episode_len: int,
     seed: int,
 ) -> dict:
-    """Roll out MPPI for n_episodes and collect cost statistics.
-
-    Uses the same seed schedule as evaluate_policy (seed + ep) so that
-    episode i starts from the *exact* same initial condition in both
-    evaluations, making the per-episode cost gap a fair comparison.
-
-    Args:
-        env:         Environment instance.
-        controller:  MPPI controller (will be reset each episode).
-        n_episodes:  Number of evaluation episodes.
-        episode_len: Maximum steps per episode.
-        seed:        Base seed — episode i uses seed + i.
-    Returns:
-        Dict with keys: mean_cost, std_cost, per_ep (list).
-    """
+    """MPPI baseline rollout (same seed schedule as ``evaluate_policy``)."""
     returns: list[float] = []
     for ep in range(n_episodes):
         np.random.seed(seed + ep)
         env.reset()
-        controller.reset()  # clear MPPI's warm-start nominal U
+        controller.reset()
 
         ep_cost = 0.0
         for t in range(episode_len):
@@ -152,15 +103,8 @@ def evaluate_mppi(
             action, _ = controller.plan_step(state)
             _, cost, done, _ = env.step(action)
             ep_cost += cost
-            # Intentionally do NOT break on done. evaluate_policy() also runs
-            # the full episode_len regardless of termination (its `if done: break`
-            # is commented out), so breaking here would make MPPI-vs-policy
-            # comparisons asymmetric: the policy is judged on the full T steps
-            # while MPPI gets cut off early. For envs where the controller can
-            # recover from a `done` state (or where post-done per-step cost is
-            # ~0, e.g. hopper v2's tolerance-based reward), this matters.
-            # if done:
-            #     break
+            # We don't break on done — evaluate_policy doesn't either, and
+            # asymmetric truncation would make the policy↔MPPI gap unfair.
         returns.append(ep_cost)
 
     arr = np.array(returns)

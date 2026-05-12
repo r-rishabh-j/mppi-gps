@@ -1,10 +1,4 @@
-"""Evaluate a saved policy checkpoint on an environment.
-
-Example:
-    python -m scripts.eval_checkpoint --env acrobot \
-        --ckpt checkpoints/dagger/dagger_acrobot_iter09.pt \
-        --n-eval 10 --render
-"""
+"""Evaluate a saved policy checkpoint."""
 import argparse
 from pathlib import Path
 

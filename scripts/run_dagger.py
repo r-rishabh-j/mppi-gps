@@ -1,18 +1,6 @@
-"""DAgger with MPPI as the expert — distills MPPI into a GaussianPolicy.
+"""DAgger with MPPI as the expert.
 
-Example:
-    python -m scripts.run_dagger --env acrobot --dagger-iters 10 \
-        --rollouts-per-iter 20 --episode-len 200 --device auto
-
-    # Hopper (terminating env — use --auto-reset so early falls don't
-    # waste the per-rollout step budget):
-    python -m scripts.run_dagger --env hopper --deterministic --auto-reset \
-        --warmup-rollouts 30 --warmup-epochs 50 \
-        --dagger-iters 30 --rollouts-per-iter 10 --episode-len 500 \
-        --beta-schedule linear --distill-epochs 6 --buffer-cap 50000 --device cuda
-
-MPPI runs on CPU (MuJoCo). Policy training uses the device selected by
-`--device` (auto → cuda → mps → cpu).
+MPPI on CPU; policy training on ``--device`` (auto → cuda → mps → cpu).
 """
 from __future__ import annotations
 
@@ -111,11 +99,6 @@ def parse_args() -> argparse.Namespace:
                         "ratio=1+eps). 0/unset = disabled (default = plain MSE-on-"
                         "mean). Typical 0.1–0.3; standard PPO uses 0.2. NOT applied "
                         "in --warmup. Only takes effect WITHOUT --deterministic.")
-    # NOTE: --loss flag removed in the "always NLL for Gaussian" sweep.
-    # Gaussian DAgger now always uses NLL (or PPO clip when --clip-ratio
-    # > 0). Deterministic DAgger is always MSE — no σ to fit. Saved
-    # `cfg.loss_type` field on legacy DAggerConfig instances is ignored
-    # by `_train_step` if encountered.
     p.add_argument("--disable-tanh", action="store_true",
                    help="Disable the default tanh squash on the policy head "
                         "(see PolicyConfig.tanh_squash). Use when reproducing "
@@ -157,9 +140,7 @@ def main() -> None:
     seed_everything(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
-    # Construct env + MPPI controller. Warp path uses BatchedMPPI with
-    # nworld = rollouts_per_iter * cfg.K so all parallel rollouts share
-    # one CUDA-graph launch per timestep.
+    # Warp path: nworld = rollouts_per_iter * cfg.K (one graph launch / step).
     mppi_cfg = MPPIConfig.load(args.env)
     if args.warp:
         env = make_env(
@@ -254,20 +235,7 @@ def main() -> None:
             print(f"  warmup train_loss: {losses[0]:.5f} → {losses[-1]:.5f}  "
                   f"(buf={trainer.buffer_size():,})")
 
-    # # --- MPPI baseline (once, shared across iterations) ---
-    # print("\nevaluating MPPI baseline...")
-    # mppi_eval = MPPI(env, cfg=mppi_cfg)
-    # mppi_stats = evaluate_mppi(env, mppi_eval,
-    #                             n_episodes=cfg.n_eval_eps,
-    #                             episode_len=cfg.eval_ep_len,
-    #                             seed=cfg.seed)
-    # print(f"MPPI baseline: {mppi_stats['mean_cost']:.2f} ± {mppi_stats['std_cost']:.2f}")
-
-    # Per-iter CSV log, opened once, header written once, one row per iter
-    # with explicit flush + fsync so a hard kill (SIGKILL/OOM/reboot) during
-    # iter N+1 still leaves rows 0..N readable on disk. Same crash-safe
-    # pattern as `gps_log.csv`. Uniform schema (NaN for inactive cols)
-    # makes pd.read_csv across runs straightforward.
+    # Per-iter CSV log, flushed + fsync per row.
     csv_columns = [
         "iter", "beta", "new_samples", "buffer_size",
         "train_loss", "val_mse",
@@ -315,8 +283,6 @@ def main() -> None:
             best_iter = k
             copy_as(ckpt_path, run_dir / "best.pt")
 
-        # Crash-safe per-iter row. flush() + fsync() so a hard kill during
-        # iter k+1 still leaves iter k readable on disk.
         csv_writer.writerow({
             "iter": k,
             "beta": info["beta"],
@@ -343,10 +309,6 @@ def main() -> None:
         "end_time": datetime.now().isoformat(timespec="seconds"),
         "best_iter": best_iter,
         "best_cost": best_cost if best_iter is not None else None,
-        # "mppi_baseline": {
-        #     "mean_cost": mppi_stats["mean_cost"],
-        #     "std_cost": mppi_stats["std_cost"],
-        # },
     })
 
     print(f"\nrun dir: {run_dir}")

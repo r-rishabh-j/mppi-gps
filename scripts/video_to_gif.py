@@ -1,21 +1,4 @@
-"""Convert a video file to an animated GIF.
-
-Uses ffmpeg's two-pass palette pipeline for high-quality output (generates a
-256-color palette tuned to the input, then maps frames against it). Requires
-``ffmpeg`` on PATH (``brew install ffmpeg`` on macOS).
-
-Examples
---------
-    # Basic: defaults to 15 fps, 480px wide, full duration
-    python -m scripts.video_to_gif input.mp4 output.gif
-
-    # Trim a clip from 2s for 4s, 640px wide, 24 fps
-    python -m scripts.video_to_gif input.mp4 output.gif \\
-        --start 2 --duration 4 --fps 24 --width 640
-
-    # Keep native size and frame rate
-    python -m scripts.video_to_gif input.mp4 output.gif --fps 0 --width 0
-"""
+"""Video → GIF via ffmpeg's two-pass palette pipeline (ffmpeg required)."""
 
 from __future__ import annotations
 
@@ -28,7 +11,7 @@ from pathlib import Path
 
 
 def _run(cmd: list[str]) -> None:
-    """Run an ffmpeg command and surface failures clearly."""
+    """Run ffmpeg; surface failures."""
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
@@ -36,12 +19,11 @@ def _run(cmd: list[str]) -> None:
 
 
 def _build_filter(fps: int, width: int) -> str:
-    """Compose the fps/scale filter chain (skips zero-valued stages)."""
+    """fps/scale filter chain; 0 = passthrough."""
     parts: list[str] = []
     if fps > 0:
         parts.append(f"fps={fps}")
     if width > 0:
-        # -1 preserves aspect ratio; lanczos gives crisp downscales
         parts.append(f"scale={width}:-1:flags=lanczos")
     return ",".join(parts) if parts else "null"
 
@@ -55,21 +37,7 @@ def video_to_gif(
     duration: float | None = None,
     loop: int = 0,
 ) -> Path:
-    """Convert ``src`` video to ``dst`` GIF.
-
-    Parameters
-    ----------
-    src, dst : Path
-        Input video and output gif paths.
-    fps : int
-        Output frame rate. ``0`` keeps the source rate.
-    width : int
-        Output width in pixels (height auto). ``0`` keeps source size.
-    start, duration : float | None
-        Optional trim window, in seconds.
-    loop : int
-        ``0`` = loop forever (default), ``-1`` = play once.
-    """
+    """``src`` → ``dst`` GIF. ``fps``/``width`` 0 = passthrough; ``loop`` 0 = forever."""
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not found on PATH. Install it (e.g. `brew install ffmpeg`).")
     if not src.exists():

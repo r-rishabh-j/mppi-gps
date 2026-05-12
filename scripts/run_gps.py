@@ -1,20 +1,7 @@
-"""Train a reactive policy via MPPI-GPS and evaluate against baselines.
+"""Train a reactive policy via MPPI-GPS.
 
-Creates a run dir `experiments/gps/<timestamp>_<env>_<name>/` containing:
-  - config.json    CLI args + all dataclass configs + metadata
-  - iter_<k>.pt    per-iter wrapped checkpoints
-  - best.pt / final.pt
-  - curves.json / curves.png
-  - <env>.mp4      eval video
-
-Usage:
-    python -m scripts.run_gps --env acrobot --exp-name baseline
-    python -m scripts.run_gps --env hopper --gps-iters 30 --alpha 0.05
-    python -m scripts.run_gps --env acrobot --deterministic --alpha 0.05
-    python -m scripts.run_gps --env acrobot --policy-prior mean_distance \
-        --alpha 0.1 --gps-iters 20 --exp-name gauss_mean_dist
-    python -m scripts.run_gps --env acrobot --exp-name warmstart \
-        --init-ckpt checkpoints/dagger/<run>/best.pt
+Writes ``experiments/gps/<timestamp>_<env>_<name>/`` with config.json,
+``iter_<k>.pt``, best.pt, final.pt, curves.{json,png}, and an eval mp4.
 """
 
 import argparse
@@ -209,12 +196,9 @@ def main():
     args = parse_args()
     seed_everything(args.seed)
 
-    # Load MPPI cfg + resolve `num_conditions` BEFORE env construction —
-    # the warp env's `nworld = N × K` is pinned at build time.
+    # Resolve num_conditions before env: warp's nworld = N*K is fixed.
     mppi_cfg = MPPIConfig.load(args.env)
     policy_cfg = PolicyConfig.for_env(args.env)
-    # Each CLI override fires only when the user set the flag; per-env
-    # defaults from `for_env(...)` are otherwise preserved.
     if args.disable_tanh:
         policy_cfg.tanh_squash = False
     if args.featurize is not None:
@@ -234,7 +218,6 @@ def main():
 
     env_kwargs: dict = {}
     if args.warp:
-        # Warp path: N conditions × K samples = N*K mjw worlds.
         env_kwargs.update(
             use_warp=True,
             nworld=gps_cfg.num_conditions * mppi_cfg.K,
@@ -330,10 +313,7 @@ def main():
         f"{trust_desc}"
     )
 
-    # ---- Construct trainer (needed early so we can load --init-ckpt and
-    #      record the actual policy class in config.json) ----
-    # Warp path uses BatchedMPPI under the hood and parallelizes the C-step
-    # over conditions; CPU path is the standard MPPIGPS.
+    # Trainer: warp parallelizes the C-step over conditions.
     Trainer = WarpMPPIGPS if args.warp else MPPIGPS
     gps = Trainer(
         env, mppi_cfg, policy_cfg, gps_cfg,
@@ -346,9 +326,7 @@ def main():
         if not init_ckpt.exists():
             raise FileNotFoundError(f"--init-ckpt not found: {init_ckpt}")
         blob = load_checkpoint(init_ckpt, map_location=device)
-        # Auto-handles GaussianPolicy → DeterministicPolicy by slicing the
-        # mu head off the (mu | log_sigma) concatenated head. Other class
-        # transitions raise a clear error.
+        # Auto Gaussian → Deterministic mu-head slice; others raise.
         report = load_state_dict_into(gps.policy, blob)
         print(f"loaded initial policy weights from {init_ckpt}: {report['msg']}")
 
@@ -394,8 +372,7 @@ def main():
         )
 
     # ---- Save learning curves as JSON ----
-    # prev_iter_kl exists on some GPSHistory variants but not all;
-    # getattr keeps the schema uniform across trainer classes.
+    # getattr: prev_iter_kl missing in some GPSHistory variants.
     curves_path = run_dir / "curves.json"
     curves_path.write_text(json.dumps({
         "mppi_costs": history.iteration_costs,
@@ -456,8 +433,7 @@ def main():
     video_path = None
     if gps_stats["frames"]:
         video_path = run_dir / f"{args.env}.mp4"
-        # Use the env's wall-clock dt so the saved video plays real-time —
-        # matches eval_checkpoint and the per-env runners.
+        # Real-time playback at env wall-clock dt.
         dt = env.model.opt.timestep * env._frame_skip
         fps = int(round(1.0 / dt))
         mediapy.write_video(str(video_path), gps_stats["frames"], fps=fps)

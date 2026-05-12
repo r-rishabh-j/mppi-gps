@@ -1,30 +1,11 @@
-"""Collect (obs, expert action) trajectories from MPPI for pure SL/BC.
+"""Collect (obs, expert-action) trajectories from MPPI as h5 for BC / DAgger seed.
 
-Writes an h5 dataset compatible with `test_sl.py` and DAgger's `--seed-from`:
-    keys:   states     (M, T, obs_dim)
-            actions    (M, T, act_dim)
-            costs      (M, T)
-            sensordata (M, T, nsensor)   — only when env produces non-empty
-                                          sensordata (MuJoCo envs); absent
-                                          for gym-wrapped envs and others
-                                          where ``env.data.sensordata`` is
-                                          missing or zero-sized.
-    attrs:  env, M, T, obs_dim, act_dim, mppi_cfg (json)
+Schema: states (M, T, obs_dim), actions (M, T, act_dim), costs (M, T),
+sensordata (M, T, nsensor) — last omitted when env has none. Attrs:
+env, M, T, obs_dim, act_dim, mppi_cfg.
 
-Caching:
-    If the output path already exists, the script prints its stats and exits
-    without re-collecting. Pass `--force` to overwrite, or `--append` to add
-    M more trajectories to the existing dataset (seeds are auto-offset by the
-    existing trajectory count so new rollouts don't duplicate old ones). The
-    default output path is `data/<env>_bc.h5`, so collecting for a new env
-    does not trample prior datasets.
-
-Examples:
-    python -m scripts.collect_bc_demos --env acrobot
-    python -m scripts.collect_bc_demos --env hopper --auto-reset -M 30 -T 500
-    python -m scripts.collect_bc_demos --env hopper --warp --auto-reset -M 30 -T 500
-    python -m scripts.collect_bc_demos --env acrobot --force              # re-collect
-    python -m scripts.collect_bc_demos --env acrobot --append -M 20       # add 20 more
+If the output exists: print stats and exit. ``--force`` overwrites;
+``--append`` adds M more (seed offset by existing trajectory count).
 """
 from __future__ import annotations
 
@@ -46,13 +27,7 @@ _ENVS = ["acrobot", "adroit_pen", "adroit_relocate", "point_mass", "hopper", "ur
 
 
 def _try_capture_sensordata(env) -> np.ndarray | None:
-    """Snapshot ``env.data.sensordata`` if the env exposes a non-empty one.
-
-    Returns ``None`` for envs without MuJoCo-style sensor outputs (e.g.
-    ``gym_wrapper``) or whose sensor list is empty. Used both as a probe
-    at startup (to decide whether to allocate the per-step buffer) and
-    inside the rollout loop (per-step capture).
-    """
+    """Snapshot ``env.data.sensordata`` or return None if absent / empty."""
     data = getattr(env, "data", None)
     if data is None:
         return None
@@ -129,14 +104,7 @@ def _load_existing(path: Path) -> dict:
 def _validate_append_compat(
     existing: dict, args, env, mppi_cfg, new_nsensor: int
 ) -> None:
-    """Raise if `existing` is incompatible for append; warn on soft mismatches.
-
-    Hard-reject on any dimension/semantics change that would corrupt downstream
-    consumers (env switch, T change, auto_reset change, obs/act dim change,
-    sensordata presence/dim change). mppi_cfg differences are soft — the user
-    may intentionally be collecting with a retuned controller, and the dataset
-    format is agnostic to it.
-    """
+    """Raise on hard incompatibilities (dim / semantics); warn on mppi_cfg drift."""
     existing_attrs = existing["attrs"]
     ex_env = existing_attrs.get("env", "?")
     if isinstance(ex_env, bytes):
@@ -159,10 +127,7 @@ def _validate_append_compat(
         mismatches.append(
             f"auto_reset: cached={ex_ar} vs current={args.auto_reset}")
 
-    # Sensordata: presence and per-step dim must agree. Adding sensordata
-    # to a legacy (no-sd) dataset (or vice versa) would leave half the rows
-    # without it, which downstream consumers can't slice cleanly — easier
-    # to refuse and tell the user to re-collect with --force.
+    # Sensordata presence + dim must agree (mixed rows can't slice cleanly).
     ex_has_sd = "sensordata" in existing
     new_has_sd = new_nsensor > 0
     if ex_has_sd != new_has_sd:
@@ -198,10 +163,8 @@ def main() -> None:
     args = parse_args()
     out_path = Path(args.out) if args.out else Path(f"data/{args.env}_bc.h5")
 
-    # Resolve the three-way gate on an existing file: describe (default),
-    # overwrite (--force), or append (--append). If the file doesn't exist,
-    # --append silently falls through to a normal write so users can script
-    # "collect or grow to N" workflows without pre-checking existence.
+    # Existing file: describe (default), overwrite (--force), or append.
+    # --append on missing file just creates fresh.
     existing: dict | None = None
     if out_path.exists():
         if args.force:
@@ -216,9 +179,7 @@ def main() -> None:
 
     np.random.seed(args.seed)
 
-    # Load MPPI cfg first when using Warp — the GPU env needs `nworld=cfg.K`
-    # (the rollout-batch width) baked in at construction time and `nworld`
-    # is fixed for the env's lifetime. Pre-CPU path is unchanged.
+    # Warp env needs nworld=cfg.K at construction (fixed for life).
     mppi_cfg = MPPIConfig.load(args.env)
     if args.warp:
         env = make_env(args.env, use_warp=True, nworld=mppi_cfg.K)
@@ -226,10 +187,7 @@ def main() -> None:
     else:
         env = make_env(args.env)
 
-    # Probe sensordata presence once on the freshly-reset env. If non-empty,
-    # we'll allocate a per-step buffer and capture each step's sensordata
-    # alongside obs/action/cost. Envs without it (gym_wrapper, anything
-    # without a MuJoCo model) just skip the buffer entirely.
+    # Probe sensordata presence; allocate per-step buffer iff non-empty.
     env.reset()
     sample_sd = _try_capture_sensordata(env)
     nsensor = sample_sd.size if sample_sd is not None else 0
@@ -247,8 +205,7 @@ def main() -> None:
     act_dim = env.action_dim
     M, T = args.M, args.T
 
-    # Per-rollout buffers (one trajectory at a time — incremental writes
-    # mean we no longer hold all M in RAM). Reused each loop iteration.
+    # Per-rollout buffers (incremental writes; M not held in RAM).
     states_row = np.zeros((T, obs_dim), dtype=np.float32)
     actions_row = np.zeros((T, act_dim), dtype=np.float32)
     costs_row = np.zeros((T,), dtype=np.float32)
@@ -267,19 +224,12 @@ def main() -> None:
               f"auto_reset={args.auto_reset}{sd_msg})")
     print(f"→ {out_path}  (incremental: each rollout flushed on completion)")
 
-    # ---- Initialise the on-disk file with resizable datasets ----
-    # Fresh: empty resizable datasets at size 0, will grow per rollout.
-    # Append: rewrite the existing rows into resizable datasets first
-    #         (a one-time migration cost; legacy files weren't created
-    #         with `maxshape=None` so we can't extend them in place),
-    #         then append new rollouts. After this prologue the file
-    #         is "incrementally extensible" forever.
+    # Resizable datasets: fresh starts at size 0; append migrates legacy
+    # files (one-time) into resizable form before extending.
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _create_dataset(f, name, initial_data, full_shape, dtype=np.float32):
-        """Helper: create a resizable dataset. `initial_data` may be None
-        (size-0 placeholder) or a numpy array (seed with existing rows).
-        ``full_shape`` is (None, *trailing) — trailing dims are fixed."""
+        """Resizable dataset; ``full_shape = (None, *trailing)``."""
         if initial_data is None:
             f.create_dataset(
                 name,

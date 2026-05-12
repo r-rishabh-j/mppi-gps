@@ -1,16 +1,11 @@
-"""Experiment bookkeeping: run directories, config dumps, checkpoint wrapping.
+"""Experiment bookkeeping: run dirs, config dumps, checkpoint wrapping.
 
-A "run dir" looks like:
+Run dir layout:
     <base>/<YYYYmmdd-HHMMSS>_<env>_<name>/
-        config.json    # args + dataclass configs + runtime metadata
-        log.csv
-        iter_00.pt  iter_01.pt  ...
-        best.pt  final.pt
+        config.json   iter_<k>.pt   best.pt   final.pt   log.csv
 
-`config.json` is created at run start and updated at run end (end_time,
-best_iter, best_cost). `.pt` files are dicts of the form
-    {"state_dict": ..., "policy_class": "<ClassName>", "round": k, ...}
-`load_checkpoint` unwraps this and also accepts legacy raw state_dicts.
+Wrapped checkpoint: ``{state_dict, policy_class, round, ...}``.
+``load_checkpoint`` also accepts legacy raw state_dicts.
 """
 from __future__ import annotations
 
@@ -120,36 +115,19 @@ def load_state_dict_into(
     *,
     strict: bool = True,
 ) -> dict:
-    """Load ``blob['state_dict']`` into ``target_policy`` with one auto-fix:
-    Gaussian → Deterministic head conversion.
+    """Load ``blob['state_dict']`` into ``target_policy``.
 
-    A ``GaussianPolicy`` checkpoint has its final ``Linear`` head sized
-    ``2 * act_dim`` (mu | log_sigma concatenated). A ``DeterministicPolicy``
-    head is ``act_dim``. The natural BC → GPS-deterministic warm-start
-    workflow needs to drop the log_sigma half and load only the mu head;
-    every other layer (input + hidden Linears, LayerNorms, Dropout, the
-    RunningNormalizer buffers) is shape-identical between the two classes,
-    so they load directly.
+    Auto-fix: Gaussian → Deterministic strips the log_sigma half of the
+    final-layer head (rest is shape-identical). Deterministic → Gaussian
+    refuses (no log_sigma weights to invent).
 
-    Behaviour:
-    * Source class == target class (or unrecorded) and shapes match → plain
-      ``load_state_dict`` (raises on any mismatch).
-    * Source = ``GaussianPolicy``, target = ``DeterministicPolicy``: detect
-      the head by "source row count is 2× target row count", slice
-      ``v[:target_rows]`` (i.e. the mu half), load the rest unchanged.
-    * Source = ``DeterministicPolicy``, target = ``GaussianPolicy``: error
-      out — we'd have to invent log_sigma weights, which is better done
-      with a fresh re-init than a silent zero-fill.
-
-    Returns a small report ``{"converted": bool, "src_class": str, "msg": str}``
-    suitable for the caller to print.
+    Returns ``{"converted", "src_class", "msg"}``.
     """
     src_class = blob.get("policy_class") or "<unknown>"
     target_class = type(target_policy).__name__
     state = blob["state_dict"]
     target_state = target_policy.state_dict()
 
-    # Path 1: classes agree (or source is legacy/unrecorded). Try direct load.
     if src_class in ("<unknown>", target_class):
         target_policy.load_state_dict(state, strict=strict)
         return {
@@ -158,7 +136,6 @@ def load_state_dict_into(
             "msg": f"loaded {src_class} → {target_class} weights directly",
         }
 
-    # Path 2: Gaussian → Deterministic — slice the mu head out.
     if src_class == "GaussianPolicy" and target_class == "DeterministicPolicy":
         remapped: dict[str, torch.Tensor] = {}
         skipped: list[str] = []
@@ -170,34 +147,25 @@ def load_state_dict_into(
             if v.shape == tshape:
                 remapped[k] = v
             elif v.ndim >= 1 and v.shape[0] == 2 * tshape[0] and v.shape[1:] == tshape[1:]:
-                # Final-layer head: take the mu rows (first half).
+                # Head: keep the mu rows (first half).
                 remapped[k] = v[: tshape[0]].clone()
             else:
                 raise RuntimeError(
                     f"can't convert Gaussian → Deterministic for {k}: "
                     f"source shape {tuple(v.shape)} vs target {tuple(tshape)}"
                 )
-        # strict=True so any missing target key (i.e. a layer the source
-        # didn't have) raises rather than silently leaving it at random init.
         target_policy.load_state_dict(remapped, strict=True)
-        msg = (
-            f"converted GaussianPolicy → DeterministicPolicy: "
-            f"kept mu head, dropped log_sigma head"
-        )
+        msg = "converted GaussianPolicy → DeterministicPolicy (dropped log_sigma)"
         if skipped:
-            msg += f" (ignored {len(skipped)} extra source keys: {skipped[:3]}...)"
+            msg += f" (ignored {len(skipped)} extra keys: {skipped[:3]}...)"
         return {"converted": True, "src_class": src_class, "msg": msg}
 
-    # Path 3: Deterministic → Gaussian — refuse, advise the user.
     if src_class == "DeterministicPolicy" and target_class == "GaussianPolicy":
         raise RuntimeError(
-            "cannot warm-start GaussianPolicy from a DeterministicPolicy "
-            "checkpoint — the log_sigma head doesn't exist in the source. "
-            "Either drop --gaussian (use a Deterministic GPS student), or "
-            "retrain the BC pretrain with --deterministic=False."
+            "cannot warm-start GaussianPolicy from DeterministicPolicy: "
+            "no log_sigma weights in the source."
         )
 
-    # Catch-all for unexpected combos.
     raise RuntimeError(
         f"unsupported policy class transition: {src_class} → {target_class}"
     )

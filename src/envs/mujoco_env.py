@@ -1,34 +1,31 @@
-"""mujoco env with batched rollouts using mujoco.rollout."""
+"""MuJoCo env with batched rollouts via ``mujoco.rollout`` (CPU thread pool)."""
 
 import os
-import numpy as np 
-import mujoco 
+import numpy as np
+import mujoco
 from jaxtyping import Array, Float
-from mujoco import rollout 
+from mujoco import rollout
 
 from src.envs.base import BaseEnv
+
 
 class MuJoCoEnv(BaseEnv):
     def __init__(self, model_path: str, nthread: int | None = None, frame_skip: int = 1):
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
 
-        # adding frame skip 
         self._frame_skip = frame_skip
         self._dt = self.model.opt.timestep * frame_skip
 
-        # state size for full physics state (qpos, qvel, actions, etc)
         self._nstate = mujoco.mj_stateSize(
             self.model, mujoco.mjtState.mjSTATE_FULLPHYSICS
         )
 
-        # thread pool for the batched rollouts 
         self._nthread = nthread or os.cpu_count()
         self._data_pool = [
             mujoco.MjData(self.model) for _ in range(self._nthread)
         ]
-
-        self._rollout_ctx = rollout.Rollout(nthread = self._nthread)
+        self._rollout_ctx = rollout.Rollout(nthread=self._nthread)
 
     def reset(self, state: np.ndarray | None = None) -> np.ndarray:
         mujoco.mj_resetData(self.model, self.data)
@@ -78,33 +75,27 @@ class MuJoCoEnv(BaseEnv):
         return states[..., start:end]
 
     def batch_rollout(
-            self, 
-            initial_state: np.ndarray, 
-            action_sequences: np.ndarray, 
+            self,
+            initial_state: np.ndarray,
+            action_sequences: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        K, H, _ = action_sequences.shape 
-        
-        # repeat each action for frame_skip physics steps 
-        actions_expanded = np.repeat(action_sequences, self._frame_skip, axis = 1) 
-        states_full, sensordata_full = self._rollout_ctx.rollout(
-            self.model,
-            self._data_pool,
-            initial_state,
-            actions_expanded
-        )
+        K, H, _ = action_sequences.shape
 
-        # downsample states: take every frame_skip-th frame
+        # Repeat each action for frame_skip physics steps; downsample after.
+        actions_expanded = np.repeat(action_sequences, self._frame_skip, axis=1)
+        states_full, sensordata_full = self._rollout_ctx.rollout(
+            self.model, self._data_pool, initial_state, actions_expanded,
+        )
         states = states_full[:, ::self._frame_skip, :]
         sensordata = sensordata_full[:, ::self._frame_skip, :]
 
-        c = self.running_cost(states, action_sequences, sensordata) # (K, H)
-        tc = self.terminal_cost(states[:, -1, :], sensordata[:, -1, :]) # (K, )
-        costs = c.sum(axis = 1) + tc
+        c = self.running_cost(states, action_sequences, sensordata)         # (K, H)
+        tc = self.terminal_cost(states[:, -1, :], sensordata[:, -1, :])      # (K,)
+        costs = c.sum(axis=1) + tc
         return states, costs, sensordata
-    
 
     def _get_obs(self) -> np.ndarray:
-        """ can be overrided in the sub class if you need to change the obs space"""
+        """Override in subclasses that have a reduced obs space."""
         return self.get_state()
 
     def state_to_obs(
@@ -112,11 +103,7 @@ class MuJoCoEnv(BaseEnv):
         states: np.ndarray,
         sensordata: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Default: return full state. Override in subclasses that have reduced obs.
-
-        ``sensordata`` is accepted for signature compatibility with envs
-        that need it (see ``BaseEnv.state_to_obs``); ignored here.
-        """
+        """Default: return full state. ``sensordata`` accepted for signature."""
         return states
 
     @property

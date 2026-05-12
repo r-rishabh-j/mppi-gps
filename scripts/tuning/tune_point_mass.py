@@ -1,17 +1,4 @@
-"""Optuna-based hyperparameter tuning for MPPI on the PointMass environment.
-
-Searches over noise_sigma and lambda (temperature) while keeping K and H
-fixed. Uses median pruning to early-stop unpromising trials. The
-objective is the mean total cost across N_SEEDS episodes — each episode
-samples a fresh random goal (see `PointMass._sample_goal`), so the tuned
-hyperparameters are robust across the whole goal sampling box rather
-than overfit to a single (0, 0) target.
-
-Usage:
-    python scripts/tuning/tune_point_mass.py
-
-Best parameters are saved to configs/point_mass_best.json.
-"""
+"""Optuna tuning for MPPI on PointMass; writes point_mass_best.json."""
 
 import json
 from pathlib import Path
@@ -28,21 +15,16 @@ BEST_PARAMS_PATH = Path(__file__).resolve().parents[2] / "configs" / "point_mass
 
 
 class FixedConfig(NamedTuple):
-    """Non-tuned parameters that stay fixed across all trials."""
-    n_startup_trials: int = 5    # random trials before GP kicks in
-    EVAL_STEPS: int = 300        # steps per evaluation episode (env dt=0.02 → 6s)
-    N_SEEDS: int = 10            # episodes per trial (random goal each), averaged
-    K: int = 256                 # MPPI sample count (fixed — not tuned)
-    H: int = 64                  # planning horizon (fixed — not tuned)
+    """Non-tuned constants."""
+    n_startup_trials: int = 5
+    EVAL_STEPS: int = 300
+    N_SEEDS: int = 10
+    K: int = 256
+    H: int = 64
 
 
 def objective(trial: optuna.Trial, config: FixedConfig) -> float:
-    """Optuna objective: mean cost across N_SEEDS episodes.
-
-    Tuned parameters:
-      - noise_sigma: exploration noise std in [0.05, 1.5] (log scale)
-      - lam:         MPPI temperature in [0.001, 1.0] (log scale)
-    """
+    """Mean cost across N_SEEDS episodes (tuning noise_sigma + lam)."""
     noise_sigma = trial.suggest_float("noise_sigma", 0.05, 1.5, log=True)
     lam = trial.suggest_float("lam", 0.001, 1.0, log=True)
 

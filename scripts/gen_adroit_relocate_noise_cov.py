@@ -1,41 +1,12 @@
 """Generate a hand-synergy correlated noise covariance for adroit_relocate.
 
-Encodes three priors that pure per-dim independent noise rarely samples:
+Off-diagonals encode two priors:
+  - hand synergy: positive correlation between every finger joint pair;
+  - lift coupling: positive correlation between arm-z and each finger.
+Per-dim marginal std stays ``noise_sigma · env.noise_scale``, so setting
+both correlations to 0 recovers the diagonal default exactly.
 
-1. **Hand synergy** — the 22 finger joints (idx 8-29) are positively
-   correlated (default rho = 0.40 between any pair). A single MPPI noise
-   sample tends to open or close all fingers together — power-grasp
-   inductive bias. Without this, MPPI would need O(2^22) samples to
-   stumble into "all fingers closed at the same moment".
-
-2. **Lift coupling** — arm-z (idx 2, A_ARTz, the slide that drives the
-   hand up/down) is positively correlated (default rho = 0.25) with
-   every finger joint. Single sample tends to explore "lift hand + grip
-   tighter" or "lower hand + open grip" together — the two coordination
-   modes critical to the lift transition. Adroit's "stops moving after
-   grasp" failure mode partly comes from arm-z and fingers being
-   sampled independently, so the joint "lift now while keeping grip"
-   trajectory is rarely synthesised.
-
-3. **Everything else independent** — arm rotation (3-5), wrist (6-7),
-   arm xy (0-1) stay diagonal. These dims genuinely need independent
-   exploration; baking in correlation here would constrain MPPI for no
-   good reason.
-
-Per-dim marginal std stays identical to the diagonal baseline:
-``sigma_per_dim = noise_sigma * env.noise_scale``. Only the joint
-(off-diagonal) distribution changes, so the cov-matrix path is a
-strict superset of the diagonal default — turning correlations to 0
-recovers the legacy behaviour exactly.
-
-Output: ``configs/adroit_relocate_correlated.json`` by default. Pass
-``--out`` to overwrite ``adroit_relocate_best.json`` instead.
-
-Examples:
-    python -m scripts.gen_adroit_relocate_noise_cov            # default rhos
-    python -m scripts.gen_adroit_relocate_noise_cov --hand-synergy 0.5 \\
-        --lift-coupling 0.3 --noise-sigma 0.2
-    python -m scripts.gen_adroit_relocate_noise_cov --out configs/adroit_relocate_best.json
+Default output: ``configs/adroit_relocate_correlated.json``.
 """
 from __future__ import annotations
 
@@ -51,39 +22,22 @@ from src.envs import make_env
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_OUT = _REPO_ROOT / "configs" / "adroit_relocate_correlated.json"
 
-# Adroit relocate actuator layout (from env.model.actuator_name):
-#   0-2  : A_ARTx, A_ARTy, A_ARTz   — arm slides
-#   3-5  : A_ARRx, A_ARRy, A_ARRz   — arm rotation
-#   6-7  : A_WRJ1, A_WRJ0           — wrist
-#   8-11 : A_FFJ3..FFJ0             — forefinger (knuckle, prox, mid, dist)
-#   12-15: A_MFJ3..MFJ0             — middle finger
-#   16-19: A_RFJ3..RFJ0             — ring finger
-#   20-24: A_LFJ4..LFJ0             — little finger (5 joints incl metacarpal)
-#   25-29: A_THJ4..THJ0             — thumb
+# Adroit actuator layout: 0-2 arm slides, 3-5 arm rot, 6-7 wrist,
+# 8-11 ff, 12-15 mf, 16-19 rf, 20-24 lf, 25-29 th.
 ARM_Z_IDX = 2
-FINGER_IDX = list(range(8, 30))   # all 22 finger joints
+FINGER_IDX = list(range(8, 30))
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--out", default=str(_DEFAULT_OUT),
-                   help="output config path (default: "
-                        "configs/adroit_relocate_correlated.json). "
-                        "Pass configs/adroit_relocate_best.json to overwrite "
-                        "the env's default config.")
+                   help="output config path.")
     p.add_argument("--noise-sigma", type=float, default=0.25,
-                   help="scalar multiplier on env.noise_scale for the per-dim "
-                        "marginal std (matches the diagonal-config field of the "
-                        "same name). Default 0.25 — same as adroit_relocate_best.json.")
+                   help="Scalar multiplier on env.noise_scale per dim.")
     p.add_argument("--hand-synergy", type=float, default=0.40,
-                   help="Pairwise correlation between any two finger joints "
-                        "(idx 8-29). 0.0 = independent (diagonal). 0.7 = "
-                        "strong synergy (loses ~half of independent exploration). "
-                        "Default 0.40.")
+                   help="Pairwise rho between finger joints (8-29).")
     p.add_argument("--lift-coupling", type=float, default=0.25,
-                   help="Pairwise correlation between arm-z (idx 2) and each "
-                        "finger joint. Encodes the 'lift+grip together' bias. "
-                        "0.0 = independent. Default 0.25.")
+                   help="Rho between arm-z (idx 2) and each finger joint.")
     p.add_argument("--K", type=int, default=1024)
     p.add_argument("--H", type=int, default=32)
     p.add_argument("--lam", type=float, default=0.08)
@@ -98,17 +52,12 @@ def build_correlation(
     hand_synergy: float,
     lift_coupling: float,
 ) -> np.ndarray:
-    """Build the (nu, nu) correlation matrix C with C[i, i] = 1, off-diagonal
-    entries set per the design above. Caller is responsible for combining
-    with per-dim std to get covariance.
-    """
+    """Correlation matrix; combine with per-dim std for covariance."""
     C = np.eye(nu)
-    # Hand synergy: every pair of finger joints
     for i in FINGER_IDX:
         for j in FINGER_IDX:
             if i != j:
                 C[i, j] = hand_synergy
-    # Lift coupling: arm-z paired with each finger joint
     for f in FINGER_IDX:
         C[ARM_Z_IDX, f] = lift_coupling
         C[f, ARM_Z_IDX] = lift_coupling

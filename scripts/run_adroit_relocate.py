@@ -16,22 +16,15 @@ from src.utils.seeding import add_seed_arg, seed_everything
 
 T = 150
 
-# Cameras to tile in the recorded video (2x2 grid). Order = top-left,
-# top-right, bottom-left, bottom-right.
+# 2×2 video tile (TL, TR, BL, BR); final frame (2·H, 2·W, 3).
 _CAMERAS = ("vil_camera", "cam_iso", "cam_side", "cam_top")
-# Per-camera tile size. Final frame is (2 * _TILE_H, 2 * _TILE_W, 3).
 _TILE_H, _TILE_W = 240, 320
 
 _OUTPUT_VIDEO = "adroit_relocate_mppi.mp4"
 
 
 def resolve_camera_ids(model: mujoco.MjModel) -> list[int]:
-    """Look up each camera by name; assert all resolve.
-
-    Passing string names per-frame to ``update_scene`` was occasionally
-    falling through silently (all four tiles ending up identical).
-    Resolving once and passing int IDs makes that failure mode loud.
-    """
+    """Resolve camera IDs once; passing names per-frame can silently fail."""
     ids = []
     for name in _CAMERAS:
         cid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, name)
@@ -49,7 +42,7 @@ def render_tiled(
     data: mujoco.MjData,
     camera_ids: list[int],
 ) -> np.ndarray:
-    """Render every camera in _CAMERAS and stitch into a 2x2 grid."""
+    """Render each ``_CAMERAS`` view; stitch into a 2×2 grid."""
     imgs = []
     for cid in camera_ids:
         renderer.update_scene(data, camera=cid)
@@ -64,17 +57,13 @@ def main():
     parser.add_argument("--live", action="store_true",
                         help="interactive viewer instead of recording")
     parser.add_argument("--warp", action="store_true",
-                        help="Use mujoco_warp GPU batch rollout for MPPI. "
-                             "Requires `uv pip install warp-lang mujoco-warp` "
-                             "and an NVIDIA GPU with CUDA (graph replay is "
-                             "the speedup; macOS / non-CUDA hosts should "
-                             "stick with the CPU path).")
+                        help="Use mujoco_warp GPU rollout (CUDA only).")
     add_seed_arg(parser, default=400)
     add_policy_prior_args(parser)
     args = parser.parse_args()
     seed_everything(args.seed)
 
-    # MPPI cfg first — `nworld` for the warp env must match `cfg.K`.
+    # MPPI cfg first — warp env nworld must match cfg.K.
     cfg = MPPIConfig.load("adroit_relocate")
     if args.warp:
         from src.envs.adroit_relocate_warp import AdroitRelocateWarp
@@ -94,7 +83,6 @@ def main():
     if args.live:
         viewer = mujoco.viewer.launch_passive(env.model, env.data)
     else:
-        # One renderer reused across cameras; size matches a single tile.
         renderer = mujoco.Renderer(env.model, height=_TILE_H, width=_TILE_W)
         camera_ids = resolve_camera_ids(env.model)
         print(f"recording cameras {list(zip(_CAMERAS, camera_ids))} -> "
@@ -129,8 +117,7 @@ def main():
     elif frames:
         import mediapy
         out_path = os.path.abspath(_OUTPUT_VIDEO)
-        # Overwrite any stale file rather than letting the OS / player
-        # cache trick the user into thinking nothing changed.
+        # Overwrite stale file (avoid OS/player cache confusion).
         if os.path.exists(out_path):
             os.remove(out_path)
         print(f"writing {len(frames)} frames of shape {frames[0].shape} -> {out_path}")

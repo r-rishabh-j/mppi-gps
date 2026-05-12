@@ -1,4 +1,4 @@
-"""acrobot swing up env"""
+"""Acrobot swing-up env."""
 
 import mujoco
 import numpy as np
@@ -41,22 +41,9 @@ class Acrobot(MuJoCoEnv):
             sensordata: Float[Array, "K H nsensor"] | None = None,
     ) -> Float[Array, "K H"]:
         tip_pos = sensordata[:, :, :3]
-        target_radius = 0.20 # hardset based on xml
         dist = np.linalg.norm(tip_pos - _TARGET, axis=-1)
-        margin = 4.0 # where the decay hits a specific value
-        # adding a gaussian tolerance 
-        # _value_at_margin = 0.1 
-        # scale = np.sqrt(-2.0 * np.log(_value_at_margin)) # how steep do you want the decay to be
-        # d_beyond = np.maximum(dist - target_radius, 0.0)
-        # reward = np.where(
-        #     dist <= target_radius, 
-        #     1.0, 
-        #     np.exp(-0.5 * (d_beyond * scale / margin) ** 2), 
-        # )
-        # gaussian_cost = 1.0 - reward
-        # tip_z = sensordata[:, :, 2] 
-
-        return (dist / margin) + 2 *(4 - np.linalg.norm(sensordata, axis=2))
+        margin = 4.0
+        return (dist / margin) + 2 * (4 - np.linalg.norm(sensordata, axis=2))
 
     def terminal_cost(
             self,
@@ -77,21 +64,11 @@ class Acrobot(MuJoCoEnv):
         states: np.ndarray,
         sensordata: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Mirrors ``_get_obs`` but works on (..., nstate) arrays from
-        ``batch_rollout``. The default implementation returns the full
-        nstate vector (which includes the leading time dim → 5-D), so
-        without this override the policy normalizer expects a 5-D obs but
-        ``_get_obs`` produces 4-D (qpos+qvel only) — the source of the
-        "size of tensor a (4) must match the size of tensor b (5)" error.
-        """
+        """[qpos, qvel] (4-D) — mirrors ``_get_obs`` on batched states."""
         qpos = self.state_qpos(states)
         qvel = self.state_qvel(states)
         return np.concatenate([qpos, qvel], axis=-1)
 
     @property
     def obs_dim(self) -> int:
-        # qpos (2) + qvel (2) = 4. Without this override, the inherited
-        # MuJoCoEnv.obs_dim returns _nstate=5 (time + qpos + qvel) and
-        # the policy's input layer is sized wrong for what _get_obs
-        # actually produces.
         return self._nq + self._nv

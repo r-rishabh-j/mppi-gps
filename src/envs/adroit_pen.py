@@ -1,29 +1,13 @@
-"""Adroit Pen reorientation task — vendored from gymnasium-robotics.
+"""Adroit Pen reorientation (24-DoF Shadow Hand, gymnasium-robotics).
 
-24-DoF Shadow Hand reposing a free pen to match a randomly-sampled target
-orientation. The dense reward of the upstream gymnasium-robotics env
-(``AdroitHandPen-v1``) is mirrored here, negated to act as an MPPI cost.
+Reposes a free pen to a randomly-sampled target orientation. The
+upstream ``AdroitHandPen-v1`` dense reward is mirrored here, negated for
+MPPI. nq=nv=30 (24 hand + 6 pen joints); 42-D obs.
 
-State / observation layout
---------------------------
-* ``model.nq = model.nv = 30`` — 24 hand joints + 6 pen joints
-  (3 slide ``OBJTx/OBJTy/OBJTz`` + 3 hinge ``OBJRx/OBJRy/OBJRz``).
-* Policy obs is 42-D, derivable from ``(qpos, qvel)`` plus the per-episode
-  target attributes — so the same composition works in ``_get_obs`` (live)
-  and ``state_to_obs`` (batched, called by GPS/DAgger relabel).
-* Pen orientation is intentionally NOT included in obs as a unit vector
-  (which would need ``mj_forward`` per state). Instead we pass the three
-  pen rotation joint angles ``qpos[27:30]`` plus the target Euler angles —
-  fully sufficient for the policy and free to compute.
-
-Cost
-----
-``running_cost`` is a verbatim translation of the upstream dense reward
-(``-goal_dist + orien_sim`` with milestone bonuses and a drop penalty),
-negated so MPPI minimises. Orientation is computed from the
-``object_top_pos`` / ``object_bottom_pos`` ``framepos`` sensors added to
-``assets/adroit_pen/adroit_pen.xml``; the pen's world position is the
-midpoint of those two sites (verified to equal ``data.xpos[Object]``).
+Pen position/orientation come from the ``object_top_pos`` /
+``object_bottom_pos`` framepos sensors (added in
+``assets/adroit/pen.xml``); position is their midpoint, orientation is
+``(top - bot) / pen_length``.
 """
 
 from pathlib import Path
@@ -36,11 +20,9 @@ from src.envs.mujoco_env import MuJoCoEnv
 
 _XML = str(Path(__file__).resolve().parents[2] / "assets" / "adroit" / "pen.xml")
 
-# Fixed target position (the eps_ball site). Target orientation is sampled
-# at every reset; only the position is constant.
+# Fixed target position (eps_ball site). Orientation is resampled per reset.
 _DESIRED_LOC = np.array([0.0, -0.2, 0.25])
-# Pen body's initial world position from the XML (used only to express
-# the policy's position-error obs without needing a forward pass).
+# Pen body's XML initial world position (for obs without mj_forward).
 _OBJ_BODY_INIT_POS = np.array([0.0, -0.2, 0.25])
 
 _DROP_THRESHOLD_Z = 0.075
@@ -61,8 +43,6 @@ class AdroitPen(MuJoCoEnv):
         super().__init__(model_path=_XML, frame_skip=frame_skip, **kwargs)
         assert self.model.nq == 30 and self.model.nv == 30 and self.model.nu == 24
 
-        # Sensor offsets — set once at construction, used in both step and
-        # batched cost paths.
         self._top_slice = self._sensor_slice("object_top_pos")
         self._bot_slice = self._sensor_slice("object_bottom_pos")
 
@@ -82,11 +62,10 @@ class AdroitPen(MuJoCoEnv):
             self.model, mujoco.mjtObj.mjOBJ_SITE, "object_bottom"
         )
 
-        # Initial target orientation (identity quat) — overwritten on reset.
+        # Overwritten on every reset.
         self._desired_orien_euler = np.zeros(3, dtype=np.float64)
         self._desired_orien = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        # Pen length used for normalising orientation vectors; matches the
-        # upstream env which recomputes from sites at each reset.
+        # Pen length, used to normalise orientation vectors.
         mujoco.mj_forward(self.model, self.data)
         self._pen_length = float(np.linalg.norm(
             self.data.site_xpos[self._obj_top_id]
@@ -99,18 +78,13 @@ class AdroitPen(MuJoCoEnv):
         dim = int(self.model.sensor_dim[sid])
         return slice(adr, adr + dim)
 
-    # ------------------------------------------------------------------
-    # Reset / step
-    # ------------------------------------------------------------------
-
     def reset(self, state: np.ndarray | None = None) -> np.ndarray:
         if state is not None:
-            # Deterministic restore (used by GPS to replay initial conditions).
             return super().reset(state=state)
 
         mujoco.mj_resetData(self.model, self.data)
 
-        # Sample a target orientation: roll, pitch ~ U(-1, 1), yaw = 0.
+        # Sample target orientation: roll, pitch ~ U(-1, 1), yaw = 0.
         self._desired_orien_euler = np.array(
             [np.random.uniform(-1, 1), np.random.uniform(-1, 1), 0.0]
         )
@@ -119,27 +93,20 @@ class AdroitPen(MuJoCoEnv):
         )
         mujoco.mj_forward(self.model, self.data)
 
-        # Capture the realised target orientation vector (top - bottom)/length.
         tar_top = self.data.site_xpos[self._tar_top_id].copy()
         tar_bot = self.data.site_xpos[self._tar_bot_id].copy()
         tar_len = float(np.linalg.norm(tar_top - tar_bot))
         self._desired_orien = (tar_top - tar_bot) / tar_len
         return self._get_obs()
 
-    # ------------------------------------------------------------------
-    # Cost
-    # ------------------------------------------------------------------
-
     def _running_reward_terms(
         self,
         sensordata: Float[Array, "... nsensor"],
     ) -> tuple[Float[Array, "..."], Float[Array, "..."], Float[Array, "..."]]:
-        """Return (goal_distance, orien_similarity, obj_pos_z) over arbitrary
-        leading dims. Used by both the vectorised MPPI cost and the live
-        ``step`` cost via the same sensordata layout."""
+        """Return (goal_distance, orien_similarity, obj_pos_z)."""
         top = sensordata[..., self._top_slice]
         bot = sensordata[..., self._bot_slice]
-        obj_pos = (top + bot) * 0.5                       # midpoint == xpos[Object]
+        obj_pos = (top + bot) * 0.5
         obj_orien = (top - bot) / self._pen_length
 
         goal_distance = np.linalg.norm(obj_pos - _DESIRED_LOC, axis=-1)
@@ -152,17 +119,12 @@ class AdroitPen(MuJoCoEnv):
         actions: Float[Array, "K H nu"],
         sensordata: Float[Array, "K H nsensor"] | None = None,
     ) -> Float[Array, "K H"]:
-        """Verbatim translation of the upstream dense reward, negated.
+        """Negated upstream dense reward.
 
-        ``reward = -goal_distance + orien_similarity
-                   + 10 * 1[goal<0.075 ∧ orien>0.9]
-                   + 50 * 1[goal<0.075 ∧ orien>0.95]
-                   - 5  * 1[obj_z<0.075]``
-
-        Cost is ``-reward``. The bonus/drop terms are bounded indicators —
-        they don't break MPPI's importance weighting because the smooth
-        ``-goal_dist + orien_sim`` term provides the gradient that
-        importance-weighting actually rides.
+        reward = -goal_dist + orien_sim
+                 + 10·1[goal<0.075 ∧ orien>0.9]
+                 + 50·1[goal<0.075 ∧ orien>0.95]
+                 -  5·1[obj_z<0.075]
         """
         if sensordata is None:
             raise ValueError(
@@ -186,13 +148,11 @@ class AdroitPen(MuJoCoEnv):
         states: Float[Array, "K nstate"],
         sensordata: Float[Array, "K nsensor"] | None = None,
     ) -> Float[Array, "K"]:
-        # Dense running cost already drives behaviour; no extra terminal term.
         return np.zeros(states.shape[0])
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
-        """Single env step. Terminates on success (matches upstream)."""
+        """Step; terminates on success (matches upstream)."""
         obs, cost, _, info = super().step(action)
-        # Sensordata is the latest after the frame_skip loop in MuJoCoEnv.step.
         sd = self.data.sensordata
         goal_distance, orien_similarity, _ = self._running_reward_terms(sd)
         success = bool(
@@ -202,34 +162,23 @@ class AdroitPen(MuJoCoEnv):
         info["success"] = success
         return obs, cost, success, info
 
-    # ------------------------------------------------------------------
-    # Observations
-    # ------------------------------------------------------------------
-
     def _build_obs(
         self,
         qpos: np.ndarray,
         qvel: np.ndarray,
     ) -> np.ndarray:
-        """42-D obs from qpos/qvel + per-episode target attrs.
+        """42-D obs.
 
-        Layout (last axis):
-          [0:24)   hand joint qpos
-          [24:27)  pen world position (init body pos + slide qpos)
-                   NOTE: this is exact only when the pen's body initial
-                   euler matches the XML default — it does, see XML.
-                   The slide joints are in body frame; we transform them
-                   by the body's initial rotation to get world coords.
-          [27:33)  pen lin+ang vel (qvel[24:30])
-          [33:36)  pen rotation joint angles (qpos[27:30])
-          [36:39)  pen position - desired_loc
-          [39:42)  desired target orientation Euler (constant per episode)
+        [0:24)  hand qpos
+        [24:27) pen world pos = init_body_pos + R_body·slide_qpos
+        [27:33) pen lin+ang vel (qvel[24:30])
+        [33:36) pen rotation angles (qpos[27:30])
+        [36:39) pen pos - desired_loc
+        [39:42) desired orientation Euler
+
+        Pen body has XML euler="0 1.57 0" (R_y(π/2)), so body slide
+        (sx, sy, sz) maps to world (sz, sy, -sx).
         """
-        # The body frame is rotated by euler="0 1.57 0" (R_y(π/2)) so
-        # body axes (x, y, z) map to world (-z, y, x). The slide joints
-        # OBJTx/OBJTy/OBJTz are along body axes, so:
-        #   pen_world = body_init_pos + R_body @ slide_qpos
-        # with R_body @ (sx, sy, sz) = (sz, sy, -sx).
         slide = qpos[..., 24:27]
         rot_offset = np.stack(
             [slide[..., 2], slide[..., 1], -slide[..., 0]],
@@ -263,15 +212,10 @@ class AdroitPen(MuJoCoEnv):
 
     @property
     def obs_dim(self) -> int:
-        # 24 + 3 + 6 + 3 + 3 + 3 = 42
         return 42
 
     @property
     def noise_scale(self) -> np.ndarray:
-        """Per-dim half-range so cfg.noise_sigma reads as a fraction of each
-        actuator's range. The Adroit hand has heterogeneous ctrlranges
-        (wrist 0.7 vs finger flexion 1.6 vs thumb 2.0); a single scalar
-        sigma over-explores some dims and under-explores others.
-        """
+        """Per-dim half-range — actuator ctrlranges are heterogeneous."""
         low, high = self.action_bounds
         return 0.5 * (high - low)

@@ -1,18 +1,4 @@
-"""Plot GPS training curves, ablation results, and baseline comparisons.
-
-This script reads JSON output from run_gps.py and run_ablations.py and
-generates publication-ready PNG plots.  It expects the following file layout:
-
-    checkpoints/gps_<env>_curves.json    ← from run_gps.py
-    results/ablations/<env>_ablations.json ← from run_ablations.py
-    checkpoints/sb3/<algo>_<env>_results.json ← from run_sb3_baseline.py
-
-Usage:
-    python scripts/visualisation/plot_results.py --env acrobot
-    python scripts/visualisation/plot_results.py --env hopper --results-dir results/ablations
-
-Plots are saved to results/plots/.
-"""
+"""Plot GPS training curves, ablations, and SB3 baseline comparisons."""
 
 import argparse
 import json
@@ -27,8 +13,7 @@ def plot_training_curves(curves_path: Path, save_dir: Path):
     env_name = curves_path.stem.replace("gps_", "").replace("_curves", "")
 
     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    # Accept both the new ("mppi_costs") and legacy ("costs") schema for
-    # back-compat with old curves.json files.
+    # Accept legacy "costs" key.
     cost_key = "mppi_costs" if "mppi_costs" in data else "costs"
     ax.plot(data[cost_key])
     ax.set_xlabel("GPS iteration")

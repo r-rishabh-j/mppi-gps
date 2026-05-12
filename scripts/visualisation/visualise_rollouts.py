@@ -1,8 +1,4 @@
-"""Visualize MPPI rollout trajectories in the MuJoCo renderer.
-
-At each planning step, the K sampled rollouts are drawn as line segments
-in the 3D scene so you can see where the controller is exploring.
-"""
+"""Visualise the K sampled MPPI rollouts as line segments in the scene."""
 
 import cv2
 import mujoco
@@ -28,17 +24,7 @@ def cost_to_rgba(cost, cost_min, cost_max, alpha=0.4):
 
 def add_rollout_lines(scene, tip_positions, costs,
                       max_rollouts=30, step_skip=4):
-    """Draw rollout trajectories as line segments in the MuJoCo scene.
-
-    Lines are colored green (low cost) to red (high cost).
-
-    Args:
-        scene: MjvScene to add geoms to
-        tip_positions: (K, H, 3) array of 3D positions along each rollout
-        costs: (K,) total cost per rollout
-        max_rollouts: max number of rollouts to draw (subsampled randomly)
-        step_skip: draw every Nth horizon step to reduce geom count
-    """
+    """Draw up to ``max_rollouts`` trajectories as line segments (cost-coloured)."""
     K, H, _ = tip_positions.shape
 
     # subsample rollouts if needed

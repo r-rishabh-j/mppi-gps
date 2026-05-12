@@ -1,22 +1,8 @@
 """MPPI-GPS for DeterministicPolicy.
 
-Variant of ``mppi_gps_clip.py`` for a non-stochastic student policy.
-
-* Policy prior is a quadratic distance to the policy mean::
-
-      prior(states, actions) = alpha * sum_t || a_t - pi(obs_t) ||^2          (K,)
-
-  Non-negative, in env-cost units. MPPI adds it to S_k directly
-  (``S = costs + is_corr + prior``); higher alpha pulls samples toward the
-  current policy.
-
-* Distillation is always MSE on (obs, action_label) pairs aggregated
-  across conditions / sub-episodes / (optionally) the cross-iter buffer.
-
-* Stabilisers retained: Adam reset, replay buffer (``distill_buffer_cap``),
-  DAgger-style relabel (gated on ``alpha > 0``), warm-start MPPI from the
-  current policy, auto-reset on termination, gradient-norm clipping inside
-  the policy's mse_step.
+Prior: ``α · Σ_t ‖a_t − π(o_t)‖²`` (quadratic distance to policy mean).
+Distill: MSE. Same stabilisers as ``mppi_gps_clip``: Adam reset, replay
+buffer, DAgger relabel, warm-start, auto-reset, grad-norm clip.
 """
 
 from __future__ import annotations
@@ -46,27 +32,12 @@ def make_policy_prior(
     env: BaseEnv,
     alpha: float,
 ) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
-    """Build a per-sample cost callable for ``MPPI.plan_step``.
+    """``prior(s, a) = α · Σ_t ‖(a_t − π(o_t)) / scale‖²`` → (K,).
 
-    Given (states, actions) of shapes ``(K, H, state_dim)`` and
-    ``(K, H, act_dim)``, returns::
-
-        C_k = alpha * sum_t || a_{k,t} - pi(obs(s_{k,t})) ||^2          (K,)
-
-    Non-negative; in the same units as env cost. MPPI adds this to ``S_k``
-    inside the softmin, so larger residuals → higher cost → lower weight,
-    which biases the samples toward the policy mean.
-
-    The policy's ``forward`` is called inside ``torch.no_grad()`` and the
-    caller is responsible for ensuring the policy is in ``eval()`` mode
-    (Dropout / LayerNorm in ``DeterministicPolicy`` would otherwise inject
-    noise into the cost).
+    Non-negative, in env-cost units; MPPI adds it to S_k. Caller must
+    set the policy to ``eval()`` (no Dropout in the prior).
     """
     device = policy._device
-    # Per-dim weighting — see `make_mean_distance_prior` in
-    # `mppi_gps_unified.py` for the full rationale. Equalizes per-dim
-    # residual contribution by 1 / (per-dim half-range). No-op for envs
-    # whose `noise_scale` defaults to ones.
     inv_scale = 1.0 / np.asarray(env.noise_scale, dtype=np.float64)
 
     def prior_cost(
@@ -142,12 +113,8 @@ class MPPIGPSDet:
         )
 
         self.mppi = MPPI(env, mppi_cfg)
-
-        # Cross-iteration episode replay buffer (rows-capped, FIFO whole
-        # episodes). Empty when distill_buffer_cap == 0.
+        # Cross-iter replay (FIFO row-capped). Empty when cap == 0.
         self._episode_buffer: list[dict] = []
-
-    # ----- helpers ---------------------------------------------------------
 
     def _sample_initial_conditions(self, n: int) -> list[np.ndarray]:
         conditions = []
@@ -162,23 +129,7 @@ class MPPIGPSDet:
         actions: np.ndarray,
         weights: np.ndarray,  # accepted for parity; unused in MSE path
     ) -> float:
-        """MSE distillation with gradient-norm clipping.
-
-        ``weights`` is currently uniform across rows (set to ones in the
-        C-step) and the deterministic policy has no weighted loss, so we
-        ignore it. Kept in the signature so the buffer flatten path doesn't
-        need a special case.
-
-        When ``cfg.grad_clip_norm > 0``, the per-batch parameter gradient
-        is L2-norm-clipped to that bound inside ``DeterministicPolicy.
-        mse_step`` (between backward and the Adam step). Bounds per-update
-        parameter movement directly — loss-agnostic, dimension-aware, no
-        biased estimator. Replaces the earlier action-target clip
-        (``cfg.clip_eps``), which censored noisy labels and created a
-        biased fixed point at ``pi_old(o) ± clip_eps``.
-
-        ``cfg.grad_clip_norm == 0`` falls through to plain ``mse_step``.
-        """
+        """MSE distill, optional L2 grad-norm clip via ``cfg.grad_clip_norm``."""
         del weights
         cfg = self.gps_cfg
         N = len(obs)

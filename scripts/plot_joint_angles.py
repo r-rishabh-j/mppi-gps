@@ -1,29 +1,4 @@
-"""Side-by-side joint-angle trajectory plot — MPPI vs trained policy.
-
-Reproduces the figure-3 style comparison from the GPS paper: roll out
-MPPI on the left, the trained policy on the right, both from the SAME
-initial state, and overlay every joint's angle as a function of time.
-The visual story is "MPC is jittery, the distilled policy is cyclic"
-(or whatever the analogous claim is for your env).
-
-Usage:
-    # Use the run dir's best.pt vs MPPI from configs/<env>_best.json
-    python -m scripts.plot_joint_angles --run-dir PAPER/hopper/gps-combined
-
-    # Specific checkpoint, longer rollout, custom joint subset
-    python -m scripts.plot_joint_angles --run-dir PAPER/hopper/gps-combined \
-        --ckpt iter_024.pt --steps 300 --joints 3,4,5 --seed 42
-
-What's plotted:
-    Two subplots sharing y-axis. X = env step, Y = qpos value. One
-    coloured line per joint index; the legend lists joint names from
-    the MuJoCo model when available, else `q[i]`.
-
-Joint selection:
-    Default = all `nq` joints. Pass `--joints 3,4,5` to restrict (useful
-    for hopper, where qpos[0..2] are the floating base — slide_x, slide_z,
-    hinge_y — and the locomotion story is in the actuated joints 3..5).
-"""
+"""Side-by-side qpos trajectories: MPPI vs trained policy from the same seed."""
 from __future__ import annotations
 
 import argparse
@@ -72,7 +47,7 @@ def parse_args() -> argparse.Namespace:
 
 def _build_policy(env, env_name: str, blob: dict, run_cfg: dict | None,
                   device) -> torch.nn.Module:
-    """Mirror eval_checkpoint's class-resolution logic."""
+    """Resolve policy class from the checkpoint and load weights."""
     policy_class = blob.get("policy_class") or (run_cfg or {}).get("policy_class")
     use_det = policy_class == "DeterministicPolicy"
     PolicyCls = DeterministicPolicy if use_det else GaussianPolicy
@@ -86,17 +61,10 @@ def _build_policy(env, env_name: str, blob: dict, run_cfg: dict | None,
 
 
 def _joint_names(model) -> list[str]:
-    """Return one name per qpos slot.
-
-    For free / ball joints the qpos block is wider than 1, so we expand
-    each joint's name to fill its qpos range. Falls back to `q[i]` if a
-    name is missing (e.g. unnamed joints).
-    """
+    """One name per qpos slot; expanded for free / ball joints."""
     names: list[str] = []
     for j in range(model.njnt):
         adr = model.jnt_qposadr[j]
-        # qpos width per joint type. mjJNT_FREE=7, mjJNT_BALL=4, others=1.
-        # `mjMINVAL` not exposed cleanly here — derive width from next joint.
         next_adr = model.jnt_qposadr[j + 1] if j + 1 < model.njnt else model.nq
         width = next_adr - adr
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) or f"j{j}"

@@ -1,43 +1,10 @@
-"""Warp-batched MPPI-GPS trainer.
+"""Warp-batched MPPI-GPS: collapses the C-step's per-condition loop into
+one parallel timestep advance over ``N*K`` GPU worlds (vs. ``N*T`` MPPI
+calls in the CPU path).
 
-Drop-in replacement for ``MPPIGPS`` when the env is a Warp variant
-(``AdroitRelocateWarp``) and the user wants the GPS C-step's
-``num_conditions`` loop collapsed into one parallel timestep advance.
-
-Architecture (vs. CPU MPPIGPS):
-
-    CPU path: for each condition n in [0..N):
-                  for t in [0..T): plan_step(state[n]) → step env
-              N × T × MPPI calls per iter; conditions sequential.
-
-    Warp path: for t in [0..T):
-                   plan_step(states[N]) → actions[N, nu]
-                   # one warp graph launch over N*K worlds
-                   step each of N CPU envs in parallel
-               T × MPPI calls per iter; conditions parallel.
-
-Wallclock win on Adroit: at typical settings (N=5 conditions, T=500
-steps, K=1024 samples, H=64), the CPU path makes 2,500 MPPI calls per
-iter, each rolling 1,024 contact-rich Adroit sims through a CPU thread
-pool. The warp path makes 500 MPPI calls, each rolling 5,120 sims on
-GPU through a captured CUDA graph — usually 5-15× faster end-to-end
-depending on the GPU.
-
-----------------------------------------------------------------------
-Scope cuts vs. ``MPPIGPS``
-----------------------------------------------------------------------
-- ``warm_start_policy`` not honored (would need per-condition policy
-  rollouts; defer until measured-need).
-- ``dagger_relabel`` not honored (would need a second batched plan call
-  with no prior — easy to add later, ~10 lines).
-- ``auto_reset`` ignored (Adroit relocate doesn't terminate mid-episode).
-- α=0 h5 cache disabled — duplicates standalone collect_bc_demos.
-- ``open_loop_steps > 1`` ignored (BatchedMPPI forces 1).
-- ``adaptive_lam`` ignored (BatchedMPPI uses fixed λ).
-
-S-step (distillation) and KL-adaptive / eval are inherited from
-``MPPIGPS`` unchanged — they operate on collected (obs, action) pairs,
-which look identical to the CPU path's output.
+Scope cuts vs ``MPPIGPS``: ``warm_start_policy``, ``dagger_relabel``,
+``auto_reset``, α=0 h5 cache, ``open_loop_steps > 1``, ``adaptive_lam`` —
+all disabled. S-step + KL-adaptive + eval inherit unchanged.
 """
 from __future__ import annotations
 
@@ -71,13 +38,11 @@ def _step_one_data(
     data: mujoco.MjData,
     action: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
-    """Advance ONE MjData instance by ``env._frame_skip`` mj_step calls.
+    """Advance one MjData by ``env._frame_skip`` mj_step calls.
 
-    Generic version of ``MuJoCoEnv.step`` that operates on a passed-in
-    ``data`` instead of ``env.data`` so we can run N independent
-    simulations from a single env class. Matches the CPU step's output
-    shape conventions (state in FULLPHYSICS layout, sensor flat copy,
-    cost from the env's running_cost on (1,1,*) inputs).
+    Variant of ``MuJoCoEnv.step`` that takes ``data`` explicitly so we
+    can run N independent sims off one env class. Output shapes match
+    the CPU step (FULLPHYSICS state, flat sensor copy, scalar cost).
     """
     data.ctrl[:] = action
     for _ in range(env._frame_skip):
@@ -108,16 +73,12 @@ def _set_state_one_data(
 
 
 class WarpMPPIGPS(MPPIGPS):
-    """GPS trainer that batches the C-step over ``num_conditions`` envs.
+    """GPS trainer that batches the C-step over conditions.
 
-    The env passed in must be a Warp variant (``env._use_warp == True``)
-    constructed with ``nworld = num_conditions × cfg.K``. This class
-    creates ``num_conditions`` CPU ``MjData`` twins from ``env.model``
-    (one per condition's executor) and uses ``BatchedMPPI`` for all
-    MPPI rollouts.
-
-    Inherits S-step (`_distill_epoch`), eval, history from ``MPPIGPS``
-    unchanged.
+    Env must be Warp-backed with ``nworld = num_conditions × cfg.K``.
+    Creates N CPU MjData twins for the executors and uses
+    ``BatchedMPPI`` for rollouts. S-step / eval / history inherit from
+    ``MPPIGPS``.
     """
 
     def __init__(
@@ -136,8 +97,6 @@ class WarpMPPIGPS(MPPIGPS):
             )
 
         # Reproduce MPPIGPS.__init__ but swap MPPI for BatchedMPPI.
-        # Everything else (policy, prior_type, replay buffer slot,
-        # KL-adaptive lazy field) is identical to the parent.
         self.env = env
         self.mppi_cfg = mppi_cfg
         self.policy_cfg = policy_cfg
@@ -178,26 +137,19 @@ class WarpMPPIGPS(MPPIGPS):
         )
         self.N = gps_cfg.num_conditions
 
-        # ---- N CPU MjData twins for executor stepping ----
-        # Each is a full MjData allocation; size is dominated by Adroit's
-        # contact buffer (~MB per condition, fine for typical N≤16).
+        # N CPU MjData twins (one executor per condition).
         self._batch_data: list[mujoco.MjData] = [
             mujoco.MjData(env.model) for _ in range(self.N)
         ]
 
-        # Inherited bookkeeping
         self._episode_buffer: list[dict] = []
         self._kl_alpha: float | None = None
-        # Policy-trust dual scalar (multiplicative α dampener). Cold-start
-        # at `policy_trust_min` under adaptive; else `policy_trust_max`
-        # (constant, == 1.0 by default → no-op).
         self._policy_trust: float = (
             float(gps_cfg.policy_trust_min)
             if gps_cfg.adaptive_policy_trust
             else float(gps_cfg.policy_trust_max)
         )
 
-        # Loud opt-out warnings for unsupported features.
         import warnings
         for attr in ("warm_start_policy", "dagger_relabel", "auto_reset"):
             if getattr(gps_cfg, attr, False):
@@ -208,49 +160,33 @@ class WarpMPPIGPS(MPPIGPS):
                     stacklevel=2,
                 )
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def _reset_all_to(self, initial_states: list[np.ndarray]) -> None:
-        """Set each of the N executor MjData twins to its condition's state."""
+        """Set each MjData twin to its condition's state."""
         assert len(initial_states) == self.N
         for n in range(self.N):
             _set_state_one_data(self.env, self._batch_data[n], initial_states[n])
 
     def _get_states_obs(self) -> tuple[np.ndarray, np.ndarray]:
-        """Snapshot per-condition (state, obs) from the N executor MjDatas.
-
-        Returns:
-            states: (N, nstate) FULLPHYSICS layout.
-            obs:    (N, obs_dim) — obs computed via env.state_to_obs (uses
-                    sensordata where available so DAPG-obs envs hit the
-                    fast path).
-        """
+        """Snapshot ``(states[N, nstate], obs[N, obs_dim])`` from the twins."""
         states = np.stack([
             self._mj_getstate(self._batch_data[n]) for n in range(self.N)
         ])
         sensors = np.stack([
             self._batch_data[n].sensordata.copy() for n in range(self.N)
         ])
-        # state_to_obs expects (..., nstate); pass (1, N, ...) so envs
-        # that index along last axis work, then squeeze leading 1.
+        # Pass (1, N, ...) so envs that index along last axis work.
         obs = np.asarray(
             self.env.state_to_obs(states[None], sensors[None])
         )[0]
         return states, obs
 
     def _mj_getstate(self, data: mujoco.MjData) -> np.ndarray:
-        """Like MuJoCoEnv.get_state but for an arbitrary MjData."""
+        """``MuJoCoEnv.get_state`` for arbitrary ``data``."""
         state = np.empty(self.env._nstate)
         mujoco.mj_getState(
             self.env.model, data, state, mujoco.mjtState.mjSTATE_FULLPHYSICS,
         )
         return state
-
-    # ------------------------------------------------------------------
-    # train()
-    # ------------------------------------------------------------------
 
     def train(
         self,
